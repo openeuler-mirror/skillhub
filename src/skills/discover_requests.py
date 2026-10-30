@@ -22,7 +22,7 @@ from src.skills.skill_parser import normalize_git_clone_url, parse_skill_md_url
 
 logger = logging.getLogger(__name__)
 
-PLATFORM_CHOICES = ("personal", )
+PLATFORM_CHOICES = ("personal", "community", "enterprise")
 
 
 def _normalize_platform(platform: str) -> str:
