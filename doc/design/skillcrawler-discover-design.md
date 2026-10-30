@@ -18,7 +18,7 @@ python skillcrawler/main.py discover
 | [§1](#1-总体流程) | [总体流程](#1-总体流程) |
 | [§2](#2-skill仓库来源) | [skill仓库来源](#2-skill仓库来源) |
 | [§3](#3-git-仓库同步) | [Git 仓库同步](#3-git-仓库同步) |
-| [§4](#4-仓库级短路分支) | [仓库级短路分支（no_skill / removed / unchanged / security_retried）](#4-仓库级短路分支no_skill--removed--unchanged--security_retried) |
+| [§4](#4-仓库级短路分支) | [仓库级短路分支（no_skill / removed / unchanged）](#4-仓库级短路分支no_skill--removed--unchanged) |
 | [§5](#5-可扫描-skill-规则) | [可扫描 Skill 规则](#5-可扫描-skill-规则) |
 | [§6](#6-latest-和-tag-版本扫描) | [latest 和 Tag 版本扫描](#6-latest-和-tag-版本扫描) |
 | [§7](#7-单个-skill-的构建顺序) | [单个 Skill 的构建顺序](#7-单个-skill-的构建顺序) |
@@ -58,9 +58,7 @@ flowchart TD
     F2 -->|有| F4["删除仓库记录及关联数据（立即 commit）<br/>结果 removed"]
     F1 -->|有| F5["创建或读取仓库记录<br/>创建仓库记录时设置status=init"]
     F5 --> F6{"已有记录且<br/>HEAD commit == repository_commit_id?"}
-    F6 -->|是| F7{"安全审计启用且<br/>存在 NULL risk_score?"}
-    F7 -->|否| F8["结果 unchanged"]
-    F7 -->|是| F9["为未评分记录重提 Jenkins 检测<br/>立即 commit，结果 security_retried"]
+    F6 -->|是| F8["结果 unchanged<br/>（衍生字段缺口由 remediation 全局兜底）"]
     F6 -->|否| F10["需要扫描：状态设为 discovering"]
     F10 --> Z[扫描仓库]
 
@@ -81,10 +79,9 @@ flowchart TD
     F3 --> W
     F4 --> W
     F8 --> W
-    F9 --> W
     W --> Y[下一仓库]
-    Y -->|全部仓库完成| Y2["embedding（索引创建）<br/>embed_missing：embedding IS NULL 且 risk_score 就绪"]
-    Y2 --> Y3["输出结果表和 summary<br/>（counters 说明 + skill 统计 + 索引创建结果，见 §11.1）"]
+    Y -->|全部仓库完成| Y2["补跑衍生字段缺口（remediation）<br/>security 风险分 → category 分类 → embedding 向量"]
+    Y2 --> Y3["输出结果表和 summary<br/>（counters 说明 + skill 统计 + 补跑结果，见 §11.1）"]
 ```
 
 ### 1.1 关键代码索引
@@ -94,10 +91,10 @@ flowchart TD
 | `skillcrawler/main.py` | CLI 参数、模式路由、逐仓库循环、结果汇总 |
 | `skillcrawler/config.py` | openEuler-skills catalog 与仓库列表加载 |
 | `skillcrawler/core/skill_manager.py` | 仓库同步、状态、扫描与存储编排 |
-| `skillcrawler/core/git_operations.py` | clone、fetch、Tag 两阶段拉取、tree hash、blob 物化 |
-| `skillcrawler/core/skill_parser.py` | SKILL.md 查找、跳过规则、URL/ID 辅助逻辑 |
+| `src/utils/git_operations.py` | clone、fetch、Tag 两阶段拉取、tree hash、blob 物化 |
+| `src/utils/skill_parser.py` | SKILL.md 查找、跳过规则、URL/ID 辅助逻辑 |
 | `skillcrawler/core/skill_scanner.py` | latest/Tag 扫描、分类、安全检测触发 |
-| `skillcrawler/core/category_classifier.py` | Category 规则和模型调用 |
+| `src/ai/category_classifier.py` | Category 规则和模型调用 |
 | `src/models/repository.py` | Skills、SkillVersions、SecurityAudit 持久化 |
 | `src/security/detector.py` | Jenkins 客户端和后台报告 collector |
 | `src/api/main.py` | API 生命周期中启动和停止 collector |
@@ -112,8 +109,8 @@ discover_configured_skill_repository(request)            # 主入口
 │   └── 空 → 查 DB 删除记录 / 返回 None
 ├── _get_or_create_skill_repository(request, repo_name)  # 查 DB 或新建记录
 ├── _is_commit_unchanged(repo, clone_dir)                # 对比commit_id
-│   ├── 未变 → _retry_unscored_security_audits(repo)        # 为未评分记录重提 Jenkins 检测
-│   └── 已变 → _discover_and_store_skills(...)              # 扫描并存储 Skills / SkillVersions
+│   └── 未变 → 标记 _unchanged 返回                        # 衍生字段缺口由 remediation 全局兜底
+└── 已变 → _discover_and_store_skills(...)                # 扫描并存储 Skills / SkillVersions
 
 _discover_and_store_skills()
 ├── _discover_skills()                                      # 扫描并返回 Skill/SkillVersion 列表
@@ -171,33 +168,39 @@ start_scan(...)
 
 2. 后台自动调度（`discover_scheduler` 定时任务）
 **自动调度**（API 服务内置定时任务：服务启动时按 `discover_scheduler.enabled`
-决定是否拉起，实现见[`src/api/services/discover_scheduler.py`](../../src/api/services/discover_scheduler.py)）：
+决定是否拉起，实现见[`src/jobs/discover_scheduler.py`](../../src/jobs/discover_scheduler.py)）：
 
-- 每天 / 每周固定时刻（`discover_scheduler.interval` / `time` / `weekday`）触发一轮
-  全量 discover（`time` 为 **UTC** 时间，如 `08:00` 即北京时间 16:00）：同步
+- **每天 / 每周固定时刻（`discover_scheduler.interval` / `time` / `weekday`）触发一轮
+  全量 discover**（`time` 为 **UTC** 时间，如 `08:00` 即北京时间 16:00）：同步
   openEuler-skills catalog、构建全部请求，逐仓库调用
   `SkillManager.discover_configured_skill_repository`（与 CLI 相同的执行路径）；
-- 调度基于纯 asyncio（sleep 到下一个触发点），每轮执行完毕后才计算下一个触发点，
+  **服务启动时额外立即执行一轮**（重启后当天触发点已过也不必等下个周期）；
+- 调度基于纯 asyncio（每轮跑完 sleep 到下一个触发点），每轮执行完毕后才计算下一个触发点，
   克隆扫描耗时较长时下一轮自动顺延，不会叠加执行；单轮整体异常只记录日志，
   不终止调度循环；
-- **每轮扫描结束后补建缺失 embedding（索引创建）**：调
-  `embed_missing()`（实现见 [`src/ai/embedding_indexer.py`](../../src/ai/embedding_indexer.py)），
-  只为 `embedding IS NULL` 且 `risk_score` 就绪的行生成向量，使其立即可被语义
-  搜索命中；与全量重建脚本 `scripts/reindex_embeddings.py` 通过
-  `pg_advisory_lock` 互斥，锁被占用时跳过本轮（全量本身覆盖一切）。失败不重试，
-  漏掉的行由下轮 discover 或 API 启动时的 `_backfill_embeddings()` 自愈（见
-  [`src/api/main.py`](../../src/api/main.py)）；
-- 每轮结果（每仓 outcome / 耗时 / 汇总计数 / skill 统计 / 索引创建结果）写入
+- **每轮扫描结束后补跑衍生字段缺口**：调 `run_remediations()`（实现见
+  [`src/jobs/remediation.py`](../../src/jobs/remediation.py)），按
+  security → category → embedding 顺序补三类缺口（三类缺口互不影响，顺序仅
+  为固定执行顺序：risk_score 缺口重提 Jenkins 检测、category 缺口补跑分类、
+  embedding 缺口补建向量），各任务自持
+  `pg_advisory_lock` 互斥（embedding 的锁另与全量重建脚本
+  `scripts/reindex_embeddings.py` 互斥），单任务锁被占用或失败只影响该任务。
+  失败不重试，漏掉的行由下轮 discover 或 API 侧的低频补齐循环自愈（见
+  [`src/jobs/remediation.py`](../../src/jobs/remediation.py)）；
+- 每轮结果（每仓 outcome / 耗时 / 汇总计数 / skill 统计 / 补跑结果）写入
   `result_dir`（默认 `<storage.local_path>/logs`）下的 `discover-<时间戳>.json`，
   结果分类口径与 CLI discover 一致，输出结构见 §11.1。
+  API 侧低频补齐循环（`run_remediation_loop`）每轮也写同目录下的
+  `remediation-<时间戳>.json`（补跑统计含 `<key>_note` 说明，口径与
+  discover 结果中的 `remediation_run` 一致）。
 
 > **注意**：CLI `skillcrawler/main.py discover` 与自动调度对齐——扫描结束后
-> 同样补建缺失 embedding（`_backfill_embeddings_after_discover()`），并写入
+> 同样补跑衍生字段缺口（`_run_remediations_safe()`），并写入
 > 同一结构的 `discover-<时间戳>.json` 结果文件（构建与保存由
 > [`skillcrawler/main.py`](../../skillcrawler/main.py) 的
 > `build_discover_result_document()` / `save_discover_result_file()` 提供，
 > 两个入口共用同一实现，输出完全一致）。语义搜索未启用或锁被全量重建占用
-> 时跳过补建，失败只记日志不影响退出码；若需强制全量重建，手动执行
+> 时跳过对应补跑，失败只记日志不影响退出码；若需强制全量重建，手动执行
 > `python scripts/reindex_embeddings.py`。
 
 ### 2.2 仓库配置读取
@@ -237,7 +240,7 @@ platform 推断均使用转换后的 GitCode 地址。
 1. 收集：[config.py `load_catalog_skill_url_entries`](../../skillcrawler/config.py#L91-L112)
    读取各组 `skill.yaml` 的 `skills[]` 条目；`skill_name` / `skill_url` 必填，
    缺失抛 `ValueError`；
-2. 解析：[skill_parser.py `parse_skill_md_url`](../../skillcrawler/core/skill_parser.py#L42-L67)
+2. 解析：[skill_parser.py `parse_skill_md_url`](../../src/utils/skill_parser.py#L42-L67)
    把 `skill_url`（`<repo>/blob/<ref>/<path>/SKILL.md`）拆为
    `(repo_url, ref, skill_path)`。`ref` 取 `/blob/` 后第一段，约定为单段分支名
    （含 `/` 的 ref 无法与路径消歧，不支持），作为 clone 分支；`repo_url` 与
@@ -393,7 +396,7 @@ pack 索引引用。对大仓库反复执行失败的 fetch 会让这些孤儿�
 | Tag 元数据或精确拉取失败 | `_cleanup_orphaned_tmp_packs` | `_get_repository_latest_tags` 在两阶段 `git fetch` 抛出 `CalledProcessError` / `TimeoutExpired` 后调用 |
 | 其他 fetch 失败 | 当前未统一处理 | 可在排查磁盘占用时手动 `rm tmp_pack_*` |
 
-实现要点（[git_operations.py `_cleanup_orphaned_tmp_packs`](../../skillcrawler/core/git_operations.py#L424-L440)）：
+实现要点（[git_operations.py `_cleanup_orphaned_tmp_packs`](../../src/utils/git_operations.py#L424-L440)）：
 
 - 只匹配 `tmp_pack_*` 前缀，不误删 `pack-*.pack` / `pack-*.idx`；
 - 通过 `glob` 列举，逐个 `unlink`，失败时只记录 warning 不抛出；
@@ -401,7 +404,7 @@ pack 索引引用。对大仓库反复执行失败的 fetch 会让这些孤儿�
 
 > 注意：清理必须在没有其他 fetch 并发执行时进行，否则可能删除正在写入的 pack。
 
-## 4. 仓库级短路分支（no_skill / removed / unchanged / security_retried）
+## 4. 仓库级短路分支（no_skill / removed / unchanged）
 
 ### 4.1 仓库没有可扫描 Skill
 
@@ -421,9 +424,7 @@ pack 索引引用。对大仓库反复执行失败的 fetch 会让这些孤儿�
 数据库 repository_commit_id
 ```
 
-相同后会继续检查当前仓库的安全评分状态。
-
-如果 `security.enable_audit=false`，或者不存在 `risk_score IS NULL` 的 Skill/SkillVersion，则：
+相同后直接标记 `_unchanged` 返回：
 
 ```text
 result = unchanged
@@ -438,26 +439,16 @@ error  = commit unchanged
 - Skills/SkillVersions 写入；
 - SecurityAudit 更新。
 
-如果 `security.enable_audit=true` 且存在 `risk_score IS NULL` 的 Skill 或 SkillVersion，则不会整仓重扫，而是：
-
-1. 查询该仓库所有未评分记录；
-2. 从已存储的 `source_url`/`skill_id` 还原 `SKILL.md` 相对路径；
-3. 使用原来的 `commit_id` 重新提交 Jenkins SkillSpector；
-4. 更新 Skill/SkillVersion 的 `extra_metadata.security_audit`；
-5. upsert 对应 `security_audits`，覆盖为新的 pending build；
-6. 保持 `risk_score=NULL`，等待 API collector 获取报告后更新评分。
-
-重试提交的 Jenkins 交互与 pending 收集流程和正常扫描一致，见
-[`security-audit-feature-spec.md`](security-audit-feature-spec.md) 3.1 节与 3.2 节。
-
-结果表中显示：
-
-```text
-result = security_retried
-error  = commit unchanged; triggered <成功数>/<候选数>
-```
-
-如果 Jenkins 当前不可用或某次触发失败，该记录仍保持 NULL，下次执行 discover 时会再次进入补偿流程。此补偿路径不走扫描主事务，重试完成后立即单独 commit（见 §10.4）。
+历史版本曾在此分支内联为 `risk_score IS NULL` 的记录重提 Jenkins 检测
+（`_retry_unscored_security_audits`，结果 `security_retried`）；现已抽离到
+统一补齐框架 [`src/jobs/remediation.py`](../../src/jobs/remediation.py)：
+安全补审计改为**全局扫描**所有 `risk_score` 缺口行（不限于本轮扫到且 commit
+未变的仓库），在每轮 discover 末尾与 API 侧低频补齐循环中执行，覆盖面更大、
+且与 category / embedding 补齐同构。未评分记录的重试流程（还原 `SKILL.md`
+相对路径 → 重新提交 Jenkins → 更新 `extra_metadata.security_audit` →
+upsert `security_audits` → 保持 `risk_score=NULL` 等 collector 回填）不变，
+见 [`security-audit-feature-spec.md`](security-audit-feature-spec.md) 3.1 节与
+3.2 节；触发失败的记录仍保持 NULL，由下一轮补跑重试。
 
 ## 5. 可扫描 Skill 规则
 
@@ -879,8 +870,9 @@ flowchart LR
 branch 和 local_path 在扫描过程中只 flush；最终 Repo 更新负责一次 commit。因此
 Skills、SkillVersions、本轮新 SecurityAudit，以及 Repo 的最终 HEAD、数量和 done
 状态要么一起成功，要么一起回滚。开始前写入的 `discovering` 状态和失败后的
-`failed` 状态仍各自单独提交，以便外部观察任务状态；§4.2 的 commit 未变化安全
-补偿路径同样在重试完成后立即单独 commit，不进入本事务。
+`failed` 状态仍各自单独提交，以便外部观察任务状态；统一补齐
+（[`src/jobs/remediation.py`](../../src/jobs/remediation.py)）是扫描
+结束后的独立短事务批次，不进入本事务。
 
 只有运行时 `_security_audit_triggered=true` 且真正获得新 Jenkins build number 的
 记录才会写入或重置 `security_audits`。
@@ -902,7 +894,6 @@ skill仓库扫描结果：
 |---|---|
 | `created` | 新建仓库记录并完成扫描 |
 | `rediscovered` | 已有仓库 commit 变化并完成重扫 |
-| `security_retried` | commit 未变化，但为 NULL risk_score 记录重新提交安全检测 |
 | `unchanged` | HEAD commit 与数据库相同，跳过扫描 |
 | `removed` | 已有仓库不再包含可扫描 Skill，删除 DB 仓库记录 |
 | `no_skill` | 新仓库没有可扫描 Skill，不创建 DB 仓库记录 |
@@ -911,18 +902,18 @@ skill仓库扫描结果：
 ### 11.1 每轮结果文件输出
 
 自动调度每轮结束把结果写入 `result_dir`（默认 `<storage.local_path>/logs`）下的
-`discover-<时间戳>.json`，结构如下（实现见 [`src/api/services/discover_scheduler.py`](../../src/api/services/discover_scheduler.py)）：
+`discover-<时间戳>.json`，结构如下（实现见 [`src/jobs/discover_scheduler.py`](../../src/jobs/discover_scheduler.py)）：
 
 | 字段 | 说明 |
 |---|---|
 | `counters` | 仓库级统计，各项含义见下表（与 §11 结果类型口径一致） |
 | `skill_stats` | skill 级统计（口径：`skills` 表 latest Skill，不含 Tag 版本） |
-| `embedding_run` | 本轮索引创建（`embed_missing`）的执行结果，见 §11.1.3 |
+| `remediation_run` | 本轮补齐三类衍生字段缺口的执行结果（`security` / `category` / `embedding`），见 §11.1.3 |
 | `repos` | 每仓明细：`url` / `outcome` / `skill_num` / `duration_seconds`，失败仓另含 `error` |
 
 `counters` / `skill_stats`（含 `security_audit`、`index_creation` 子对象）/
-`embedding_run` 的每个字段均内嵌 `<key>_note` 文字说明（如 `created` → `created_note`），
-随文件输出便于离线解读：
+`remediation_run`（各任务子对象）的每个字段均内嵌 `<key>_note` 文字说明
+（如 `created` → `created_note`），随文件输出便于离线解读：
 
 #### 11.1.1 counters 各项含义
 
@@ -930,7 +921,6 @@ skill仓库扫描结果：
 |---|---|
 | `created` | 新建仓库记录并完成扫描 |
 | `rediscovered` | 已有仓库 commit 变化并完成重扫 |
-| `security_retried` | commit 未变化，但为 NULL risk_score 记录重新提交安全检测 |
 | `unchanged` | HEAD commit 与数据库相同，跳过扫描 |
 | `removed` | 已有仓库不再包含可扫描 Skill，删除 DB 仓库记录 |
 | `no_skill` | 新仓库没有可扫描 Skill，不创建 DB 仓库记录 |
@@ -947,15 +937,19 @@ skill仓库扫描结果：
 | `security_audit.failed` | 安全检测失败：`risk_score` 为空且无异步检测进行中（触发失败或终态无报告） |
 | `security_audit.failed_skills` | 失败明细（`skill_id` / `name` / `source_url`），最多 50 条，超出由 `failed_skills_truncated` 标记 |
 
-#### 11.1.3 索引创建结果（embedding_run）
+#### 11.1.3 补齐结果（remediation_run）
 
-`embedding_run` 字段是本轮补建缺失 embedding（§1 流程图 Y2 节点）的执行结果：
+`remediation_run` 是本轮补跑衍生字段缺口（§1 流程图 Y2 节点）的执行结果，
+含 `security` / `category` / `embedding` 三个任务各自的统计（实现见
+[`src/jobs/remediation.py`](../../src/jobs/remediation.py)）：
 
-| 情形 | 输出 |
-|---|---|
-| 正常执行 | `ReindexStats.as_dict()`：`total` / `indexed` / `failed_batches` / `failed_rows` / `skipped_empty` / `stale_skipped`（见 [`src/ai/embedding_indexer.py`](../../src/ai/embedding_indexer.py)） |
-| 锁被全量重建占用 | `{"skipped": "reindex lock held by another task"}` |
-| 语义搜索未启用 / 执行异常 | 字段为 `null`，异常见日志 |
+| 任务 | 正常执行输出 | 跳过/异常输出 |
+|---|---|---|
+| `security` | `SecurityBackfillStats.as_dict()`：`total` / `triggered` / `failed` / `skipped` | `{"skipped": "..."}`（锁被占用、检测关闭、skillspector 不可用） |
+| `category` | `BackfillStats.as_dict()`：`total` / `filled` / `unclassified` / `failed` / `skipped`（见 [`category_backfill.py`](../../src/ai/category_backfill.py)） | `{"skipped": "..."}`（锁被占用、分类器不可用） |
+| `embedding` | `ReindexStats.as_dict()`：`total` / `indexed` / `failed_batches` / `failed_rows` / `skipped_empty` / `stale_skipped`（见 [`src/ai/embedding_indexer.py`](../../src/ai/embedding_indexer.py)） | `{"skipped": "..."}`（锁被占用、语义搜索未启用）；任务级异常为 `{"error": "..."}` |
+
+单任务锁被占用或失败只记录在该任务的统计里，不影响其余任务执行。
 
 `skill_stats.index_creation` 是索引状态的存量口径（全库），四项为互斥三分法，
 `indexed + missing + not_required` 恒等于 `total`：
