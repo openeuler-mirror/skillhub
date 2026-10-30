@@ -441,7 +441,7 @@ GET /api/v1/skills/{skill_id}/audit
 # 已入库 Skill 审计（写库）
 async def audit_skill(
     skill_id: str,                        # skill 唯一标识
-    source: str,                          # "github" / "gitcode" / "clawhub"
+    source: str,                          # "github" / "atomgit" / "clawhub"
     source_url: str,                      # 仓库 URL（优先 repo_url）
     metadata: dict[str, Any],             # { version, commit_id, content, skill_path }
     scanners: list[str] | None = None,    # None → 自动检测可用扫描器
@@ -529,8 +529,8 @@ GET /api/v1/skills/{skill_id}/audit-report
 {
     "skill_id": "github:openeuler/find-skills/find-skills",
     "skill_name": "find-skills",
-    "source_url": "https://gitcode.com/.../SKILL.md",
-    "repo_url": "https://gitcode.com/openeuler/find-skills",
+    "source_url": "https://atomgit.com/.../SKILL.md",
+    "repo_url": "https://atomgit.com/openeuler/find-skills",
     "version": "1.0.0",
     "has_report": true,
     "reason": null,

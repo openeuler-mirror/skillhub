@@ -149,7 +149,7 @@ start_scan(...)
 触发方式有两种：CLI 命令和后台定时任务
 
 触发后读取skill仓库配置，根据配置构造 discover 请求列表。
-- 先同步`https://gitcode.com/openeuler/openEuler-skills` 到
+- 先同步`https://atomgit.com/openeuler/openEuler-skills` 到
 `<storage.local_path>/skill-repositories/openEuler-skills`，
 扫描其中 `community`、`enterprise`、`personal` 分组下的 `*/skill.yaml`。
 - 再解析出全部 discover 请求：入口**build_configured_discover_requests**，
@@ -226,10 +226,10 @@ start_scan(...)
 （`-r` / 自动同步的 openEuler-skills）解析相对路径；文件名必须恰好是
 `skill.yaml` 且位于三个平台分组之下，否则抛 `ValueError`。
 
-仓库请求进入 discover 前会规范化 URL：`atomgit.com` 是 `gitcode.com` 的旧域名，
-HTTPS/HTTP 和 SSH 地址中的精确 host `atomgit.com` 都会自动转换为
-`gitcode.com`。后续 clone、`repo_name`、数据库 `url`、source/skill ID 生成和
-platform 推断均使用转换后的 GitCode 地址。
+仓库请求进入 discover 前会规范化 URL：`gitcode.com` 是 `atomgit.com` 的旧域名，
+HTTPS/HTTP 和 SSH 地址中的精确 host `gitcode.com` 都会自动转换为
+`atomgit.com`。后续 clone、`repo_name`、数据库 `url`、source/skill ID 生成和
+platform 推断均使用转换后的 AtomGit 地址。
 
 ### 2.3 单 Skill URL 贡献（`skills[].skill_url`）
 
@@ -244,7 +244,7 @@ platform 推断均使用转换后的 GitCode 地址。
    把 `skill_url`（`<repo>/blob/<ref>/<path>/SKILL.md`）拆为
    `(repo_url, ref, skill_path)`。`ref` 取 `/blob/` 后第一段，约定为单段分支名
    （含 `/` 的 ref 无法与路径消歧，不支持），作为 clone 分支；`repo_url` 与
-   `skill_repos` 同口径规范化（去 `.git`、atomgit→gitcode）；
+   `skill_repos` 同口径规范化（去 `.git`、gitcode→atomgit）；
 3. 合并（[main.py `_build_requests_from_skill_urls`](../../skillcrawler/main.py#L118-L176)）：
    - 同一仓库的多条贡献合并为一个请求，`skill_paths` 取并集（部分扫描按请求
      同步入库，拆成多个请求会互相删掉对方的 skill）；
@@ -559,7 +559,7 @@ flowchart TD
 | 失败清理 | `_cleanup_orphaned_tmp_packs(clone_dir)` | Git 流式传输把 pack 写到 `tmp_pack_XXXXXX`，成功后才 rename；超时/中断留下孤儿文件，需主动删除 |
 
 > `creatordate` 是统一排序字段，不是可信发布时间。Git 时间戳可由提交者设置；如果
-> 业务以后要求“平台 Release 发布时间”，需要另接 GitHub/GitLab/GitCode API。
+> 业务以后要求“平台 Release 发布时间”，需要另接 GitHub/GitLab/AtomGit API。
 
 元数据阶段的传输规模主要与 Tag 数量和各 Tag tip commit 数量相关，而不是与仓库
 文件总体积相关。即使仓库历史包含大型二进制文件，`tree:0` 也不会在这一阶段下载
@@ -678,7 +678,7 @@ flowchart TD
 - community 仓库缓存目录：`/opt/wittyhub/openeuler-community`
 - 扫描 `sig/*/sig-info.yaml` 的 `repositories[].repo`，只读取 `openeuler/<repo>`，
   不读取 `src-openeuler/<repo>`
-- 映射示例：`openeuler/PilotGo-plugin-llmops` → `gitcode.com_openeuler_PilotGo-plugin-llmops` → `sig_name`
+- 映射示例：`openeuler/PilotGo-plugin-llmops` → `atomgit.com_openeuler_PilotGo-plugin-llmops` → `sig_name`
 
 ## 9. SkillSpector 安全检测
 
@@ -795,8 +795,8 @@ discover 写入路径涉及三张关键表，字段约定如下，供 §11 仓�
 
 | 字段 | 含义 |
 |------|------|
-| `repo_name` | 由仓库 URL 生成的本地唯一名称，如 `gitcode.com_openeuler_wittyhub-cli` |
-| `source` | 仓库来源，如 `gitcode` / `github` |
+| `repo_name` | 由仓库 URL 生成的本地唯一名称，如 `atomgit.com_openeuler_wittyhub-cli` |
+| `source` | 仓库来源，如 `atomgit` / `github` |
 | `platform` | 平台分类，如 `openeuler` / `enterprise` / `personal` |
 | `branch` | 当前扫描分支 |
 | `url` | Git 仓库 URL |
@@ -811,7 +811,7 @@ discover 写入路径涉及三张关键表，字段约定如下，供 §11 仓�
 
 | 字段 | 含义 |
 |------|------|
-| `skill_id` | 全局唯一 Skill ID，格式类似 `gitcode:openeuler/wittyhub-cli/find-skills` |
+| `skill_id` | 全局唯一 Skill ID，格式类似 `atomgit:openeuler/wittyhub-cli/find-skills` |
 | `skill_repo_id` | 所属 `skill_repos.id` |
 | `commit_id` | `SKILL.md` 所在 skill 文件夹的最新 commit，不是 repo HEAD |
 | `platform` | 优先继承 `skill_repos.platform` |

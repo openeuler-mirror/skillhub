@@ -14,7 +14,7 @@
 
 ### 1.1 系统定位
 
-WittyHub 是一个去中心化的 Agent/Skill 检索与下载平台。平台本地只存储索引元数据，Skill 内容托管在 GitHub / GitCode / Gitee 等外部仓库，通过 REST API、Web UI 和 CLI 三种方式对外提供服务。
+WittyHub 是一个去中心化的 Agent/Skill 检索与下载平台。平台本地只存储索引元数据，Skill 内容托管在 GitHub / AtomGit / Gitee 等外部仓库，通过 REST API、Web UI 和 CLI 三种方式对外提供服务。
 
 ### 1.2 核心设计原则
 
@@ -55,7 +55,7 @@ graph LR
     end
 
     subgraph 外部系统
-        GH[GitHub / GitCode / Gitee]
+        GH[GitHub / AtomGit / Gitee]
         EMB[Embedding 服务]
         SOC[SkillSpector]
     end
@@ -127,7 +127,7 @@ graph TB
 
     subgraph 基础设施 Infrastructure
         PG[(PostgreSQL<br/>tsvector + pgvector)]
-        EXT[外部仓库<br/>GitHub/GitCode/Gitee]
+        EXT[外部仓库<br/>GitHub/AtomGit/Gitee]
         EMBSVC[Embedding 微服务]
     end
 
@@ -167,7 +167,7 @@ src/api/routes/skills.py ──► src/storage/downloader.py
                            ──► src/api/services/security.py
 src/indexer/search.py ──► PostgreSQL (tsvector + pgvector)
 src/ai/embedding.py ──► Embedding 微服务 (HTTP)
-src/storage/downloader.py ──► GitHub/GitCode/Gitee (HTTP)
+src/storage/downloader.py ──► GitHub/AtomGit/Gitee (HTTP)
 ```
 
 ### 3.4 数据模型（逻辑）
@@ -454,7 +454,7 @@ CLI 下载 ZIP 后在客户端完成解压安装：
 
 #### 4.2.6 多源与中国区优化
 
-多源支持统一收敛在 skillcrawler 爬取阶段：GitHub / GitCode / Gitee 仓库均以
+多源支持统一收敛在 skillcrawler 爬取阶段：GitHub / AtomGit / Gitee 仓库均以
 `git clone` 方式落地到本地 `skill-repositories/`，下载侧无需感知平台差异。
 GitHub 爬取可配置 `github_token` 提高 rate limit。
 
@@ -492,7 +492,7 @@ graph TB
     NG -->|/* static| NG
     API --> DB
     API --> EMB
-    API -->|下载链接| EXT[GitHub/GitCode/Gitee]
+    API -->|下载链接| EXT[GitHub/AtomGit/Gitee]
 
     subgraph 持久化卷
         V1[(postgres-data)]
@@ -817,7 +817,7 @@ curl -X POST http://localhost:8081/api/v1/index/reindex
 │  │                              /opt/wittyhub                         │  │
 │  └────────────────────────────────────────────────────────────────────┘  │
 │                                                                          │
-│  External: GitHub / GitCode / Gitee / SkillSpector                       │
+│  External: GitHub / AtomGit / Gitee / SkillSpector                       │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -892,7 +892,7 @@ curl -X POST http://localhost:8081/api/v1/index/reindex
 
 | 优先级 | 功能 | 说明 | 状态 |
 |--------|------|------|------|
-| P1 | 爬虫自动发现 | skillcrawler discover 扫描 GitHub/GitCode/Gitee，自动入库 | 已实现 |
+| P1 | 爬虫自动发现 | skillcrawler discover 扫描 GitHub/AtomGit/Gitee，自动入库 | 已实现 |
 
 ### 9.2 待实现
 
