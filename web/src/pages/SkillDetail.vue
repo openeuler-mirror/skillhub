@@ -205,7 +205,7 @@ const riskScoreText = computed(() => {
 // 历史数据可能仍为旧格式 {source_type}/{owner}/{repo}/<path...>，
 // 优先用 source_url 的 SKILL.md 路径确定目录名，确保提示词恒为新格式。
 function toNewSkillId(skillId: string, sourceUrl?: string | null): string {
-  const sourceTypes = ['github', 'gitcode', 'gitlab', 'gitee']
+  const sourceTypes = ['github', 'atomgit', 'gitlab', 'gitee']
   const id = (skillId || '').trim()
   const colon = id.indexOf(':')
   if (colon > 0 && sourceTypes.includes(id.slice(0, colon).toLowerCase())) {

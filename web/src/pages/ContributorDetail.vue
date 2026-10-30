@@ -21,7 +21,7 @@ const platformNames: Record<string, string> = {
 }
 const sourceNames: Record<string, string> = {
   github: 'GitHub',
-  gitcode: 'GitCode'
+  atomgit: 'AtomGit'
 }
 
 const contributor = ref<ContributorSkillsResponse | null>(null)
