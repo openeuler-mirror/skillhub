@@ -52,21 +52,21 @@ def _skill(
     source_url: str | None = None,
 ):
     return SimpleNamespace(
-        skill_id=skill_id or "gitcode:openeuler/opendesign-components/clean-code",
+        skill_id=skill_id or "atomgit:openeuler/opendesign-components/clean-code",
         name="clean-code",
         version="1.1.0",
         commit_id=commit_id,
         source_url=(
             source_url
-            or "https://gitcode.com/openeuler/opendesign-components/blob/master/packages/skills/clean-code/SKILL.md"
+            or "https://atomgit.com/openeuler/opendesign-components/blob/master/packages/skills/clean-code/SKILL.md"
         ),
     )
 
 
 def _repository(repository: Path):
     return SimpleNamespace(
-        source="gitcode",
-        url="https://gitcode.com/openeuler/opendesign-components.git",
+        source="atomgit",
+        url="https://atomgit.com/openeuler/opendesign-components.git",
         local_path=str(repository),
         branch="master",
     )
@@ -74,10 +74,10 @@ def _repository(repository: Path):
 
 def test_resolve_skill_relative_path_keeps_nested_directories():
     relative_path = DownloadManager.resolve_skill_relative_path(
-        skill_id="gitcode:openeuler/opendesign-components/clean-code",
-        source="gitcode",
-        repository_url="https://gitcode.com/openeuler/opendesign-components",
-        source_url="https://gitcode.com/openeuler/opendesign-components/blob/master/packages/skills/clean-code/SKILL.md",
+        skill_id="atomgit:openeuler/opendesign-components/clean-code",
+        source="atomgit",
+        repository_url="https://atomgit.com/openeuler/opendesign-components",
+        source_url="https://atomgit.com/openeuler/opendesign-components/blob/master/packages/skills/clean-code/SKILL.md",
         refs=["master"],
     )
 
@@ -87,10 +87,10 @@ def test_resolve_skill_relative_path_keeps_nested_directories():
 def test_resolve_skill_relative_path_rejects_repository_mismatch():
     with pytest.raises(SkillArchiveConflictError):
         DownloadManager.resolve_skill_relative_path(
-            skill_id="gitcode:another/repository/clean-code",
-            source="gitcode",
-            repository_url="https://gitcode.com/openeuler/opendesign-components",
-            source_url="https://gitcode.com/openeuler/opendesign-components/blob/master/packages/skills/clean-code/SKILL.md",
+            skill_id="atomgit:another/repository/clean-code",
+            source="atomgit",
+            repository_url="https://atomgit.com/openeuler/opendesign-components",
+            source_url="https://atomgit.com/openeuler/opendesign-components/blob/master/packages/skills/clean-code/SKILL.md",
             refs=["master"],
         )
 
@@ -98,10 +98,10 @@ def test_resolve_skill_relative_path_rejects_repository_mismatch():
 def test_resolve_skill_relative_path_rejects_parent_traversal():
     with pytest.raises(SkillArchiveConflictError):
         DownloadManager.resolve_skill_relative_path(
-            skill_id="gitcode:openeuler/opendesign-components/clean-code",
-            source="gitcode",
-            repository_url="https://gitcode.com/openeuler/opendesign-components",
-            source_url="https://gitcode.com/openeuler/opendesign-components/blob/master/../secrets/SKILL.md",
+            skill_id="atomgit:openeuler/opendesign-components/clean-code",
+            source="atomgit",
+            repository_url="https://atomgit.com/openeuler/opendesign-components",
+            source_url="https://atomgit.com/openeuler/opendesign-components/blob/master/../secrets/SKILL.md",
             refs=["master"],
         )
 
@@ -178,8 +178,8 @@ def test_create_skill_archive_reports_missing_skill_at_commit(tmp_path):
             manager.create_skill_archive(
                 skill=_skill(
                     commit_id,
-                    skill_id="gitcode:openeuler/opendesign-components/missing",
-                    source_url="https://gitcode.com/openeuler/opendesign-components/blob/master/packages/skills/missing/SKILL.md",
+                    skill_id="atomgit:openeuler/opendesign-components/missing",
+                    source_url="https://atomgit.com/openeuler/opendesign-components/blob/master/packages/skills/missing/SKILL.md",
                 ),
                 repository=_repository(repository),
             )

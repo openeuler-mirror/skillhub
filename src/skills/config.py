@@ -9,7 +9,7 @@ import yaml
 
 from src.utils.git_operations import GitOperations
 
-OPENEULER_SKILLS_URL = "https://gitcode.com/openeuler/openEuler-skills"
+OPENEULER_SKILLS_URL = "https://atomgit.com/openeuler/openEuler-skills"
 
 logger = logging.getLogger(__name__)
 

@@ -2,7 +2,7 @@
 
 set -eu
 
-# 部分平台（如未启用 LFS 的 GitCode 项目）无法下载 Git LFS 大文件。
+# 部分平台（如未启用 LFS 的 AtomGit 项目）无法下载 Git LFS 大文件。
 # 跳过 LFS smudge，让 git cat-file 导出 LFS 指针文件（文本）而非二进制内容，
 # 避免 checkout 阶段因下载 LFS blob 失败导致整个扫描失败。
 export GIT_LFS_SKIP_SMUDGE=1

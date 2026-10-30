@@ -38,15 +38,15 @@ class TestSkillsTelemetry:
 
         assert skill_id == "github:acme/agent-skills/agent-skills"
 
-    def test_build_skill_id_from_telemetry_gitcode_matches_crawler(self):
+    def test_build_skill_id_from_telemetry_atomgit_matches_crawler(self):
         skill_id = build_skill_id_from_telemetry(
-            "gitcode",
+            "atomgit",
             "openeuler/yuanrong",
-            "gitcode-api",
-            {"gitcode-api": ".skills/gitcode-api/SKILL.md"},
+            "atomgit-api",
+            {"atomgit-api": ".skills/atomgit-api/SKILL.md"},
         )
 
-        assert skill_id == "gitcode:openeuler/yuanrong/gitcode-api"
+        assert skill_id == "atomgit:openeuler/yuanrong/atomgit-api"
 
     def test_process_install_telemetry_increments_each_matched_skill(self):
         service = TelemetryService(AsyncMock())

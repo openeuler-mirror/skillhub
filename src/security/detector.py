@@ -47,7 +47,6 @@ ALLOWED_GIT_HOSTS = frozenset({
     "bitbucket.org",
     "gitea.io",
     "gitee.com",
-    "gitcode.com",
     "atomgit.com",
     "codeberg.org",
     "git.sr.ht",

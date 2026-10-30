@@ -14,7 +14,9 @@ def build_skill_id_from_telemetry(
     skill_name: str,
     skill_files: dict[str, str] | None = None,
 ) -> str | None:
-    if source_type not in {"github", "gitcode", "gitlab", "gitee"}:
+    if source_type == "gitcode":
+        source_type = "atomgit"
+    if source_type not in {"github", "atomgit", "gitlab", "gitee"}:
         return None
     if not repo_url:
         return None

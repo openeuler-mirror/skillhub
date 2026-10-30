@@ -711,14 +711,14 @@ def _add_popularity_parser(subparsers: argparse._SubParsersAction) -> None:
         "popularity",
         help="Collect popularity (stars/forks/watchers) for configured repos",
         description=(
-            "Query GitHub/GitCode public APIs for repository popularity metrics "
+            "Query GitHub/AtomGit public APIs for repository popularity metrics "
             "and persist them on the matching skill_repos rows."
         ),
     )
     parser.add_argument(
         "-s",
         "--source",
-        choices=("github", "gitcode"),
+        choices=("github", "atomgit"),
         default=None,
         help="Only collect from this platform (default: all)",
     )

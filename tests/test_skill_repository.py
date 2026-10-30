@@ -489,7 +489,7 @@ class TestSkillRepositoryUnit:
         skill_file = tmp_path / "personal" / "leon-wang2021" / "skill.yaml"
         skill_file.parent.mkdir(parents=True)
         skill_file.write_text(
-            "skill_repos:\n- url: https://gitcode.com/leon-wang2021/aet\n",
+            "skill_repos:\n- url: https://atomgit.com/leon-wang2021/aet\n",
             encoding="utf-8",
         )
         monkeypatch.setattr(
@@ -499,7 +499,7 @@ class TestSkillRepositoryUnit:
         requests = _build_requests_from_skill_yaml("personal/leon-wang2021/skill.yaml")
 
         assert len(requests) == 1
-        assert requests[0].url == "https://gitcode.com/leon-wang2021/aet"
+        assert requests[0].url == "https://atomgit.com/leon-wang2021/aet"
         assert requests[0].platform == "personal"
 
     def test_single_skill_yaml_rejects_invalid_target(self, tmp_path, monkeypatch):
@@ -566,15 +566,15 @@ repositories:
 
         mapping = _load_sig_mapping(tmp_path)
 
-        assert mapping["gitcode.com_openeuler_PilotGo-plugin-llmops"] == "sig-ops"
-        assert mapping["gitcode.com_openeuler_intel-openvino"] == "sig-ops"
-        assert "gitcode.com_src-openeuler_ignored-package" not in mapping
+        assert mapping["atomgit.com_openeuler_PilotGo-plugin-llmops"] == "sig-ops"
+        assert mapping["atomgit.com_openeuler_intel-openvino"] == "sig-ops"
+        assert "atomgit.com_src-openeuler_ignored-package" not in mapping
 
     def test_build_requests_from_catalog_includes_community_sig_name(self, tmp_path):
         repos_dict = {
             "community": [
                 {
-                    "url": "https://gitcode.com/openeuler/PilotGo-plugin-llmops",
+                    "url": "https://atomgit.com/openeuler/PilotGo-plugin-llmops",
                     "sig_name": "sig-ops",
                 }
             ]
@@ -592,21 +592,21 @@ repositories:
         skill_file = tmp_path / "community" / "sig-security-facility" / "skill.yaml"
         skill_file.parent.mkdir(parents=True)
         skill_file.write_text(
-            "name: security\nskill_repos:\n  - url: https://gitcode.com/openeuler/security\n",
+            "name: security\nskill_repos:\n  - url: https://atomgit.com/openeuler/security\n",
             encoding="utf-8",
         )
         config = load_crawler_config(tmp_path)
-        assert config["community"][0]["url"] == "https://gitcode.com/openeuler/security"
+        assert config["community"][0]["url"] == "https://atomgit.com/openeuler/security"
         assert config["community"][0]["sig_name"] == "sig-security-facility"
 
     def test_skill_manager_resolves_openeuler_sig_lazily(self):
         manager = SkillManager(MagicMock(), MagicMock())
         manager._openeuler_sig_by_repo_name = {
-            "gitcode.com_openeuler_PilotGo-plugin-llmops": "sig-ops"
+            "atomgit.com_openeuler_PilotGo-plugin-llmops": "sig-ops"
         }
 
         sig_name = manager._get_openeuler_sig_name(
-            "gitcode.com_openeuler_PilotGo-plugin-llmops"
+            "atomgit.com_openeuler_PilotGo-plugin-llmops"
         )
 
         assert sig_name == "sig-ops"
@@ -794,8 +794,8 @@ repositories:
         )
         repo = SimpleNamespace(
             id=uuid.uuid4(),
-            source="gitcode",
-            url="https://gitcode.com/acme/widgets",
+            source="atomgit",
+            url="https://atomgit.com/acme/widgets",
             branch="master",
             platform=None,
         )
@@ -814,13 +814,13 @@ repositories:
         )
 
         assert {skill.skill_id for skill in skills} == {
-            "gitcode:acme/widgets/skill",
-            "gitcode:acme/widgets/skill-1",
+            "atomgit:acme/widgets/skill",
+            "atomgit:acme/widgets/skill-1",
         }
         assert {(v.version, v.commit_id) for v in tagged_skills} == {
             ("v2", v2_commit),
         }
-        assert {v.skill_id for v in tagged_skills} == {"gitcode:acme/widgets/skill"}
+        assert {v.skill_id for v in tagged_skills} == {"atomgit:acme/widgets/skill"}
 
     async def test_skill_scanner_pre_dedups_same_commit_tags(self, tmp_path):
         """Tags pointing at the same commit must not re-run record assembly.
@@ -856,8 +856,8 @@ repositories:
         )
         repo = SimpleNamespace(
             id=uuid.uuid4(),
-            source="gitcode",
-            url="https://gitcode.com/acme/widgets",
+            source="atomgit",
+            url="https://atomgit.com/acme/widgets",
             branch="master",
             platform=None,
         )
@@ -1087,8 +1087,8 @@ repositories:
         )
         repo = SimpleNamespace(
             id=uuid.uuid4(),
-            source="gitcode",
-            url="https://gitcode.com/weijihui/test",
+            source="atomgit",
+            url="https://atomgit.com/weijihui/test",
             branch="main",
             platform=None,
         )
@@ -1341,8 +1341,8 @@ repositories:
         )
         repo = SimpleNamespace(
             id=uuid.uuid4(),
-            source="gitcode",
-            url="https://gitcode.com/acme/widgets",
+            source="atomgit",
+            url="https://atomgit.com/acme/widgets",
             branch="master",
             platform=None,
         )
@@ -1353,7 +1353,7 @@ repositories:
             repository_git_metadata={"commit_id": head_commit},
         )
 
-        assert {skill.skill_id for skill in skills} == {"gitcode:acme/widgets/with-both"}
+        assert {skill.skill_id for skill in skills} == {"atomgit:acme/widgets/with-both"}
 
     async def test_configured_discover_force_does_not_skip_commit_unchanged_check(self):
         skill_repository = MagicMock()
@@ -1439,14 +1439,14 @@ repositories:
         repository = SimpleNamespace(
             id=1,
             repo_name="openeuler_demo-skills",
-            source="gitcode",
+            source="atomgit",
             platform="",
         )
 
         returned = await manager._sync_catalog_source(
             repository,
             SkillRepositoryRequest(
-                url="https://gitcode.com/openeuler/demo-skills",
+                url="https://atomgit.com/openeuler/demo-skills",
                 platform="community",
             ),
         )
@@ -1479,14 +1479,14 @@ repositories:
         repository = SimpleNamespace(
             id=1,
             repo_name="openeuler_demo-skills",
-            source="gitcode",
+            source="atomgit",
             platform="community",
         )
 
         returned = await manager._sync_catalog_source(
             repository,
             SkillRepositoryRequest(
-                url="https://gitcode.com/openeuler/demo-skills",
+                url="https://atomgit.com/openeuler/demo-skills",
                 platform="community",
             ),
         )
@@ -2851,7 +2851,7 @@ class TestDeleteCleanup:
             "src.models.repository.SkillRepository.delete_skill_related_records",
             related_mock,
         ):
-            result = await SkillRepository(session).delete("gitcode:acme/widgets/one")
+            result = await SkillRepository(session).delete("atomgit:acme/widgets/one")
 
         assert result is True
         assert set(related_mock.await_args.args[0]) == {
@@ -2886,11 +2886,11 @@ class TestSkillUrlContribution:
         assert ref == "main"
         assert skill_path == "skills/demo/SKILL.md"
 
-        # atomgit 旧域名规范化为 gitcode；查询串/锚点忽略
+        # atomgit 旧域名规范化为 atomgit；查询串/锚点忽略
         repo_url, ref, skill_path = parse_skill_md_url(
             "https://atomgit.com/acme/x/blob/master/SKILL.md?plain=1"
         )
-        assert repo_url == "https://gitcode.com/acme/x"
+        assert repo_url == "https://atomgit.com/acme/x"
         assert ref == "master"
         assert skill_path == "SKILL.md"
 
@@ -3063,8 +3063,8 @@ class TestSkillUrlContribution:
         )
         repo = SimpleNamespace(
             id=uuid.uuid4(),
-            source="gitcode",
-            url="https://gitcode.com/acme/widgets",
+            source="atomgit",
+            url="https://atomgit.com/acme/widgets",
             branch="master",
             platform=None,
         )
@@ -3081,8 +3081,8 @@ class TestSkillUrlContribution:
             skill_path_filter={"skills/one/SKILL.md"},
         )
 
-        assert [skill.skill_id for skill in skills] == ["gitcode:acme/widgets/one"]
-        assert {v.skill_id for v in tagged_skills} == {"gitcode:acme/widgets/one"}
+        assert [skill.skill_id for skill in skills] == ["atomgit:acme/widgets/one"]
+        assert {v.skill_id for v in tagged_skills} == {"atomgit:acme/widgets/one"}
 
 
 class TestConfig:
@@ -3130,7 +3130,7 @@ class TestSkillSchema:
         assert response.skill_id.startswith("author/")
 
     async def test_source_validation(self):
-        valid_sources = ["local", "github", "clawhub", "gitcode", "gitlab"]
+        valid_sources = ["local", "github", "clawhub", "atomgit", "gitlab"]
         for source in valid_sources:
             skill_data = {
                 "id": str(uuid.uuid4()),

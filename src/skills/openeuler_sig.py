@@ -15,7 +15,7 @@ from src.core.config import get_settings
 _logger = logging.getLogger(__name__)
 settings = get_settings()
 
-COMMUNITY_REPO_URL = "https://gitcode.com/openeuler/community.git"
+COMMUNITY_REPO_URL = "https://atomgit.com/openeuler/community.git"
 COMMUNITY_CACHE_DIRNAME = "openeuler-community"
 
 
@@ -36,7 +36,7 @@ def repo_name_from_openeuler_repo_slug(repo_slug: str) -> str | None:
     parts = normalized.split("/", 1)
     if len(parts) != 2 or not parts[1].strip():
         return None
-    return f"gitcode.com_openeuler_{parts[1].strip()}"
+    return f"atomgit.com_openeuler_{parts[1].strip()}"
 
 
 def repo_name_from_url(url: str | None) -> str | None:

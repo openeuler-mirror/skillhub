@@ -30,7 +30,7 @@ AI Agent Skills 检索与分发平台。发现、评估和获取可复用的 AI 
 ### 准备环境变量
 
 ```bash
-git clone https://gitcode.com/openeuler/wittyhub.git
+git clone https://atomgit.com/openeuler/wittyhub.git
 cd wittyhub
 cp deploy/.env.example deploy/.env
 ```

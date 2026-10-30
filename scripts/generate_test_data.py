@@ -27,7 +27,7 @@ PLATFORMS = [
     "csharp", "ruby", "php", "swift", "kotlin", "scala"
 ]
 
-SOURCES = ["github", "gitlab", "gitcode", "local", "clawhub"]
+SOURCES = ["github", "gitlab", "atomgit", "local", "clawhub"]
 
 SKILL_TEMPLATES = {
     "python": {
