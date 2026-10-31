@@ -219,14 +219,16 @@ class DiscoverScheduler:
             # 失败仅记录日志，不阻断本轮扫描（清理属于自愈，非主流程）。
             try:
                 removed_repos = await manager.delete_removed_catalog_repos(requests)
-                if removed_repos:
+                removed_skills = await manager.delete_removed_catalog_skills(requests)
+                if removed_repos or removed_skills:
                     logger.info(
-                        "%s synced catalog removals before scan: %d repo(s) deleted",
+                        "%s synced catalog removals before scan: %d repo(s), %d skill(s) deleted",
                         LOG_PREFIX,
                         removed_repos,
+                        removed_skills,
                     )
                 else:
-                    logger.info("%s no catalog repo removed before scan", LOG_PREFIX)
+                    logger.info("%s no catalog repo/skill removed before scan", LOG_PREFIX)
             except Exception:
                 logger.exception("%s catalog removal sync failed", LOG_PREFIX)
             for index, request in enumerate(requests, start=1):

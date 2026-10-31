@@ -26,6 +26,7 @@ from src.skills.skill_parser import (
     normalize_git_clone_url,
 )
 from src.skills.skill_scanner import SkillScanner
+from src.skills.skill_id import build_skill_id, extract_owner_repo
 from src.core.config import get_settings
 from src.models.orm import Skill, SkillVersion
 from src.models.repository import (
@@ -440,6 +441,48 @@ class SkillManager:
             deleted_contributors,
         )
         return len(removed_ids)
+
+    async def delete_removed_catalog_skills(
+        self, requests: list[SkillRepositoryRequest]
+    ) -> int:
+        """同步删除 catalog 中已撤销登记的单 Skill（URL / local_skills 条目移除）。
+
+        对每条「部分扫描」请求（``skill_paths`` 非空：``skills[].skill_url``
+        单 Skill 与 ``local_skills`` 原文件方式），按同一口径推导该仓库期望
+        存在的 skill_id 集合，删除仓库下不属于集合的 skill（含 version 与
+        security_audits / download_history 软关联）。整仓移除由
+        ``delete_removed_catalog_repos`` 负责；整仓请求（skill_paths=None）
+        在这里跳过——它是全量扫描，store 的 diff 已覆盖。
+        返回删除的 skill 行数。
+        """
+        deleted = 0
+        for request in requests:
+            if not request.skill_paths:
+                continue
+            normalized = self._normalize_repository_request(request)
+            repo_name = self._derive_repo_name(normalized)
+            repository = await self.skill_repo_repository.get_skill_repository_by_repo_name(repo_name)
+            if repository is None:
+                continue
+            source, _ = derive_skill_source(normalized.url)
+            owner_repo = extract_owner_repo(normalized.url)
+            expected_skill_ids = {
+                build_skill_id(source, owner_repo, path)
+                for path in normalized.skill_paths
+            }
+            removed = await self.skill_repository.delete_skills_not_in_skill_ids(
+                repository.id, expected_skill_ids
+            )
+            if removed:
+                deleted += removed
+                _logger.info(
+                    '[Discover] removed %d revoked skill(s) from %s',
+                    removed,
+                    repo_name,
+                )
+        if deleted:
+            await self._reconcile_skill_statistics()
+        return deleted
 
     def _contributor_profile(self, platform: str | None, author: str) -> dict[str, Any]:
         """Lookup catalog profile fields (name/description/git_profile) for a contributor.
