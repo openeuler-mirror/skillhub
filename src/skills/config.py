@@ -112,6 +112,40 @@ def load_catalog_skill_url_entries(repository_path: Path | None = None) -> list[
     return entries
 
 
+def load_catalog_local_skill_entries(repository_path: Path | None = None) -> list[dict[str, Any]]:
+    """收集 catalog 中的原文件方式贡献条目（``local_skills``）。
+
+    返回 ``{"platform", "owner", "author", "skill_name", "skill_path"}`` 列表。
+    ``skill_path`` 为仓库根目录 ``skills/<skill_name>/SKILL.md`` 相对路径；
+    ``author`` 口径与 ``load_contributor_profiles`` 一致（enterprise 取
+    organization 字段否则 owner，community/personal 取 owner）。
+    """
+    path = (repository_path or sync_openEuler_skills_repo()).expanduser()
+    entries: list[dict[str, Any]] = []
+    for platform, owner, entry in _iter_catalog_entries(path):
+        local_skills = entry.get("local_skills")
+        if not isinstance(local_skills, list):
+            continue
+        if platform == "enterprise":
+            author = _clean_optional_str(entry.get("organization")) or owner
+        else:
+            author = owner
+        for skill_name in local_skills:
+            if not isinstance(skill_name, str):
+                continue
+            name = skill_name.strip()
+            if not name:
+                continue
+            entries.append({
+                "platform": platform,
+                "owner": owner,
+                "author": author,
+                "skill_name": name,
+                "skill_path": f"skills/{name}/SKILL.md",
+            })
+    return entries
+
+
 def load_single_catalog_entry(skill_yaml: Path) -> tuple[str, str, dict[str, Any]]:
     """读取单个 skill.yaml → ``(platform, owner, entry)``（``--url`` 单文件模式）。
 

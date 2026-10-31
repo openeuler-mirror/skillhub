@@ -51,6 +51,10 @@ class SkillRepositoryRequest(BaseModel):
     # URL 方式贡献的单 Skill 收窄扫描（skills[].skill_url）：非空时只收录
     # 这些 SKILL.md 相对路径；None 表示整仓扫描
     skill_paths: list[str] | None = None
+    # 原文件方式贡献（local_skills）：相对路径 → author / platform 两个平行映射，
+    # 用于同一仓库（openEuler-skills catalog）内多个作者各自的 Skill 归属覆盖。
+    skill_authors: dict[str, str] | None = None
+    skill_platforms: dict[str, str] | None = None
 
 
 class SkillDiscoverStatus:
@@ -253,6 +257,8 @@ class SkillManager:
                 skill_paths=skill_paths,
                 skill_path_filter=skill_path_filter,
                 author=normalized.sig_name,
+                skill_authors=normalized.skill_authors,
+                skill_platforms=normalized.skill_platforms,
             )
         except Exception as exc:
             error_summary = self._git_ops.summarize_exception(exc)
@@ -285,6 +291,8 @@ class SkillManager:
         skill_paths: list[str] | None = None,
         skill_path_filter: set[str] | None = None,
         author: str | None = None,
+        skill_authors: dict[str, str] | None = None,
+        skill_platforms: dict[str, str] | None = None,
     ) -> SkillRepoModel:
         author = author or self._resolve_skill_author(repo.platform, repo_name)
         latest_skills, tagged_skills, repository_commit_id = await self._discover_skills(
@@ -293,6 +301,8 @@ class SkillManager:
             author=author,
             skill_paths=skill_paths,
             skill_path_filter=skill_path_filter,
+            skill_authors=skill_authors,
+            skill_platforms=skill_platforms,
         )
         # enterprise/personal 仓库 author 未显式传入（community 走 sig_name）时，
         # 用扫描结果里 URL 推导的 author 兜底，保证 skill_repos.author 与
@@ -415,6 +425,8 @@ class SkillManager:
         author: str | None,
         skill_paths: list[str] | None = None,
         skill_path_filter: set[str] | None = None,
+        skill_authors: dict[str, str] | None = None,
+        skill_platforms: dict[str, str] | None = None,
     ) -> tuple[list[Skill], list[SkillVersion], str | None]:
         clone_url = normalize_clone_url_for_git(repo.url)
         repository_git_metadata = await asyncio.to_thread(
@@ -448,6 +460,8 @@ class SkillManager:
             author=author,
             skill_paths=skill_paths,
             skill_path_filter=skill_path_filter,
+            skill_authors=skill_authors,
+            skill_platforms=skill_platforms,
         )
         return latest_skills, tagged_skills, repository_commit_id
 
@@ -675,12 +689,26 @@ class SkillManager:
             if request.skill_paths
             else None
         )
+        skill_authors = (
+            {path.strip(): str(val).strip() for path, val in request.skill_authors.items()
+             if path.strip() and str(val).strip()}
+            if request.skill_authors
+            else None
+        )
+        skill_platforms = (
+            {path.strip(): str(val).strip() for path, val in request.skill_platforms.items()
+             if path.strip() and str(val).strip()}
+            if request.skill_platforms
+            else None
+        )
         return SkillRepositoryRequest(
             branch=branch,
             url=url,
             platform=platform,
             sig_name=sig_name,
             skill_paths=skill_paths or None,
+            skill_authors=skill_authors or None,
+            skill_platforms=skill_platforms or None,
         )
 
     @staticmethod
