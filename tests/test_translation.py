@@ -14,24 +14,19 @@ def test_contains_chinese():
 @pytest.mark.asyncio
 async def test_translate_query_uses_openai_compatible_response():
     translation._cache.clear()
-    response = MagicMock()
-    response.raise_for_status.return_value = None
-    response.json.return_value = {
-        "choices": [{"message": {"content": "log analysis"}}]
-    }
     settings = MagicMock()
     settings.model.base_url = "http://model"
     settings.model.api_key = "token"
     settings.model.name = "translator"
     settings.model.timeout = 5
+    completion = AsyncMock(return_value="log analysis")
     with (
         patch.object(translation, "get_settings", return_value=settings),
-        patch.object(translation, "_get_client") as get_client,
+        patch.object(translation, "chat_completion", completion),
     ):
-        get_client.return_value.post = AsyncMock(return_value=response)
         assert await translation.translate_query_to_english(" 日志分析 ") == "log analysis"
         assert await translation.translate_query_to_english("日志分析") == "log analysis"
-        assert get_client.return_value.post.await_count == 1
+        assert completion.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -40,9 +35,10 @@ async def test_translate_query_failure_degrades_to_none():
     settings.model.base_url = "http://model"
     settings.model.api_key = "token"
     settings.model.timeout = 5
+    completion = AsyncMock(side_effect=httpx.TimeoutException("timeout"))
     with (
         patch.object(translation, "get_settings", return_value=settings),
-        patch.object(translation, "_get_client") as get_client,
+        patch.object(translation, "chat_completion", completion),
     ):
-        get_client.return_value.post = AsyncMock(side_effect=httpx.TimeoutException("timeout"))
         assert await translation.translate_query_to_english("分析日志") is None
+        assert completion.await_count == 1
