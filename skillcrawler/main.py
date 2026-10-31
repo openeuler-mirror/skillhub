@@ -27,7 +27,7 @@ from src.core.config import get_settings
 from src.core.database import get_db_context
 from src.skills.discover_requests import (
     PLATFORM_CHOICES,
-    _build_requests_from_skill_yaml,
+    build_requests_from_skill_yaml,
     build_configured_discover_requests,
 )
 from src.skills.discover_result import (
@@ -512,7 +512,7 @@ async def _run_discover_single_skill_yaml(
     args: argparse.Namespace,
 ) -> tuple[int, dict[str, Any]]:
     """--url 单文件模式：只扫描指定 skill.yaml 登记的 skill_repos / skills[]。"""
-    requests = _build_requests_from_skill_yaml(args.url)
+    requests = build_requests_from_skill_yaml(args.url)
     return await _discover_repositories_from_requests(
         manager,
         requests,

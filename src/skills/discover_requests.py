@@ -133,7 +133,7 @@ def _build_requests_from_skill_urls(
     ]
 
 
-def _build_requests_from_skill_yaml(skill_yaml: str) -> list[SkillRepositoryRequest]:
+def build_requests_from_skill_yaml(skill_yaml: str) -> list[SkillRepositoryRequest]:
     """从单个 skill.yaml 构建 discover 请求（``--url`` 单文件模式）。
 
     与全量构建同口径：``skill_repos`` 整仓条目 + ``skills[].skill_url`` 单

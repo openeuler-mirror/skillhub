@@ -30,7 +30,7 @@ from src.skills.skill_scanner import SkillScanner
 from src.skills.discover_requests import (
     PLATFORM_CHOICES,
     _build_requests_from_config,
-    _build_requests_from_skill_yaml,
+    build_requests_from_skill_yaml,
     _normalize_platform,
     build_configured_discover_requests,
 )
@@ -470,7 +470,7 @@ class TestSkillRepositoryUnit:
             encoding="utf-8",
         )
 
-        requests = _build_requests_from_skill_yaml(str(skill_file))
+        requests = build_requests_from_skill_yaml(str(skill_file))
 
         assert len(requests) == 2
         repo_request = next(r for r in requests if r.skill_paths is None)
@@ -496,7 +496,7 @@ class TestSkillRepositoryUnit:
             "skillcrawler.main.sync_openEuler_skills_repo", lambda: tmp_path
         )
 
-        requests = _build_requests_from_skill_yaml("personal/leon-wang2021/skill.yaml")
+        requests = build_requests_from_skill_yaml("personal/leon-wang2021/skill.yaml")
 
         assert len(requests) == 1
         assert requests[0].url == "https://atomgit.com/leon-wang2021/aet"
@@ -509,7 +509,7 @@ class TestSkillRepositoryUnit:
             "skillcrawler.main.sync_openEuler_skills_repo", lambda: tmp_path
         )
         with pytest.raises(ValueError, match="skill.yaml not found"):
-            _build_requests_from_skill_yaml("personal/x/skill.yaml")
+            build_requests_from_skill_yaml("personal/x/skill.yaml")
 
         wrong_name = tmp_path / "personal" / "x" / "other.yaml"
         wrong_name.parent.mkdir(parents=True)

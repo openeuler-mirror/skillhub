@@ -217,7 +217,7 @@ start_scan(...)
    对应列表为空同样 warning 后跳过，不产生请求。
 
 使用 `--url` 单文件模式时，只构建指定 skill.yaml 登记的请求（入口
-[main.py `_build_requests_from_skill_yaml`](../../skillcrawler/main.py)）：
+[main.py `build_requests_from_skill_yaml`](../../skillcrawler/main.py)）：
 `platform` / owner 取自文件目录结构 `<catalog>/<platform>/<owner>/skill.yaml`
 （不再由 URL 推断）；路径先按本地文件解析，不存在时按 catalog 根
 （`-r` / 自动同步的 openEuler-skills）解析相对路径；文件名必须恰好是
