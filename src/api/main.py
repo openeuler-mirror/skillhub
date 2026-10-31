@@ -135,6 +135,11 @@ async def lifespan(app: FastAPI):
 
         collector = await start_skillspector_collector()
 
+    # 一次性迁移先于 discover 扫描执行；幂等，
+    from src.jobs.migration import run_migration
+
+    await run_migration()
+
     discover_scheduler = None
     if settings.discover_scheduler.enabled:
         from src.jobs.discover_scheduler import start_discover_scheduler
