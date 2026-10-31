@@ -215,6 +215,20 @@ class DiscoverScheduler:
                 contributor_repository=ContributorRepository(session),
                 catalog_path=repository_path,
             )
+            # 先同步删除 catalog 中已消失的仓库，再开始扫描新增/更新。
+            # 失败仅记录日志，不阻断本轮扫描（清理属于自愈，非主流程）。
+            try:
+                removed_repos = await manager.delete_removed_catalog_repos(requests)
+                if removed_repos:
+                    logger.info(
+                        "%s synced catalog removals before scan: %d repo(s) deleted",
+                        LOG_PREFIX,
+                        removed_repos,
+                    )
+                else:
+                    logger.info("%s no catalog repo removed before scan", LOG_PREFIX)
+            except Exception:
+                logger.exception("%s catalog removal sync failed", LOG_PREFIX)
             for index, request in enumerate(requests, start=1):
                 label = request.url or "<missing-url>"
                 logger.info("%s [%d/%d] scanning %s", LOG_PREFIX, index, total, label)

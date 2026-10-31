@@ -42,6 +42,10 @@ if TYPE_CHECKING:
 _logger = logging.getLogger(__name__)
 settings = get_settings()
 
+# catalog 仓库的三个渠道（按 skill_repos.platform 判定）；用于「同步删除」时
+# 识别哪些仓库属于 openEuler-skills catalog 登记、可从删除同步中清理。
+CATALOG_PLATFORMS = ("community", "enterprise", "personal")
+
 
 class SkillRepositoryRequest(BaseModel):
     branch: str | None = None
@@ -387,6 +391,55 @@ class SkillManager:
                 )
         except Exception as exc:
             _logger.warning('[Discover] Failed to reconcile skill statistics after scan: %s', exc)
+
+    async def delete_removed_catalog_repos(
+        self, requests: list[SkillRepositoryRequest]
+    ) -> int:
+        """同步删除 catalog 中已消失的仓库及其级联数据，返回删除的仓库数。
+
+        按 platform ∈ {community, enterprise, personal} 识别 catalog 仓库，
+        删除其中 repo_name 不在期望集合内的行——期望集合由本次扫描请求
+        （platform 属于 catalog 渠道的部分）按同一 normalize / derive 口径推导。
+        skill / skill_versions 通过外键 CASCADE 删除，security_audits /
+        download_history 软关联由 ``delete_skill_repositories`` 一并清理。
+        删除后重算 contributors.skill_count 并物理删除名下已无任何 skill
+        的 contributor 行（孤儿作者）。
+        """
+        expected_repo_names = {
+            self._derive_repo_name(self._normalize_repository_request(request))
+            for request in requests
+            if request.platform in CATALOG_PLATFORMS
+        }
+        repos = await self.skill_repo_repository.list_skill_repositories()
+        removed = [
+            repo for repo in repos
+            if repo.platform in CATALOG_PLATFORMS and repo.repo_name not in expected_repo_names
+        ]
+        if not removed:
+            return 0
+
+        removed_ids = [repo.id for repo in removed]
+        _logger.info(
+            '[Discover] syncing catalog removals: deleting %d repo(s) %s',
+            len(removed_ids),
+            [repo.repo_name for repo in removed],
+        )
+        await self.skill_repo_repository.delete_skill_repositories(removed_ids)
+
+        # 删除后自愈统计值并清理孤儿作者；内部容错，失败仅告警不影响删除结果
+        await self._reconcile_skill_statistics()
+        deleted_contributors = 0
+        if self.contributor_repository is not None:
+            deleted_contributors = (
+                await self.contributor_repository.delete_contributors_without_skills()
+            )
+        _logger.info(
+            '[Discover] catalog removal sync done: repos_deleted=%d, '
+            'empty_contributors_deleted=%d',
+            len(removed_ids),
+            deleted_contributors,
+        )
+        return len(removed_ids)
 
     def _contributor_profile(self, platform: str | None, author: str) -> dict[str, Any]:
         """Lookup catalog profile fields (name/description/git_profile) for a contributor.

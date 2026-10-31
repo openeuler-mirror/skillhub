@@ -1277,6 +1277,28 @@ class ContributorRepository:
             await self.session.commit()
         return int(result.rowcount or 0)
 
+    async def delete_contributors_without_skills(self, commit: bool = True) -> int:
+        """物理删除名下已无任何 skill 记录的 contributor，返回删除行数。
+
+        判定口径为 skills 表中 (source, author) 是否存在任何行（而非
+        ``reconcile_skill_counts`` 的可见口径——后者会把仅有未审计 skill 的
+        贡献者也算作空并误删）。用于 catalog 删除仓库后清理孤儿作者，幂等。
+        """
+        skill_exists = (
+            select(func.count(Skill.id))
+            .where(
+                Skill.source == Contributor.source,
+                Skill.author == Contributor.author,
+            )
+            .scalar_subquery()
+        )
+        result = await self.session.execute(
+            delete(Contributor).where(skill_exists == 0)
+        )
+        if commit:
+            await self.session.commit()
+        return int(result.rowcount or 0)
+
     async def list(
         self,
         *,
