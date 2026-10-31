@@ -154,6 +154,7 @@ def _save_remediation_result_file(
                 "remediation_run": remediation_run_with_notes(results),
             },
             file_prefix="remediation",
+            log=False,
         )
         if path:
             logger.info("%s result saved to %s", LOG_PREFIX, path)

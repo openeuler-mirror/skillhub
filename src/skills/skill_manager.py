@@ -399,8 +399,9 @@ class SkillManager:
         """同步删除 catalog 中已消失的仓库及其级联数据，返回删除的仓库数。
 
         按 platform ∈ {community, enterprise, personal} 识别 catalog 仓库，
-        删除其中 repo_name 不在期望集合内的行——期望集合由本次扫描请求
-        （platform 属于 catalog 渠道的部分）按同一 normalize / derive 口径推导。
+        删除其中 repo_name 不在期望集合内的行——期望集合由本次扫描请求中
+        platform 属于 catalog 渠道的部分按同一 normalize / derive 口径推导
+        （PLATFORM_CHOICES 已覆盖三渠道，``requests`` 即全量 catalog 登记）。
         skill / skill_versions 通过外键 CASCADE 删除，security_audits /
         download_history 软关联由 ``delete_skill_repositories`` 一并清理。
         删除后重算 contributors.skill_count 并物理删除名下已无任何 skill
