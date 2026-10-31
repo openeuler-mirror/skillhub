@@ -17,15 +17,13 @@ pg_advisory_lock（embedding 的锁另与全量重建脚本互斥），单任务
 
 触发点两处：
 
-- ``run_remediation_loop()``：API 启动后立即补一轮，之后每小时一轮，
-  兜住长驻实例期间新增的缺口；
+- API 启动时（main lifespan 在 discover 扫描前先补一轮历史遗留缺口）；
 - 每轮 discover 末尾（skillcrawler CLI 与 DiscoverScheduler）：本轮新
-  入库的缺口行立即补齐，不必等下个整点。
+  入库的缺口行立即补齐，不必等启动。
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import time
 from datetime import datetime
@@ -35,9 +33,6 @@ from src.core.config import get_settings
 
 logger = logging.getLogger(__name__)
 LOG_PREFIX = "[Remediation]"
-
-# 低频补齐循环的默认间隔（秒）：启动即补一轮，之后每小时一轮
-DEFAULT_INTERVAL_SECONDS = 3600.0
 
 
 # ── 补齐任务：run_remediations 依次执行 security / category / embedding ──
@@ -119,26 +114,21 @@ async def run_remediations() -> dict[str, Any]:
     return results
 
 
-async def run_remediation_loop(
-    interval_seconds: float = DEFAULT_INTERVAL_SECONDS,
-) -> None:
-    """启动后立即补一轮，此后每 interval_seconds 补一轮，直到被 cancel。
+async def run_remediation_on_startup() -> None:
+    """API 启动时补一轮历史遗留缺口，并把结果落盘；失败只记日志不影响启动。
 
-    单轮异常只记录日志，不终止循环（与 DiscoverScheduler 同款容错）。
-    每轮结果写入结果目录下的 remediation-<时间戳>.json（与 discover 结果
-    同目录同风格，remediation_run 各字段含 <key>_note 说明）。
+    触发点在 main lifespan（discover 扫描前）；discover 每轮末尾的补齐结果
+    则由 discover_scheduler 直接写进 discover-<时间戳>.json，不经过本函数。
     """
-    while True:
-        started_at = datetime.now()
-        run_started = time.monotonic()
-        logger.info("%s round started", LOG_PREFIX)
-        try:
-            results = await run_remediations()
-            logger.info("%s round finished: %s", LOG_PREFIX, results)
-            _save_remediation_result_file(results, started_at, run_started)
-        except Exception:
-            logger.exception("%s round failed", LOG_PREFIX)
-        await asyncio.sleep(interval_seconds)
+    started_at = datetime.now()
+    run_started = time.monotonic()
+    logger.info("%s startup round started", LOG_PREFIX)
+    try:
+        results = await run_remediations()
+        logger.info("%s startup round finished: %s", LOG_PREFIX, results)
+        _save_remediation_result_file(results, started_at, run_started)
+    except Exception:
+        logger.exception("%s startup round failed", LOG_PREFIX)
 
 
 def _save_remediation_result_file(
@@ -166,6 +156,6 @@ def _save_remediation_result_file(
             file_prefix="remediation",
         )
         if path:
-            logger.info("[Remediation] %s result saved to %s", LOG_PREFIX, path)
+            logger.info("%s result saved to %s", LOG_PREFIX, path)
     except Exception:
         logger.warning("%s failed to save result file", LOG_PREFIX, exc_info=True)

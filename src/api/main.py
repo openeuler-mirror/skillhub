@@ -1,4 +1,3 @@
-import asyncio
 import logging
 import sys
 from contextlib import asynccontextmanager
@@ -106,24 +105,6 @@ def configure_logging() -> None:
     )
 
 
-async def _run_remediation_loop() -> None:
-    """启动后立即补一轮衍生字段缺口，之后低频定时补跑，失败不影响服务。
-
-    覆盖三类缺口（security 风险分 / category 分类 / embedding 向量），
-    详见 src/jobs/remediation.py：启动即补可自愈重启期间错过的补跑
-    （discover 调度会跳过当天已过触发点），之后每小时一轮兜住长驻实例
-    期间新增的缺口。单轮内部各任务自持 pg_advisory_lock 互斥。
-    """
-    from src.jobs.remediation import run_remediation_loop
-
-    try:
-        await run_remediation_loop()
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        structlog.get_logger().exception("Remediation loop failed")
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger = structlog.get_logger()
@@ -140,18 +121,20 @@ async def lifespan(app: FastAPI):
 
     await run_migration()
 
+    # 启动顺序：先补衍生字段缺口（security/category/embedding），再扫描；
+    # 启动补一轮结果落盘，扫描后的缺口由 discover 每轮末尾的全表补齐兜底。
+    from src.jobs.remediation import run_remediation_on_startup
+
+    await run_remediation_on_startup()
+
     discover_scheduler = None
     if settings.discover_scheduler.enabled:
         from src.jobs.discover_scheduler import start_discover_scheduler
 
         discover_scheduler = await start_discover_scheduler()
 
-    # 启动时补跑衍生字段缺口（security/category/embedding），之后每小时一轮：
-    remediation_task = asyncio.create_task(_run_remediation_loop())
-
     yield
 
-    remediation_task.cancel()
     if discover_scheduler is not None:
         await discover_scheduler.stop()
     if collector is not None:

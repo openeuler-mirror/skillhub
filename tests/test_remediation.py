@@ -1,7 +1,6 @@
 """统一补齐编排（src/jobs/remediation.py）与安全补跑
 （src/ai/security_backfill.py）的测试。"""
 
-import asyncio
 import json
 import uuid
 from datetime import datetime
@@ -17,7 +16,7 @@ from src.ai.security_backfill import (
     backfill_missing_security_audits,
 )
 from src.jobs import remediation
-from src.jobs.remediation import run_remediation_loop, run_remediations
+from src.jobs.remediation import run_remediations
 
 
 class AsyncContext:
@@ -99,30 +98,6 @@ class TestRunRemediations:
         assert results["security"] == {"error": "remediation task failed"}
         assert results["category"] == {"filled": 1}
         assert results["embedding"] == {"filled": 1}
-
-    async def test_loop_runs_immediately_then_sleeps(self):
-        """启动即补一轮，随后按间隔休眠（休眠点取消结束循环）。"""
-        calls = []
-
-        async def fake_run():
-            calls.append("run")
-            return {}
-
-        async def fake_sleep(_seconds):
-            calls.append("sleep")
-            raise asyncio.CancelledError()
-
-        import asyncio
-
-        with (
-            patch.object(remediation, "run_remediations", fake_run),
-            patch.object(remediation, "_save_remediation_result_file"),
-            patch.object(remediation.asyncio, "sleep", fake_sleep),
-        ):
-            with pytest.raises(asyncio.CancelledError):
-                await run_remediation_loop(interval_seconds=0.01)
-
-        assert calls == ["run", "sleep"]
 
     def test_save_remediation_result_file_writes_document(self, tmp_path):
         """每轮补齐结果写 remediation-<时间戳>.json，统计字段带 <key>_note。"""

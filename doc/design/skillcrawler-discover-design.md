@@ -185,14 +185,11 @@ start_scan(...)
   embedding 缺口补建向量），各任务自持
   `pg_advisory_lock` 互斥（embedding 的锁另与全量重建脚本
   `scripts/reindex_embeddings.py` 互斥），单任务锁被占用或失败只影响该任务。
-  失败不重试，漏掉的行由下轮 discover 或 API 侧的低频补齐循环自愈（见
+  失败不重试，漏掉的行由下轮 discover 或 API 启动时的补齐自愈（见
   [`src/jobs/remediation.py`](../../src/jobs/remediation.py)）；
 - 每轮结果（每仓 outcome / 耗时 / 汇总计数 / skill 统计 / 补跑结果）写入
   `result_dir`（默认 `<storage.local_path>/logs`）下的 `discover-<时间戳>.json`，
   结果分类口径与 CLI discover 一致，输出结构见 §11.1。
-  API 侧低频补齐循环（`run_remediation_loop`）每轮也写同目录下的
-  `remediation-<时间戳>.json`（补跑统计含 `<key>_note` 说明，口径与
-  discover 结果中的 `remediation_run` 一致）。
 
 > **注意**：CLI `skillcrawler/main.py discover` 与自动调度对齐——扫描结束后
 > 同样补跑衍生字段缺口（`_run_remediations_safe()`），并写入

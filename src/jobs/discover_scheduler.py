@@ -272,10 +272,10 @@ class DiscoverScheduler:
             )
 
         # 补跑衍生字段缺口（security 风险分 / category 分类 / embedding 向量）：
-        # 本轮新入库或中断留下的缺口行在此补齐，使其立即可用；各任务自持
-        # pg_advisory_lock 互斥（embedding 的锁另与全量重建脚本互斥），单任务
-        # 失败/跳过只记录在该任务的统计里。失败不重试，漏掉的行由下轮 discover
-        # 或 API 启动后的低频补齐循环自愈。
+        # 本轮新入库或中断留下的缺口行在此补齐，使其立即可用；
+        # 各任务自持pg_advisory_lock 互斥（embedding 的锁另与全量重建脚本互斥），单任务
+        # 失败/跳过只记录在该任务的统计里。
+        # 失败不重试，漏掉的行由下轮 discover 或 API 启动时的补齐自愈。
         remediation_run: dict[str, Any] | None = None
         try:
             from src.jobs.remediation import run_remediations
