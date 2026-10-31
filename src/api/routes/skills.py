@@ -688,10 +688,14 @@ async def download_skill(
     await repo.increment_download(skill_id)
     await db.commit()
 
+    headers = (
+        {"X-Artifact-SHA256": archive.sha256} if archive.sha256 else None
+    )
     return FileResponse(
         path=archive.path,
         filename=archive.filename,
         media_type=archive.media_type,
+        headers=headers,
     )
 
 
