@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from src.api.services.discover_scheduler import (
+from src.jobs.discover_scheduler import (
     DiscoverScheduler,
     compute_next_run,
 )
@@ -97,6 +97,19 @@ def _fake_result(**flags):
     return SimpleNamespace(skill_num=2, url="https://gitcode.com/a/b", **flags)
 
 
+@pytest.fixture(autouse=True)
+def _isolate_remediation():
+    """统一屏蔽补跑任务：避免测试触达 Jenkins / DB / embedding 服务。
+
+    需要验证补跑口径的用例自行 patch 同一目标即可覆盖此默认值。
+    """
+    with patch(
+        "src.jobs.remediation.run_remediations",
+        AsyncMock(return_value={}),
+    ):
+        yield
+
+
 class TestRunDiscoverOnce:
     @pytest.fixture
     def requests(self):
@@ -113,7 +126,7 @@ class TestRunDiscoverOnce:
         scheduler = DiscoverScheduler(
             DiscoverSchedulerConfig(enabled=True, result_dir=str(tmp_path))
         )
-        caplog.set_level(logging.INFO, logger="src.api.services.discover_scheduler")
+        caplog.set_level(logging.INFO, logger="src.jobs.discover_scheduler")
 
         results = [
             _fake_result(_created_new=True),
@@ -123,11 +136,11 @@ class TestRunDiscoverOnce:
 
         with (
             patch(
-                "src.api.services.discover_scheduler.build_configured_discover_requests",
+                "src.jobs.discover_scheduler.build_configured_discover_requests",
                 return_value=requests,
             ),
             patch(
-                "src.api.services.discover_scheduler.AsyncSessionLocal"
+                "src.jobs.discover_scheduler.AsyncSessionLocal"
             ) as session_factory,
         ):
             session_ctx = AsyncMock()
@@ -136,14 +149,13 @@ class TestRunDiscoverOnce:
                 discover_configured_skill_repository=AsyncMock(side_effect=results)
             )
             with patch(
-                "src.api.services.discover_scheduler.SkillManager", return_value=manager
+                "src.jobs.discover_scheduler.SkillManager", return_value=manager
             ):
                 counters = await scheduler.run_discover_once()
 
         assert counters == {
             "created": 1,
             "rediscovered": 0,
-            "security_retried": 0,
             "unchanged": 1,
             "removed": 1,
             "no_skill": 0,
@@ -170,22 +182,38 @@ class TestRunDiscoverOnce:
             _fake_result(_unchanged=True),
             _fake_result(_removed_existing=True),
         ]
+        remediation_run = {
+            "security": {"total": 2, "triggered": 2, "failed": 0, "skipped": None},
+            "category": {"total": 0, "filled": 0, "unclassified": 0, "failed": 0, "skipped": None},
+            "embedding": {
+                "total": 1,
+                "indexed": 1,
+                "failed_batches": 0,
+                "failed_rows": 0,
+                "skipped_empty": 0,
+                "stale_skipped": 0,
+            },
+        }
 
         with (
             patch(
-                "src.api.services.discover_scheduler.build_configured_discover_requests",
+                "src.jobs.discover_scheduler.build_configured_discover_requests",
                 return_value=requests,
             ),
             patch(
-                "src.api.services.discover_scheduler.AsyncSessionLocal"
+                "src.jobs.discover_scheduler.AsyncSessionLocal"
             ) as session_factory,
+            patch(
+                "src.jobs.remediation.run_remediations",
+                AsyncMock(return_value=remediation_run),
+            ),
         ):
             session_factory.return_value = AsyncMock()
             manager = SimpleNamespace(
                 discover_configured_skill_repository=AsyncMock(side_effect=results)
             )
             with patch(
-                "src.api.services.discover_scheduler.SkillManager", return_value=manager
+                "src.jobs.discover_scheduler.SkillManager", return_value=manager
             ):
                 await scheduler.run_discover_once()
 
@@ -199,8 +227,6 @@ class TestRunDiscoverOnce:
             "created_note": "新建仓库记录并完成扫描",
             "rediscovered": 0,
             "rediscovered_note": "已有仓库 commit 变化并完成重扫",
-            "security_retried": 0,
-            "security_retried_note": "commit 未变化，但为 NULL risk_score 记录重新提交安全检测",
             "unchanged": 1,
             "unchanged_note": "HEAD commit 与数据库相同，跳过扫描",
             "removed": 1,
@@ -213,13 +239,22 @@ class TestRunDiscoverOnce:
         assert document["config_keys"] == ["community"]
         # 各区块每项为 <key> + <key>_note（统计查询失败时 skill_stats 为 null）
         assert document["skill_stats"] is None
-        embed_run = document["embedding_run"]
-        assert embed_run["indexed"] == 0
+        # remediation_run 三个任务各自带 <key>_note
+        run_doc = document["remediation_run"]
+        assert run_doc["security"]["triggered"] == 2
+        assert run_doc["security"]["triggered_note"] == "本轮成功重新触发 Jenkins 检测的行数"
+        assert run_doc["category"]["filled"] == 0
+        assert run_doc["category"]["filled_note"] == "本轮成功写入分类的行数"
+        embed_run = run_doc["embedding"]
+        assert embed_run["indexed"] == 1
         assert embed_run["indexed_note"] == "本轮成功写入 embedding 的行数"
         assert embed_run["total_note"] == "本轮扫描到的待编码行数"
-        assert all(
-            embed_run[f"{key}_note"] for key in embed_run if not key.endswith("_note")
-        )
+        for task_stats in run_doc.values():
+            assert all(
+                task_stats[f"{key}_note"]
+                for key in task_stats
+                if not key.endswith("_note")
+            )
         assert "started_at" in document
         assert "finished_at" in document
         assert "total_seconds" in document
@@ -243,11 +278,11 @@ class TestRunDiscoverOnce:
         )
         with (
             patch(
-                "src.api.services.discover_scheduler.build_configured_discover_requests",
+                "src.jobs.discover_scheduler.build_configured_discover_requests",
                 return_value=requests,
             ),
             patch(
-                "src.api.services.discover_scheduler.AsyncSessionLocal"
+                "src.jobs.discover_scheduler.AsyncSessionLocal"
             ) as session_factory,
         ):
             session_factory.return_value = AsyncMock()
@@ -257,7 +292,7 @@ class TestRunDiscoverOnce:
                 )
             )
             with patch(
-                "src.api.services.discover_scheduler.SkillManager", return_value=manager
+                "src.jobs.discover_scheduler.SkillManager", return_value=manager
             ):
                 await scheduler.run_discover_once()
 
@@ -272,15 +307,15 @@ class TestRunDiscoverOnce:
         scheduler = DiscoverScheduler(
             DiscoverSchedulerConfig(enabled=True, result_dir="/proc/forbidden-dir")
         )
-        caplog.set_level(logging.WARNING, logger="src.api.services.discover_scheduler")
+        caplog.set_level(logging.WARNING, logger="src.jobs.discover_scheduler")
 
         with (
             patch(
-                "src.api.services.discover_scheduler.build_configured_discover_requests",
+                "src.jobs.discover_scheduler.build_configured_discover_requests",
                 return_value=requests,
             ),
             patch(
-                "src.api.services.discover_scheduler.AsyncSessionLocal"
+                "src.jobs.discover_scheduler.AsyncSessionLocal"
             ) as session_factory,
         ):
             session_factory.return_value = AsyncMock()
@@ -294,7 +329,7 @@ class TestRunDiscoverOnce:
                 )
             )
             with patch(
-                "src.api.services.discover_scheduler.SkillManager", return_value=manager
+                "src.jobs.discover_scheduler.SkillManager", return_value=manager
             ):
                 counters = await scheduler.run_discover_once()
 
@@ -305,15 +340,15 @@ class TestRunDiscoverOnce:
         scheduler = DiscoverScheduler(
             DiscoverSchedulerConfig(enabled=True, result_dir=str(tmp_path))
         )
-        caplog.set_level(logging.INFO, logger="src.api.services.discover_scheduler")
+        caplog.set_level(logging.INFO, logger="src.jobs.discover_scheduler")
 
         with (
             patch(
-                "src.api.services.discover_scheduler.build_configured_discover_requests",
+                "src.jobs.discover_scheduler.build_configured_discover_requests",
                 return_value=requests,
             ),
             patch(
-                "src.api.services.discover_scheduler.AsyncSessionLocal"
+                "src.jobs.discover_scheduler.AsyncSessionLocal"
             ) as session_factory,
         ):
             session_factory.return_value = AsyncMock()
@@ -323,7 +358,7 @@ class TestRunDiscoverOnce:
                 )
             )
             with patch(
-                "src.api.services.discover_scheduler.SkillManager", return_value=manager
+                "src.jobs.discover_scheduler.SkillManager", return_value=manager
             ):
                 counters = await scheduler.run_discover_once()
 
@@ -332,13 +367,13 @@ class TestRunDiscoverOnce:
         assert counters["no_skill"] == 1
 
         # 失败仓库的日志带耗时（after Xs）
-        assert "Discover failed for" in caplog.text
+        assert "[Discover] failed for" in caplog.text
         assert "after" in caplog.text
 
 
 class TestSchedulerLoop:
-    async def test_loop_triggers_run_at_scheduled_time(self):
-        """循环睡眠到调度点后触发 run_discover_once，run 返回后继续等待。"""
+    async def test_loop_runs_immediately_then_at_scheduled_time(self):
+        """启动即跑一轮，之后睡眠到调度点再跑；run 完才计算下一个触发点。"""
         config = DiscoverSchedulerConfig(enabled=True, interval="daily", time="03:00")
         scheduler = DiscoverScheduler(config)
 
@@ -350,12 +385,13 @@ class TestSchedulerLoop:
 
         async def fake_run(sched):
             calls.append("run")
-            sched._running = False  # 首轮执行后停止循环
+            if calls.count("run") == 2:  # 第二轮执行后停止循环
+                sched._running = False
 
         fixed_now = datetime(2026, 8, 28, 1, 0)
         with (
-            patch("src.api.services.discover_scheduler.asyncio.sleep", fake_sleep),
-            patch("src.api.services.discover_scheduler.datetime") as dt_mock,
+            patch("src.jobs.discover_scheduler.asyncio.sleep", fake_sleep),
+            patch("src.jobs.discover_scheduler.datetime") as dt_mock,
             patch.object(DiscoverScheduler, "run_discover_once", fake_run),
         ):
             dt_mock.now.return_value = fixed_now
@@ -363,33 +399,34 @@ class TestSchedulerLoop:
             scheduler._running = True  # 直接驱动 _loop（不经 start() 创建 task）
             await scheduler._loop()
 
-        # 1:00 -> 3:00 间隔 2 小时；run 恰好执行一次
-        assert calls[0] == timedelta(hours=2).total_seconds()
-        assert calls[1] == "run"
+        # 启动先跑一轮；1:00 -> 3:00 间隔 2 小时；到点再跑第二轮
+        assert calls == ["run", timedelta(hours=2).total_seconds(), "run"]
 
     async def test_start_stop_lifecycle(self):
         config = DiscoverSchedulerConfig(enabled=True)
         scheduler = DiscoverScheduler(config)
-        await scheduler.start()
-        assert scheduler._running is True
-        assert scheduler._task is not None
-        await scheduler.stop()
+        with patch.object(DiscoverScheduler, "run_discover_once", AsyncMock()):
+            await scheduler.start()
+            assert scheduler._running is True
+            assert scheduler._task is not None
+            await scheduler.stop()
         assert scheduler._running is False
         assert scheduler._task is None
 
     async def test_start_is_idempotent(self):
         config = DiscoverSchedulerConfig(enabled=True)
         scheduler = DiscoverScheduler(config)
-        await scheduler.start()
-        task = scheduler._task
-        await scheduler.start()
-        assert scheduler._task is task
-        await scheduler.stop()
+        with patch.object(DiscoverScheduler, "run_discover_once", AsyncMock()):
+            await scheduler.start()
+            task = scheduler._task
+            await scheduler.start()
+            assert scheduler._task is task
+            await scheduler.stop()
 
 
 class TestStartDiscoverScheduler:
     async def test_returns_none_when_disabled(self):
-        from src.api.services.discover_scheduler import start_discover_scheduler
+        from src.jobs.discover_scheduler import start_discover_scheduler
 
         settings = SimpleNamespace(
             discover_scheduler=DiscoverSchedulerConfig(enabled=False)
@@ -399,7 +436,7 @@ class TestStartDiscoverScheduler:
         assert result is None
 
     async def test_starts_and_returns_scheduler_when_enabled(self):
-        from src.api.services.discover_scheduler import start_discover_scheduler
+        from src.jobs.discover_scheduler import start_discover_scheduler
 
         settings = SimpleNamespace(
             discover_scheduler=DiscoverSchedulerConfig(enabled=True)
@@ -413,7 +450,7 @@ class TestStartDiscoverScheduler:
 class TestSkillStatsWithNotes:
     def test_nested_sections_get_notes(self):
         """skill_stats 各层字段（含 security_audit / index_creation）均补 <key>_note。"""
-        from skillcrawler.main import skill_stats_with_notes
+        from src.skills.discover_result import skill_stats_with_notes
 
         raw = {
             "total_skills": 9008,

@@ -62,7 +62,7 @@ def test_missing_jenkins_artifact_is_finalized_immediately():
 
 
 def test_final_result_log_contains_report():
-    with patch("src.security.detector.logger.info") as log_info:
+    with patch("src.security.detector.collector_logger.info") as log_info:
         _log_skillspector_final_result(
             audit_id="audit-1",
             build_number=123,
@@ -93,7 +93,7 @@ def test_missing_jenkins_build_is_terminal():
 
 
 def test_collector_event_log_contains_decision():
-    with patch("src.security.detector.logger.info") as log_info:
+    with patch("src.security.detector.collector_logger.info") as log_info:
         _log_collector_event(
             "item_deferred",
             audit_id="audit-1",
