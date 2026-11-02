@@ -1,0 +1,624 @@
+diff --git a/.env.example b/.env.example
+index 5e90ec6..72373b2 100644
+--- a/.env.example
++++ b/.env.example
+@@ -32,6 +32,8 @@ ANTHROPIC_PROXY_API_KEY=
+ SKILLSPECTOR_MODEL=                                             # leave empty to use the active provider's bundled default (see README); set to override (e.g. gpt-5.2)
+ # SKILLSPECTOR_MODEL_REGISTRY=./model_registry.yaml             # optional override; defaults to each provider's bundled YAML in src/skillspector/providers/
+ SKILLSPECTOR_LOG_LEVEL=WARNING                                  # options: DEBUG|INFO|WARNING|ERROR
++# SKILLSPECTOR_LLM_NODES=                                       # optional per-node LLM allowlist (comma separated, fnmatch patterns, or "all"). Unset = every LLM node runs.
++#                                                               # e.g. meta_analyzer = static analysis + LLM false-positive filtering only; semantic_* = semantic discovery only
+ 
+ # langchain/langsmith config (all optional)
+ LANGCHAIN_TRACING_V2=false
+diff --git a/README.md b/README.md
+index 8e6c5df..8cdf7a5 100644
+--- a/README.md
++++ b/README.md
+@@ -187,8 +187,19 @@ skillspector scan ./my-skill/
+ 
+ # Skip LLM analysis (faster, static analysis only)
+ skillspector scan ./my-skill/ --no-llm
++
++# Run only part of the LLM pipeline (cost control). Unset = every LLM node runs.
++export SKILLSPECTOR_LLM_NODES=meta_analyzer   # static analysis + LLM false-positive filtering only
++export SKILLSPECTOR_LLM_NODES=semantic_*      # semantic discovery only; meta filtering keeps every static finding
+ ```
+ 
++`SKILLSPECTOR_LLM_NODES` takes a comma-separated allowlist of node IDs
++(`fnmatch` patterns and `all` are accepted). The LLM-using nodes are
++`semantic_security_discovery`, `semantic_developer_intent`,
++`semantic_quality_policy`, `mcp_tool_poisoning` (its TP4 check only) and
++`meta_analyzer`. Nodes left out of the allowlist return immediately without
++spending any tokens; the static analysis stage is unaffected either way.
++
+ ## Vulnerability Patterns
+ 
+ SkillSpector detects **64 vulnerability patterns** across 16 categories:
+diff --git a/src/skillspector/cli.py b/src/skillspector/cli.py
+index 8ce0eb1..bd369b6 100644
+--- a/src/skillspector/cli.py
++++ b/src/skillspector/cli.py
+@@ -126,7 +126,14 @@ def _render_format(
+         else:
+             return str(result["report_body"])
+ 
+-    findings = result.get("filtered_findings") or result.get("findings") or []
++    # ``filtered_findings`` is the post-meta list -- the very same list the report
++    # node used to compute ``risk_score`` below.  It must be preferred even when it
++    # is empty: ``or`` treated "meta rejected every finding" ([]) as "absent" and
++    # fell back to the pre-meta accumulator, writing reports that scored 0 / SAFE
++    # while still listing CRITICAL issues.
++    findings = result.get("filtered_findings")
++    if findings is None:
++        findings = result.get("findings") or []
+     component_metadata = result.get("component_metadata") or []
+     has_executable_scripts = bool(result.get("has_executable_scripts", False))
+     manifest = result.get("manifest") or {}
+diff --git a/src/skillspector/llm_analyzer_base.py b/src/skillspector/llm_analyzer_base.py
+index 2089c02..2009101 100644
+--- a/src/skillspector/llm_analyzer_base.py
++++ b/src/skillspector/llm_analyzer_base.py
+@@ -30,9 +30,10 @@ from __future__ import annotations
+ import asyncio
+ import json
+ import re
++import threading
+ from collections import defaultdict
+ from dataclasses import dataclass, field
+-from typing import Literal
++from typing import Any, Literal
+ 
+ from langchain_core.messages import AIMessage, BaseMessage
+ from pydantic import BaseModel, Field, field_validator
+@@ -44,6 +45,68 @@ from skillspector.models import Finding
+ 
+ logger = get_logger(__name__)
+ 
++
++class LLMBadResponseError(ValueError):
++    """The model replied, but its payload could not be parsed as JSON.
++
++    Subclasses :class:`ValueError` so the existing retry/fallback paths keep
++    working, while letting analyzer nodes tell "the LLM produced junk for this
++    batch" apart from "the tool is misconfigured" (also a ``ValueError``, e.g.
++    no API key).  The former should degrade that batch to zero findings; the
++    latter must stay loud.  Before this distinction existed, a single malformed
++    payload aborted the whole scan with exit code 2 and no report artifact.
++    """
++
++
++# Single process-wide event loop, owned by a background thread.
++_BACKGROUND_LOOP: asyncio.AbstractEventLoop | None = None
++_BACKGROUND_LOOP_LOCK = threading.Lock()
++
++
++def _get_background_loop() -> asyncio.AbstractEventLoop:
++    """Return the process-wide event loop, starting its thread on first use."""
++    global _BACKGROUND_LOOP
++    loop = _BACKGROUND_LOOP
++    if loop is not None and not loop.is_closed():
++        return loop
++    with _BACKGROUND_LOOP_LOCK:
++        if _BACKGROUND_LOOP is None or _BACKGROUND_LOOP.is_closed():
++            loop = asyncio.new_event_loop()
++            thread = threading.Thread(
++                target=loop.run_forever,
++                name="skillspector-llm-loop",
++                daemon=True,
++            )
++            thread.start()
++            _BACKGROUND_LOOP = loop
++        return _BACKGROUND_LOOP
++
++
++def run_llm_coro(coro: Any) -> Any:
++    """Run *coro* on a single process-wide event loop.
++
++    Each LLM stage (three semantic analyzers + the meta analyzer) used to wrap
++    its work in ``asyncio.run(...)``, which creates and closes a fresh event
++    loop per stage — and the stages run in different worker threads, so a
++    per-thread loop did not help either.  Async HTTP clients keep keep-alive
++    connections bound to the loop that opened them; when a later stage reused
++    (or recycled) such a connection, the transport's ``close()`` called
++    ``loop.call_soon`` on the already-closed loop and raised
++    ``RuntimeError: Event loop is closed`` — flakily, depending on keep-alive
++    timing.  Funnelling every stage through one long-lived loop removes the
++    loop churn entirely while keeping the per-stage ``asyncio.gather``
++    concurrency intact.
++    """
++    loop = _get_background_loop()
++    try:
++        asyncio.get_running_loop()
++    except RuntimeError:
++        return asyncio.run_coroutine_threadsafe(coro, loop).result()
++    raise RuntimeError(
++        "run_llm_coro must not be called from inside a running event loop"
++    )
++
++
+ # DeepSeek's ``response_format={"type": "json_object"}`` requires the prompt
+ # to contain the substring ``json`` (case-insensitive).  When we route through
+ # the prompt-driven JSON path we append this suffix so the constraint is met.
+@@ -62,6 +125,23 @@ _JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
+ _JSON_ARRAY_RE = re.compile(r"\[.*\]", re.DOTALL)
+ 
+ 
++def _log_usage(response: object) -> None:
++    """TEMPORARY: emit per-call token usage for cost accounting."""
++    try:
++        um = getattr(response, "usage_metadata", None) or {}
++        tu = (getattr(response, "response_metadata", None) or {}).get("token_usage") or {}
++        logger.info(
++            "USAGE in=%s out=%s total=%s cache_hit=%s cache_miss=%s",
++            um.get("input_tokens"),
++            um.get("output_tokens"),
++            um.get("total_tokens"),
++            tu.get("prompt_cache_hit_tokens"),
++            tu.get("prompt_cache_miss_tokens"),
++        )
++    except Exception:
++        pass
++
++
+ def _is_deepseek_model(llm: object) -> bool:
+     """True when *llm* was constructed against DeepSeek's OpenAI endpoint.
+ 
+@@ -284,11 +364,22 @@ def _extract_json_payload(text: str) -> str:
+     if stripped.startswith("```"):
+         stripped = re.sub(r"^```(?:json)?\s*", "", stripped)
+         stripped = re.sub(r"\s*```\s*$", "", stripped)
++    # Preferred path: decode the FIRST complete JSON value and drop whatever
++    # follows.  DeepSeek occasionally emits a second object (or trailing
++    # prose), which makes the greedy regex below span "{...}{...}" — invalid
++    # JSON, and the resulting ValueError used to abort the whole scan.
++    starts = [i for i in (stripped.find("{"), stripped.find("[")) if i != -1]
++    if starts:
++        try:
++            value, _ = json.JSONDecoder().raw_decode(stripped[min(starts):])
++            return json.dumps(value)
++        except json.JSONDecodeError:
++            pass
+     for pattern in (_JSON_OBJECT_RE, _JSON_ARRAY_RE):
+         match = pattern.search(stripped)
+         if match:
+             return match.group(0)
+-    raise ValueError(f"No JSON object/array found in LLM response: {text[:200]!r}")
++    raise LLMBadResponseError(f"No JSON object/array found in LLM response: {text[:200]!r}")
+ 
+ 
+ def _message_json(response: object) -> str:
+@@ -513,6 +604,7 @@ class LLMAnalyzerBase:
+         if self._is_deepseek and self.response_schema is not None:
+             wrapped = self._wrap_prompt(prompt)
+             response = self._llm.invoke(wrapped)
++            _log_usage(response)
+             try:
+                 raw = _message_json(response)
+             except ValueError as exc:
+@@ -521,9 +613,12 @@ class LLMAnalyzerBase:
+                     exc,
+                 )
+                 response = self._llm.invoke(prompt)
++                _log_usage(response)
+                 raw = _message_json(response)
+             return self._validate_json_response(raw)
+-        return _message_text(self._llm.invoke(prompt))
++        response = self._llm.invoke(prompt)
++        _log_usage(response)
++        return _message_text(response)
+ 
+     async def _ainvoke_llm(self, prompt: str) -> object:
+         """Async variant of :meth:`_invoke_llm`."""
+@@ -532,6 +627,7 @@ class LLMAnalyzerBase:
+         if self._is_deepseek and self.response_schema is not None:
+             wrapped = self._wrap_prompt(prompt)
+             response = await self._llm.ainvoke(wrapped)
++            _log_usage(response)
+             try:
+                 raw = _message_json(response)
+             except ValueError as exc:
+@@ -540,9 +636,12 @@ class LLMAnalyzerBase:
+                     exc,
+                 )
+                 response = await self._llm.ainvoke(prompt)
++                _log_usage(response)
+                 raw = _message_json(response)
+             return self._validate_json_response(raw)
+-        return _message_text(await self._llm.ainvoke(prompt))
++        response = await self._llm.ainvoke(prompt)
++        _log_usage(response)
++        return _message_text(response)
+ 
+     def _wrap_prompt(self, prompt: str) -> str:
+         """Append the DeepSeek JSON suffix + schema so the prompt contains ``json``.
+@@ -577,7 +676,18 @@ class LLMAnalyzerBase:
+         try:
+             data = json.loads(response)
+         except json.JSONDecodeError as exc:
+-            raise ValueError(f"LLM response is not valid JSON: {exc}; payload={response[:200]!r}") from exc
++            if "Extra data" in str(exc):
++                # Tolerate trailing content after a complete JSON value.
++                try:
++                    data, _ = json.JSONDecoder().raw_decode(response.lstrip())
++                except json.JSONDecodeError:
++                    raise LLMBadResponseError(
++                        f"LLM response is not valid JSON: {exc}; payload={response[:200]!r}"
++                    ) from exc
++            else:
++                raise LLMBadResponseError(
++                    f"LLM response is not valid JSON: {exc}; payload={response[:200]!r}"
++                ) from exc
+         if self.response_schema is None:
+             return LLMAnalysisResult()
+         return self.response_schema.model_validate(data)
+diff --git a/src/skillspector/llm_utils.py b/src/skillspector/llm_utils.py
+index ab6e551..eb2d133 100644
+--- a/src/skillspector/llm_utils.py
++++ b/src/skillspector/llm_utils.py
+@@ -30,6 +30,9 @@ other OpenAI-compatible endpoint is configured via the standard
+ 
+ from __future__ import annotations
+ 
++import fnmatch
++import os
++
+ from langchain_core.language_models.chat_models import BaseChatModel
+ from langchain_core.messages import BaseMessage
+ 
+@@ -66,6 +69,32 @@ def is_llm_available() -> tuple[bool, str | None]:
+     return True, None
+ 
+ 
++#: Comma-separated allowlist of the LLM-using node IDs that may call the model.
++#: Accepts ``fnmatch`` patterns and the special value ``all``; unset or empty
++#: means every node is enabled (the historical behaviour).  Examples:
++#: ``meta_analyzer`` (static analysis + LLM false-positive filtering only, no
++#: semantic discovery) or ``semantic_*`` (semantic discovery only, meta filtering
++#: falls back to keeping every static finding).
++LLM_NODES_ENV = "SKILLSPECTOR_LLM_NODES"
++
++
++def llm_node_enabled(node_id: str) -> bool:
++    """Return whether *node_id* is allowed to call the LLM.
++
++    Nodes outside the allowlist return immediately without issuing a request,
++    so one build can be run in "static + meta only" or "semantic only" mode by
++    changing a single env var.  This is the only per-node LLM switch: the
++    ``use_llm`` state flag remains all-or-nothing.
++    """
++    raw = os.environ.get(LLM_NODES_ENV, "").strip()
++    if not raw:
++        return True
++    patterns = [part.strip().lower() for part in raw.split(",") if part.strip()]
++    if not patterns or "all" in patterns:
++        return True
++    return any(fnmatch.fnmatchcase(node_id.lower(), pattern) for pattern in patterns)
++
++
+ def fetch_model_token_limits(model_label: str) -> tuple[int, int]:
+     """Return ``(max_input_tokens, max_output_tokens)`` for *model_label*."""
+     return get_max_input_tokens(model_label), get_max_output_tokens(model_label)
+diff --git a/src/skillspector/nodes/analyzers/mcp_tool_poisoning.py b/src/skillspector/nodes/analyzers/mcp_tool_poisoning.py
+index 45d13dc..c067f4d 100644
+--- a/src/skillspector/nodes/analyzers/mcp_tool_poisoning.py
++++ b/src/skillspector/nodes/analyzers/mcp_tool_poisoning.py
+@@ -23,7 +23,7 @@ import logging
+ import re
+ import unicodedata
+ 
+-from skillspector.llm_utils import chat_completion
++from skillspector.llm_utils import LLM_NODES_ENV, chat_completion, llm_node_enabled
+ from skillspector.models import Finding
+ from skillspector.state import AnalyzerNodeResponse, SkillspectorState
+ 
+@@ -839,8 +839,10 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
+     # match every other LLM-using node (semantic_*, meta_analyzer); the CLI
+     # always sets this explicitly, so the default only affects programmatic
+     # callers that omit the key.
+-    if state.get("use_llm", True):
++    if state.get("use_llm", True) and llm_node_enabled(ANALYZER_ID):
+         findings.extend(_check_tp4(state))
++    else:
++        logger.info("%s: TP4 skipped (not in %s)", ANALYZER_ID, LLM_NODES_ENV)
+ 
+     logger.info("%s: %d findings", ANALYZER_ID, len(findings))
+     return {"findings": findings}
+diff --git a/src/skillspector/nodes/analyzers/semantic_developer_intent.py b/src/skillspector/nodes/analyzers/semantic_developer_intent.py
+index a3a54be..723d025 100644
+--- a/src/skillspector/nodes/analyzers/semantic_developer_intent.py
++++ b/src/skillspector/nodes/analyzers/semantic_developer_intent.py
+@@ -22,10 +22,9 @@ its actual code behavior using LLM-based analysis.
+ 
+ from __future__ import annotations
+ 
+-import asyncio
+-
+ from skillspector.constants import _SKILLSPECTOR_DEFAULT_MODEL, MODEL_CONFIG
+-from skillspector.llm_analyzer_base import LLMAnalyzerBase
++from skillspector.llm_analyzer_base import LLMAnalyzerBase, LLMBadResponseError, run_llm_coro
++from skillspector.llm_utils import LLM_NODES_ENV, llm_node_enabled
+ from skillspector.logging_config import get_logger
+ from skillspector.state import AnalyzerNodeResponse, SkillspectorState
+ 
+@@ -159,6 +158,10 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
+     if not state.get("use_llm", True):
+         return {"findings": []}
+ 
++    if not llm_node_enabled(ANALYZER_ID):
++        logger.info("%s: skipped (not in %s)", ANALYZER_ID, LLM_NODES_ENV)
++        return {"findings": []}
++
+     file_cache: dict[str, str] = state.get("file_cache") or {}
+     if not file_cache:
+         return {"findings": []}
+@@ -176,10 +179,13 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
+         prompt = ANALYZER_PROMPT.format(manifest_section=_format_manifest(manifest))
+         analyzer = LLMAnalyzerBase(base_prompt=prompt, model=model)
+         batches = analyzer.get_batches(sorted(file_cache), file_cache)
+-        results = asyncio.run(analyzer.arun_batches(batches))
++        results = run_llm_coro(analyzer.arun_batches(batches))
+         findings = analyzer.collect_findings(results)
+         logger.info("%s: %d findings", ANALYZER_ID, len(findings))
+         return {"findings": findings}
++    except LLMBadResponseError as exc:
++        logger.warning("%s: unparseable LLM payload, batch skipped: %s", ANALYZER_ID, exc)
++        return {"findings": []}
+     except ValueError:
+         raise
+     except Exception as exc:
+diff --git a/src/skillspector/nodes/analyzers/semantic_quality_policy.py b/src/skillspector/nodes/analyzers/semantic_quality_policy.py
+index 3140334..e83efe9 100644
+--- a/src/skillspector/nodes/analyzers/semantic_quality_policy.py
++++ b/src/skillspector/nodes/analyzers/semantic_quality_policy.py
+@@ -22,10 +22,9 @@ natural-language policy violations that static/behavioral tools cannot detect.
+ 
+ from __future__ import annotations
+ 
+-import asyncio
+-
+ from skillspector.constants import _SKILLSPECTOR_DEFAULT_MODEL
+-from skillspector.llm_analyzer_base import LLMAnalyzerBase
++from skillspector.llm_analyzer_base import LLMAnalyzerBase, LLMBadResponseError, run_llm_coro
++from skillspector.llm_utils import LLM_NODES_ENV, llm_node_enabled
+ from skillspector.logging_config import get_logger
+ from skillspector.state import AnalyzerNodeResponse, SkillspectorState
+ 
+@@ -132,6 +131,10 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
+     if not state.get("use_llm", True):
+         return {"findings": []}
+ 
++    if not llm_node_enabled(ANALYZER_ID):
++        logger.info("%s: skipped (not in %s)", ANALYZER_ID, LLM_NODES_ENV)
++        return {"findings": []}
++
+     file_cache: dict[str, str] = state.get("file_cache") or {}
+     files = sorted(file_cache.keys())
+     if not files:
+@@ -145,10 +148,13 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
+     try:
+         analyzer = LLMAnalyzerBase(base_prompt=ANALYZER_PROMPT, model=model)
+         batches = analyzer.get_batches(files, file_cache)
+-        results = asyncio.run(analyzer.arun_batches(batches))
++        results = run_llm_coro(analyzer.arun_batches(batches))
+         findings = analyzer.collect_findings(results)
+         logger.info("%s: %d findings", ANALYZER_ID, len(findings))
+         return {"findings": findings}
++    except LLMBadResponseError as exc:
++        logger.warning("%s: unparseable LLM payload, batch skipped: %s", ANALYZER_ID, exc)
++        return {"findings": []}
+     except ValueError:
+         raise
+     except Exception as exc:
+diff --git a/src/skillspector/nodes/analyzers/semantic_security_discovery.py b/src/skillspector/nodes/analyzers/semantic_security_discovery.py
+index 62ef4e9..e525395 100644
+--- a/src/skillspector/nodes/analyzers/semantic_security_discovery.py
++++ b/src/skillspector/nodes/analyzers/semantic_security_discovery.py
+@@ -20,7 +20,8 @@ from __future__ import annotations
+ from pydantic import ValidationError
+ 
+ from skillspector.constants import _SKILLSPECTOR_DEFAULT_MODEL
+-from skillspector.llm_analyzer_base import LLMAnalyzerBase
++from skillspector.llm_analyzer_base import LLMAnalyzerBase, LLMBadResponseError
++from skillspector.llm_utils import LLM_NODES_ENV, llm_node_enabled
+ from skillspector.logging_config import get_logger
+ from skillspector.state import AnalyzerNodeResponse, SkillspectorState
+ 
+@@ -74,6 +75,10 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
+         logger.info("%s: skipped (use_llm=False)", ANALYZER_ID)
+         return {"findings": []}
+ 
++    if not llm_node_enabled(ANALYZER_ID):
++        logger.info("%s: skipped (not in %s)", ANALYZER_ID, LLM_NODES_ENV)
++        return {"findings": []}
++
+     file_cache: dict[str, str] = state.get("file_cache") or {}
+     components: list[str] = state.get("components") or sorted(file_cache.keys())
+     if not components:
+@@ -95,6 +100,9 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
+         # Malformed LLM response — degrade gracefully rather than crashing the graph
+         logger.warning("%s: LLM returned malformed response: %s", ANALYZER_ID, exc)
+         return {"findings": []}
++    except LLMBadResponseError as exc:
++        logger.warning("%s: unparseable LLM payload, batch skipped: %s", ANALYZER_ID, exc)
++        return {"findings": []}
+     except ValueError:
+         raise
+     except Exception as exc:
+diff --git a/src/skillspector/nodes/meta_analyzer.py b/src/skillspector/nodes/meta_analyzer.py
+index ba8a597..ce36aa0 100644
+--- a/src/skillspector/nodes/meta_analyzer.py
++++ b/src/skillspector/nodes/meta_analyzer.py
+@@ -26,13 +26,16 @@ import asyncio
+ import json
+ from typing import Literal
+ 
+-from pydantic import BaseModel, Field, field_validator
++from pydantic import BaseModel, Field, ValidationError, field_validator
+ 
+ from skillspector.llm_analyzer_base import (
+     Batch,
+     LLMAnalyzerBase,
++    LLMBadResponseError,
+     estimate_tokens,
++    run_llm_coro,
+ )
++from skillspector.llm_utils import LLM_NODES_ENV, llm_node_enabled
+ from skillspector.logging_config import get_logger
+ from skillspector.models import Finding
+ from skillspector.nodes.analyzers.pattern_defaults import (
+@@ -43,6 +46,14 @@ from skillspector.state import MetaAnalyzerResponse, SkillspectorState
+ 
+ logger = get_logger(__name__)
+ 
++ANALYZER_ID = "meta_analyzer"
++
++#: Key of the marker item that :meth:`LLMMetaAnalyzer.arun_batches` emits for a
++#: batch whose LLM payload could not be parsed.  An *empty* item list means "this
++#: batch held no vulnerability", whereas the marker means "no verdict was ever
++#: obtained": only the latter keeps the batch's static findings.
++_UNJUDGED = "_unjudged"
++
+ 
+ # ---------------------------------------------------------------------------
+ # Structured output schemas
+@@ -286,6 +297,52 @@ class LLMMetaAnalyzer(LLMAnalyzerBase):
+             items.append(d)
+         return items
+ 
++    async def arun_batches(
++        self,
++        batches: list[Batch],
++        *,
++        max_concurrency: int = 10,
++        **kwargs: object,
++    ) -> list[tuple[Batch, list[dict[str, object]]]]:
++        """Run all batches concurrently, isolating unparseable ones.
++
++        The base implementation gathers the batches into one failure domain, so a
++        single malformed payload used to cost the verdicts of *every* other batch
++        as well -- and the run-level fallback then kept all findings, putting back
++        exactly the false positives meta exists to remove.  Here such a batch is
++        reported with the ``_unjudged`` marker (:data:`_UNJUDGED`) so that only its
++        findings stay in the report while the remaining batches are still filtered
++        normally.  Errors that are not evidence of an unusable payload (network,
++        credentials, event loop) keep propagating.
++        """
++        sem = asyncio.Semaphore(max_concurrency)
++
++        async def _process(batch: Batch) -> list[dict[str, object]]:
++            async with sem:
++                prompt = self.build_prompt(batch, **kwargs)
++                logger.debug(
++                    "LLM call for %s (tokens~%d, findings=%d)",
++                    batch.file_label,
++                    estimate_tokens(prompt),
++                    len(batch.findings),
++                )
++                try:
++                    response = await self._ainvoke_llm(prompt)
++                except (LLMBadResponseError, ValidationError) as exc:
++                    logger.warning(
++                        "%s: unusable LLM payload for %s (%s) -- keeping its %d "
++                        "findings, other batches unaffected",
++                        ANALYZER_ID,
++                        batch.file_label,
++                        exc,
++                        len(batch.findings),
++                    )
++                    return [{_UNJUDGED: True}]
++                logger.debug("LLM response for %s", batch.file_label)
++                return self.parse_response(response, batch)
++
++        return list(zip(batches, await asyncio.gather(*[_process(b) for b in batches])))
++
+     # -- Apply filter (keyed by file + rule_id + start/end_line) -------------
+ 
+     def apply_filter(
+@@ -295,6 +352,10 @@ class LLMMetaAnalyzer(LLMAnalyzerBase):
+     ) -> list[Finding]:
+         """Keep only LLM-confirmed findings, enriched with explanation / remediation.
+ 
++        Findings from a batch marked :data:`_UNJUDGED` are kept as-is (with default
++        remediation): the model never returned a verdict for them, so treating them
++        as rejections would turn a parse failure into a silent false negative.
++
+         Uses granular ``(file, rule_id, start_line, end_line)`` keying when the
+         LLM provides a ``start_line``, so multiple findings with the same
+         rule_id in one file are independently confirmed or rejected.  ``end_line``
+@@ -336,9 +397,19 @@ class LLMMetaAnalyzer(LLMAnalyzerBase):
+                 else:
+                     confirmed_coarse[(file_path, pattern_id)] = enrichment
+ 
++        unjudged_keys = {
++            (f.file, f.rule_id, f.start_line, f.end_line)
++            for batch, llm_items in batch_results
++            if any(_UNJUDGED in item for item in llm_items)
++            for f in batch.findings
++        }
++
+         result: list[Finding] = []
+         for f in findings:
+             exact_key = (f.file, f.rule_id, f.start_line, f.end_line)
++            if exact_key in unjudged_keys:
++                result.append(_fallback_filtered([f])[0])
++                continue
+             start_only_key = (f.file, f.rule_id, f.start_line, None)
+             coarse_key = (f.file, f.rule_id)
+             start_key = (f.file, f.rule_id, f.start_line) if f.start_line is not None else None
+@@ -400,6 +471,10 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
+     if state.get("use_llm", True) is False:
+         return {"filtered_findings": _fallback_filtered(findings)}
+ 
++    if not llm_node_enabled(ANALYZER_ID):
++        logger.info("%s: skipped (not in %s)", ANALYZER_ID, LLM_NODES_ENV)
++        return {"filtered_findings": _fallback_filtered(findings)}
++
+     file_cache: dict[str, str] = state.get("file_cache") or {}
+     manifest: dict[str, object] = state.get("manifest") or {}
+     model_config: dict[str, str] = state.get("model_config") or {}
+@@ -419,7 +494,7 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
+             model,
+         )
+ 
+-        batch_results = asyncio.run(analyzer.arun_batches(batches, metadata_text=metadata_text))
++        batch_results = run_llm_coro(analyzer.arun_batches(batches, metadata_text=metadata_text))
+         filtered = analyzer.apply_filter(findings, batch_results)
+ 
+         logger.debug(
+@@ -428,8 +503,21 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
+             len(filtered),
+         )
+         return {"filtered_findings": filtered}
++    except LLMBadResponseError as e:
++        # Safety net: :meth:`LLMMetaAnalyzer.arun_batches` already isolates
++        # per-batch parse failures, so this only fires for callers that bypass
++        # it.  Letting it escape would reach the CLI as a ValueError -> exit code
++        # 2 with no report artifact, discarding the whole scan, so keep every
++        # finding -- the same conservative policy as the fallback below.
++        logger.warning(
++            "%s: unparseable LLM payload, keeping all %d findings: %s",
++            ANALYZER_ID,
++            len(findings),
++            e,
++        )
++        return {"filtered_findings": _fallback_filtered(findings)}
+     except ValueError:
+         raise
+     except Exception as e:
+-        logger.warning("LLM call failed, using fallback: %s", e)
++        logger.warning("LLM call failed, using fallback: %s", e, exc_info=True)
+         return {"filtered_findings": _fallback_filtered(findings)}
+diff --git a/src/skillspector/providers/openai/model_registry.yaml b/src/skillspector/providers/openai/model_registry.yaml
+index a44268e..80fb0a6 100644
+--- a/src/skillspector/providers/openai/model_registry.yaml
++++ b/src/skillspector/providers/openai/model_registry.yaml
+@@ -16,3 +16,8 @@ models:
+   "deepseek-v4-flash":
+     context_length: 1000000
+     max_output_tokens: 8192
++
++  # DeepSeek 官方 /v1/models 返回的现行 id（deepseek-flash = DeepSeek-V4.1-Flash）
++  "deepseek-flash":
++    context_length: 1048576
++    max_output_tokens: 393216
