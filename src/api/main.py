@@ -1,4 +1,5 @@
 import logging
+import asyncio
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -116,25 +117,56 @@ async def lifespan(app: FastAPI):
 
         collector = await start_skillspector_collector()
 
-    # 一次性迁移先于 discover 扫描执行；幂等，
-    from src.jobs.migration import run_migration
+    # 一次性迁移 + 启动补跑 + discover 调度器串成一条后台引导链：
+    # migration → startup remediation → discover 首轮扫描，顺序保持不变，
+    # 但整体放到后台，避免迁移（约 18s）阻塞 API 启动。
+    # discover scheduler 的引用经 app.state 回传，供 shutdown 阶段停止。
+    app.state.discover_scheduler = None
 
-    await run_migration()
+    async def _bootstrap() -> None:
+        # 一次性幂等迁移先于 discover 扫描执行；失败仅记录，不阻断后续步骤。
+        try:
+            from src.jobs.migration import run_migration
 
-    # 启动顺序：先补衍生字段缺口（security/category/embedding），再扫描；
-    # 启动补一轮结果落盘，扫描后的缺口由 discover 每轮末尾的全表补齐兜底。
-    from src.jobs.remediation import run_remediation_on_startup
+            await run_migration()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("startup migration failed")
 
-    await run_remediation_on_startup()
+        # 启动补一轮衍生字段缺口（security/category/embedding）并落盘；
+        # 扫描后的缺口由 discover 每轮末尾的全表补齐兜底。
+        try:
+            from src.jobs.remediation import run_remediation_on_startup
 
-    discover_scheduler = None
-    if settings.discover_scheduler.enabled:
-        from src.jobs.discover_scheduler import start_discover_scheduler
+            await run_remediation_on_startup()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("startup remediation failed")
 
-        discover_scheduler = await start_discover_scheduler()
+        if settings.discover_scheduler.enabled:
+            from src.jobs.discover_scheduler import start_discover_scheduler
+
+            try:
+                app.state.discover_scheduler = await start_discover_scheduler()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("discover scheduler start failed")
+
+    bootstrap_task = asyncio.create_task(_bootstrap(), name="startup-bootstrap")
 
     yield
 
+    if not bootstrap_task.done():
+        bootstrap_task.cancel()
+    try:
+        await bootstrap_task
+    except asyncio.CancelledError:
+        pass
+
+    discover_scheduler = app.state.discover_scheduler
     if discover_scheduler is not None:
         await discover_scheduler.stop()
     if collector is not None:

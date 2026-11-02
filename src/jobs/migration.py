@@ -56,7 +56,7 @@ def _count(conn, sql: str) -> int:
 
 
 def _plan_ops() -> list[tuple[str, str]]:
-    """构造 (描述, update_sql) 列表：文本列、JSONB 列、source 列。"""
+    """构造 (描述, update_sql) 列表：文本列 + source 列（便宜，每次启动都检查）。"""
     ops: list[tuple[str, str]] = []
 
     for table, columns in TEXT_COLUMNS.items():
@@ -65,15 +65,6 @@ def _plan_ops() -> list[tuple[str, str]]:
             expr = (
                 f"replace(replace({column}, 'gitcode.com', 'atomgit.com'), "
                 f"'gitcode:', 'atomgit:')"
-            )
-            ops.append((f"{table}.{column}", f"UPDATE {table} SET {column} = {expr} WHERE {cond}"))
-
-    for table, columns in JSONB_COLUMNS.items():
-        for column in columns:
-            cond = f"({column})::text LIKE '%gitcode.com%' OR ({column})::text LIKE '%gitcode:%'"
-            expr = (
-                f"replace(replace({column}::text, 'gitcode.com', 'atomgit.com'), "
-                f"'gitcode:', 'atomgit:')::jsonb"
             )
             ops.append((f"{table}.{column}", f"UPDATE {table} SET {column} = {expr} WHERE {cond}"))
 
@@ -88,19 +79,72 @@ def _plan_ops() -> list[tuple[str, str]]:
     return ops
 
 
-def migrate_database(dry_run: bool = False) -> int:
-    """迁移数据库字段，返回受影响行数；dry_run 仅统计不写入。"""
+def _plan_jsonb_ops() -> list[tuple[str, str]]:
+    """构造 JSONB 列 (描述, update_sql)：整体 cast 成 text 替换后写回。
+
+    这些列（尤其 security_audits.details / risk_signals 合起来 142MB）的
+    ``(jsonb)::text LIKE '%gitcode.com%'`` 全表扫描无法走索引（jsonb 上的
+    trigram/gin 索引对 LIKE 子串不生效），一次空跑就要十几秒；因此用完成
+    标记保证只在首次迁移时扫描一次，之后跳过。
+    """
+    ops: list[tuple[str, str]] = []
+    for table, columns in JSONB_COLUMNS.items():
+        for column in columns:
+            cond = f"({column})::text LIKE '%gitcode.com%' OR ({column})::text LIKE '%gitcode:%'"
+            expr = (
+                f"replace(replace({column}::text, 'gitcode.com', 'atomgit.com'), "
+                f"'gitcode:', 'atomgit:')::jsonb"
+            )
+            ops.append((f"{table}.{column}", f"UPDATE {table} SET {column} = {expr} WHERE {cond}"))
+    return ops
+
+
+def _jsonb_done_marker() -> Path:
+    """JSONB 列迁移完成标记路径（落在 storage.local_path 持久卷上）。"""
+    return Path(get_settings().storage.local_path).expanduser() / ".gitcode_jsonb_migration_done"
+
+
+def _apply_ops(conn, ops: list[tuple[str, str]], dry_run: bool) -> int:
+    """对 (描述, update_sql) 逐条统计并迁移，返回受影响行数。"""
     total = 0
+    for description, update_sql in ops:
+        where_clause = update_sql.split(" WHERE ", 1)[1]
+        table = description.split(".", 1)[0]
+        count = _count(conn, f"SELECT count(*) FROM {table} WHERE {where_clause}")
+        if count:
+            total += count
+            logger.info("%s %s: %d row(s)", LOG_PREFIX, description, count)
+        if not dry_run and count:
+            conn.execute(text(update_sql))
+    return total
+
+
+def migrate_database(dry_run: bool = False) -> int:
+    """迁移数据库字段，返回受影响行数；dry_run 仅统计不写入。
+
+    文本列与 source 列每次启动都检查（代价可忽略，且是源引用的主线列）；
+    JSONB 列首次迁移成功（含空跑无残留）后落标记并跳过，避免对
+    security_audits 等大表的 ``(jsonb)::text LIKE`` 全表扫描在每次空跑时
+    重复十几秒。dry_run 不落标记。
+
+    取舍：标记落盘后，后续新写入 JSONB 列（主要是 security_audits.details /
+    risk_signals）中的 ``gitcode.com`` / ``gitcode:`` 残留不会再被捕获；源引用
+    主线列（skill_repos.url / skills.source_url 等）不受影响、每次仍全量检查。
+    如需恢复 JSONB 兜底，删除 ``<storage.local_path>/.gitcode_jsonb_migration_done``
+    即可在下一次启动重新扫描并重新落标记。
+    """
+    total = 0
+    marker = _jsonb_done_marker()
+    jsonb_done = marker.exists()
+
     with sync_engine.begin() as conn:
-        for description, update_sql in _plan_ops():
-            where_clause = update_sql.split(" WHERE ", 1)[1]
-            table = description.split(".", 1)[0]
-            count = _count(conn, f"SELECT count(*) FROM {table} WHERE {where_clause}")
-            if count:
-                total += count
-                logger.info("%s %s: %d row(s)", LOG_PREFIX, description, count)
-            if not dry_run and count:
-                conn.execute(text(update_sql))
+        total += _apply_ops(conn, _plan_ops(), dry_run)
+        if not jsonb_done:
+            total += _apply_ops(conn, _plan_jsonb_ops(), dry_run)
+
+    if not dry_run and not jsonb_done:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.touch()
     return total
 
 
