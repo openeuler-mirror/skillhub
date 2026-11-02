@@ -658,6 +658,8 @@ class SkillspectorCollector:
         processed = 0
         async with self._session_factory() as session:
             pending = await self._fetch_pending(session)
+            if not pending:
+                return 0
             _log_collector_event(
                 "batch_started",
                 pending_count=len(pending),
