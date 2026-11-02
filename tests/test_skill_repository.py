@@ -1466,6 +1466,104 @@ repositories:
         migrated = executed[0].compile(dialect=postgresql.dialect()).params
         assert migrated["platform"] == "community"
 
+    async def test_delete_removed_catalog_repos_deletes_moved_community_author(self):
+        """community 仓库从旧 SIG 挪到新 SIG：数据库记录的 (platform, author,
+        repo_name) 组合在 catalog 期望集合中已不存在，按交集删除旧归属，
+        供后续扫描重建到新归属。"""
+
+        session = MagicMock()
+        skill_repository = MagicMock()
+        skill_repository.session = session
+        repo_repository = MagicMock()
+        repo_repository.delete_skill_repositories = AsyncMock()
+        repo_repository.reconcile_skill_nums = AsyncMock(return_value=0)
+        contributor_repository = MagicMock()
+        contributor_repository.reconcile_skill_counts = AsyncMock(return_value=0)
+        contributor_repository.delete_contributors_without_skills = AsyncMock(return_value=0)
+        manager = SkillManager(skill_repository, repo_repository, contributor_repository)
+
+        moved_request = SkillRepositoryRequest(
+            url="https://atomgit.com/openeuler/agent-skills",
+            platform="community",
+            sig_name="Infrastructure",
+        )
+        stayed_request = SkillRepositoryRequest(
+            url="https://atomgit.com/openeuler/other-skills",
+            platform="community",
+            sig_name="Infrastructure",
+        )
+        moved_repo_name = manager._derive_repo_name(
+            manager._normalize_repository_request(moved_request)
+        )
+        stayed_repo_name = manager._derive_repo_name(
+            manager._normalize_repository_request(stayed_request)
+        )
+
+        repo_repository.list_skill_repositories = AsyncMock(
+            return_value=[
+                SimpleNamespace(
+                    id=1,
+                    repo_name=moved_repo_name,
+                    platform="community",
+                    author="unassigned-sig",
+                ),
+                SimpleNamespace(
+                    id=2,
+                    repo_name=stayed_repo_name,
+                    platform="community",
+                    author="Infrastructure",
+                ),
+            ]
+        )
+
+        deleted = await manager.delete_removed_catalog_repos(
+            [moved_request, stayed_request]
+        )
+
+        assert deleted == 1
+        repo_repository.delete_skill_repositories.assert_awaited_once()
+        removed_ids = repo_repository.delete_skill_repositories.await_args.args[0]
+        assert removed_ids == [1]
+
+    async def test_delete_removed_catalog_repos_uses_url_owner_for_non_community(self):
+        """非 community 仓库的 (author, repo_name) 中 author 取 URL owner，
+        URL 未变则归属未变，不会被误删。"""
+
+        session = MagicMock()
+        skill_repository = MagicMock()
+        skill_repository.session = session
+        repo_repository = MagicMock()
+        repo_repository.delete_skill_repositories = AsyncMock()
+        repo_repository.reconcile_skill_nums = AsyncMock(return_value=0)
+        contributor_repository = MagicMock()
+        contributor_repository.reconcile_skill_counts = AsyncMock(return_value=0)
+        contributor_repository.delete_contributors_without_skills = AsyncMock(return_value=0)
+        manager = SkillManager(skill_repository, repo_repository, contributor_repository)
+
+        request = SkillRepositoryRequest(
+            url="https://github.com/acme/agent-skills",
+            platform="enterprise",
+        )
+        normalized = manager._normalize_repository_request(request)
+        repo_name = manager._derive_repo_name(normalized)
+        assert manager._derive_catalog_author(normalized) == "acme"
+
+        repo_repository.list_skill_repositories = AsyncMock(
+            return_value=[
+                SimpleNamespace(
+                    id=1,
+                    repo_name=repo_name,
+                    platform="enterprise",
+                    author="acme",
+                ),
+            ]
+        )
+
+        deleted = await manager.delete_removed_catalog_repos([request])
+
+        assert deleted == 0
+        repo_repository.delete_skill_repositories.assert_not_called()
+
     async def test_sync_catalog_source_skips_when_platform_unchanged(self):
         """Issue #9: no migration (and no writes) when the catalog view matches."""
 

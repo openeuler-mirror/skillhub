@@ -398,24 +398,31 @@ class SkillManager:
     ) -> int:
         """同步删除 catalog 中已消失的仓库及其级联数据，返回删除的仓库数。
 
-        按 platform ∈ {community, enterprise, personal} 识别 catalog 仓库，
-        删除其中 repo_name 不在期望集合内的行——期望集合由本次扫描请求中
-        platform 属于 catalog 渠道的部分按同一 normalize / derive 口径推导
-        （PLATFORM_CHOICES 已覆盖三渠道，``requests`` 即全量 catalog 登记）。
-        skill / skill_versions 通过外键 CASCADE 删除，security_audits /
-        download_history 软关联由 ``delete_skill_repositories`` 一并清理。
-        删除后重算 contributors.skill_count 并物理删除名下已无任何 skill
-        的 contributor 行（孤儿作者）。
+        按 (platform, author, repo_name) 求交集：数据库中在 catalog 期望集合
+        外的组合即已删除。author 口径与扫描写入 skill_repos.author 一致。
+
+        skill / skill_versions 走外键 CASCADE；security_audits / download_history
+        软关联由 ``delete_skill_repositories`` 清理；删除后重算 contributors
+        .skill_count 并清理名下已无 skill 的孤儿作者。
         """
-        expected_repo_names = {
-            self._derive_repo_name(self._normalize_repository_request(request))
-            for request in requests
-            if request.platform in CATALOG_PLATFORMS
-        }
+        expected_keys: set[tuple[str, str | None, str]] = set()
+        for request in requests:
+            if request.platform not in CATALOG_PLATFORMS:
+                continue
+            normalized = self._normalize_repository_request(request)
+            expected_keys.add(
+                (
+                    normalized.platform,
+                    self._derive_catalog_author(normalized),
+                    self._derive_repo_name(normalized),
+                )
+            )
+
         repos = await self.skill_repo_repository.list_skill_repositories()
         removed = [
             repo for repo in repos
-            if repo.platform in CATALOG_PLATFORMS and repo.repo_name not in expected_repo_names
+            if repo.platform in CATALOG_PLATFORMS
+            and (repo.platform, repo.author, repo.repo_name) not in expected_keys
         ]
         if not removed:
             return 0
@@ -677,6 +684,10 @@ class SkillManager:
         若后续在锚点目录中登记（如 ``platform='community'``），则下一次采集时
         必须迁移其 ``platform``/``source`` 字段，即使 git 提交未变化也是如此。
         否则技能列表会一直显示旧来源，直到仓库内容发生变化。
+
+        author 与 catalog 的差异不在此处原地迁移，统一交由同步删除阶段
+        （``delete_removed_catalog_repos``）处理：数据库有、catalog 无的
+        (platform, author, repo) 组合会被删除，之后重新扫描写入正确归属。
         """
         target_source: str | None = None
         try:
@@ -817,6 +828,21 @@ class SkillManager:
         name = name.removesuffix('.git')
         name = name.replace('/', '_')
         return name
+
+    @staticmethod
+    def _derive_catalog_author(request: SkillRepositoryRequest) -> str | None:
+        """catalog 仓库的期望 author 口径，与扫描写入 skill_repos.author 一致。
+
+        community 归属 SIG 目录名（sig_name）；enterprise/personal 取仓库 URL
+        的 owner 段（扫描时 skill.author 的 URL 兜底口径 derive_skill_source）。
+        """
+        if request.platform == 'community':
+            return request.sig_name
+        try:
+            _, owner = derive_skill_source(request.url)
+            return owner
+        except ValueError:
+            return None
 
     def _get_openeuler_sig_name(self, repo_name: str) -> str | None:
         if self._openeuler_sig_by_repo_name is None:

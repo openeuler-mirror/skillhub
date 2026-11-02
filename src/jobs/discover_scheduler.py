@@ -186,16 +186,8 @@ class DiscoverScheduler:
             build_configured_discover_requests,
             repository_path=repository_path,
         )
-        total = len(requests)
         run_started = time.monotonic()
         run_started_wall = datetime.now()
-        logger.info(
-            "%s round started: %d repos from %s (catalog: %s)",
-            LOG_PREFIX,
-            total,
-            ", ".join(config_keys),
-            repository_path,
-        )
 
         counters = {
             "created": 0,
@@ -231,6 +223,15 @@ class DiscoverScheduler:
                     logger.info("%s no catalog repo/skill removed before scan", LOG_PREFIX)
             except Exception:
                 logger.exception("%s catalog removal sync failed", LOG_PREFIX)
+
+            total = len(requests)
+            logger.info(
+                "%s round started: %d repos from %s (catalog: %s)",
+                LOG_PREFIX,
+                total,
+                ", ".join(config_keys),
+                repository_path,
+            )
             for index, request in enumerate(requests, start=1):
                 label = request.url or "<missing-url>"
                 logger.info("%s [%d/%d] scanning %s", LOG_PREFIX, index, total, label)
