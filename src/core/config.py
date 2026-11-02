@@ -1,7 +1,8 @@
 import os
+import re
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, Field
@@ -24,7 +25,9 @@ class PostgresConfig(BaseSettings):
     def sync_url(self) -> str:
         # Keep the synchronous driver explicit. SQLAlchemy's default PostgreSQL
         # driver can vary across major releases; this project installs psycopg2.
-        return f"postgresql+psycopg2://{self.user}:{self.password}@{self.host}:{self.port}/{self.db}"
+        return (
+            f"postgresql+psycopg2://{self.user}:{self.password}@{self.host}:{self.port}/{self.db}"
+        )
 
 
 class StorageConfig(BaseSettings):
@@ -126,6 +129,67 @@ class DiscoverSchedulerConfig(BaseSettings):
     result_dir: str = ""  # 每轮结果 JSON 保存目录；空则用 storage.local_path/logs
 
 
+class AuditLLMReviewConfig(BaseSettings):
+    """后台定时 LLM 复核配置。
+
+    每天在 ``start_time`` ~ ``end_time``（本地时区 HH:MM，容器 TZ 为
+    Asia/Shanghai）窗口内，分批对已入库但尚未复核的 SkillSpector 风险项
+    做误报判定；复核结果回写 security_audits 与 skills/skill_versions。
+    """
+
+    enabled: bool = False
+    start_time: str = "01:00"
+    end_time: str = "08:00"
+    # OpenAI 兼容接口；默认硅基流动免费档 Qwen3.5-4B（与 skillspector 复核模型一致）
+    model: str = "Qwen/Qwen3.5-4B"
+    base_url: str = "https://api.siliconflow.cn/v1"
+    api_key: str = ""
+    timeout: float = 90.0
+    # 同一时刻最多并发的 LLM 请求数；硅基流动免费档实测可用并发约 3-4
+    concurrency: int = 3
+    # 单次请求最多送多少条命中；单轮 pass 单条审计最多复核多少条。
+    # 一轮 pass 扫完后若窗口未结束且仍有剩余，会立即开始下一轮，
+    # 因此队列空闲时单条审计当晚可连续推进多个批次（0 = 不限）。
+    max_findings_per_call: int = 10
+    max_findings_per_audit: int = 200
+    # 复核上下文：本地 repo 缓存 -> 远端 raw -> 现有 snippet。
+    # window 模式对小文件送全文，大文件按命中位置取窗口行。
+    context_mode: Literal["snippet", "window", "full"] = "window"
+    window_lines: int = 40
+    window_header_lines: int = 40
+    window_max_ranges: int = 24
+    window_gap: int = 3
+    full_file_max_bytes: int = 64 * 1024
+    max_file_bytes: int = 512 * 1024
+    max_context_chars: int = 60_000
+    repo_cache_root: str = "/opt/wittyhub/skill-repositories"
+    git_timeout: float = 20.0
+    # 远端 raw 拉取（本地缓存缺失时）；失败/超时回退 snippet，不影响审计状态
+    remote_fetch_enabled: bool = True
+    remote_fetch_timeout: float = 15.0
+    remote_fetch_max_bytes: int = 512 * 1024
+    remote_fetch_max_files_per_audit: int = 40
+    github_token: str = ""
+    gitcode_token: str = ""
+    gitlab_token: str = ""
+    gitee_token: str = ""
+    context_cache_max_bytes: int = 64 * 1024 * 1024
+    max_output_tokens: int = 2048
+    # 置信度门槛：模型确认命中但 confidence 低于该值时按上游口径丢弃；
+    # 0 表示关闭，所有确认为真的命中都保留
+    min_confidence: float = 0.6
+    # 误报删除门槛：模型判定 is_vulnerability=false 但 confidence 低于该值时
+    # 不删除、保留命中；HIGH/CRITICAL 使用更严格的 *_high 值。
+    # 0 表示关闭该门槛（仅按模型结论删除）。
+    min_false_positive_confidence: float = 0.85
+    min_false_positive_confidence_high: float = 0.9
+    # 单条审计复核失败的最大重试轮次（跨天累计），超过后不再自动重试
+    max_attempts: int = 3
+    # 客户端限流（与硅基流动免费档 1000 RPM / 80000 TPM 对齐；0 = 不限流）
+    rpm: int = 1000
+    tpm: int = 80000
+
+
 class LoggingConfig(BaseSettings):
     level: str = "INFO"
     format: str = "json"
@@ -146,6 +210,7 @@ class Settings(BaseSettings):
     security: SecurityConfig = Field(default_factory=SecurityConfig)
     app: AppConfig = Field(default_factory=AppConfig)
     discover_scheduler: DiscoverSchedulerConfig = Field(default_factory=DiscoverSchedulerConfig)
+    audit_llm_review: AuditLLMReviewConfig = Field(default_factory=AuditLLMReviewConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     ai: AIConfig = Field(default_factory=AIConfig)
     openeuler_repos: list[SkillRepoEntry] = Field(default_factory=list)
@@ -169,6 +234,7 @@ class Settings(BaseSettings):
             security=SecurityConfig(**data.get("security", {})),
             app=AppConfig(**data.get("app", {})),
             discover_scheduler=DiscoverSchedulerConfig(**data.get("discover_scheduler", {})),
+            audit_llm_review=AuditLLMReviewConfig(**data.get("audit_llm_review", {})),
             logging=LoggingConfig(**data.get("logging", {})),
             ai=AIConfig(**data.get("ai", {})),
             openeuler_repos=data.get("openeuler_repos", []) or [],
@@ -191,9 +257,16 @@ def _apply_env_overrides(data: dict[str, Any]) -> None:
             section_data[field] = _parse_env_value(value)
 
 
+_HHMM_PATTERN = re.compile(r"^\d{1,2}:\d{2}$")
+
+
 def _parse_env_value(value: str) -> Any:
     if value == "":
         return ""
+    # 形如 "2:00" 的值在 YAML 1.1 里会被解析成六十进制整数（120），
+    # 会让调度器的 HH:MM 解析失败；时间类配置一律保留字符串。
+    if _HHMM_PATTERN.fullmatch(value.strip()):
+        return value
     try:
         return yaml.safe_load(value)
     except yaml.YAMLError:
