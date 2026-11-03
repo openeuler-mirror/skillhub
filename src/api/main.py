@@ -141,12 +141,20 @@ async def lifespan(app: FastAPI):
 
         discover_scheduler = await start_discover_scheduler()
 
+    audit_llm_review = None
+    if settings.audit_llm_review.enabled:
+        from src.jobs.audit_llm_review import start_audit_llm_review_scheduler
+
+        audit_llm_review = await start_audit_llm_review_scheduler()
+
     # 启动时补跑衍生字段缺口（security/category/embedding），之后每小时一轮：
     remediation_task = asyncio.create_task(_run_remediation_loop())
 
     yield
 
     remediation_task.cancel()
+    if audit_llm_review is not None:
+        await audit_llm_review.stop()
     if discover_scheduler is not None:
         await discover_scheduler.stop()
     if collector is not None:
