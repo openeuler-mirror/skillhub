@@ -7,15 +7,15 @@ Create Date: 2026-09-15 00:00:00
 contributors 表包含 git_profile（代码托管平台主页）和 website（官网地址）
 两列，对应 skill.yaml 中的同名字段。
 """
-from typing import Sequence, Union
+from collections.abc import Sequence
 
 import sqlalchemy as sa
 from alembic import op
 
 revision: str = "013_contributors_git_profile"
-down_revision: Union[str, None] = "012_add_skill_tree_hash"
-branch_labels: Union[str, Sequence[str], None] = None
-depends_on: Union[str, Sequence[str], None] = None
+down_revision: str | None = "012_add_skill_tree_hash"
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:

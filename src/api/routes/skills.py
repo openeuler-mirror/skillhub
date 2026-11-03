@@ -9,17 +9,15 @@ from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, Res
 from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.skills.skill_id import extract_owner_repo
-
 from src.api.schemas.skill import (
     AuditByUrlRequest,
     AuditByUrlResponse,
     AuditByUrlResultResponse,
+    AuditReportResponse,
     ContributorListResponse,
     ContributorResponse,
-    AuditReportResponse,
-    ErrorResponse,
     ContributorSkillsResponse,
+    ErrorResponse,
     SecurityAuditResponse,
     SkillCreate,
     SkillListResponse,
@@ -46,6 +44,7 @@ from src.storage.downloader import (
     SkillArchiveError,
     SkillArchiveNotFoundError,
 )
+from src.utils.skill_path import derive_skill_path
 
 router = APIRouter()
 _logger = logging.getLogger(__name__)
@@ -58,28 +57,11 @@ def _derive_scan_skill_path(source: str, source_url: str, skill_id: str) -> str:
     Mirrors ``SkillManager._relative_skill_path`` so manual audits scan the same
     skill directory as crawler-triggered audits.  Empty string means repo root.
     """
-    # 1) source_url 带 /blob/<ref>/.../SKILL.md 时直接取其父目录
-    blob_match = re.search(r"/blob/[^/]+/(.+)", source_url or "")
-    if blob_match:
-        relative = blob_match.group(1)
-        if relative.endswith("SKILL.md"):
-            return relative.rsplit("/", 1)[0] if "/" in relative else ""
-
-    # 2) 从 skill_id 推导：{source}/{owner}/{repo}/<skill dir>
-    try:
-        owner_repo = extract_owner_repo(source_url)
-    except ValueError:
-        return ""
-    prefix = f"{source}/{owner_repo}"
-    if skill_id == prefix:
-        return ""  # 整仓库即 skill，扫仓库根
-    if skill_id.startswith(prefix + "/"):
-        skill_path = skill_id.removeprefix(prefix + "/").strip("/")
-        repository_name = owner_repo.rsplit("/", 1)[-1]
-        if not skill_path or skill_path == repository_name:
-            return ""
-        return skill_path
-    return ""
+    return derive_skill_path(
+        source_url=source_url,
+        source=source,
+        skill_id=skill_id,
+    )
 
 
 def _resolve_default_branch(git_url: str) -> str:
@@ -688,10 +670,14 @@ async def download_skill(
     await repo.increment_download(skill_id)
     await db.commit()
 
+    headers = (
+        {"X-Artifact-SHA256": archive.sha256} if archive.sha256 else None
+    )
     return FileResponse(
         path=archive.path,
         filename=archive.filename,
         media_type=archive.media_type,
+        headers=headers,
     )
 
 

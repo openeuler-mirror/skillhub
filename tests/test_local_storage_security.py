@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from src.storage.downloader import LocalStorage, MAX_STORAGE_READ_BYTES
+from src.storage.downloader import MAX_STORAGE_READ_BYTES, LocalStorage
 
 
 @pytest.mark.parametrize(

@@ -161,6 +161,102 @@ collector 不属于 `python skillcrawler/main.py discover` 进程。discover 退
 
 启动: `src/security/detector.py` → `start_skillspector_collector()`（内部自行导入 `AsyncSessionLocal`），由 `src/api/main.py` lifespan 调用。
 
+### 3.3 后台定时 LLM 复核（误报剔除）
+
+已入库的 SkillSpector 报告可能仍包含大量静态误报。新增的后台任务在每天
+`audit_llm_review.start_time` ~ `end_time`（默认 01:00-08:00，本地时区）窗口内，
+分批对**尚未复核**的审计做 LLM 二次判定：
+
+```
+AuditLLMReviewScheduler（src/jobs/audit_llm_review.py）
+  ├── 查询 security_audits：
+  │     details.skillspector_report.issues 非空
+  │     且 details.llm_review 为空（或 status=failed 且 attempts < max_attempts）
+  │     且 resource_id 仍对应 skills / skill_versions
+  │     排序：社区 SIG（platform=community）绝对优先 -> 风险等级降序
+  │     （critical/high/medium/low）-> 命中数升序 -> audited_at 升序 -> id 升序；
+  │     keyset 游标为 community_priority/risk_rank/issue_count/audited_at/id
+  │     五元组
+  ├── 按文件分组、文件内按严重度排序挑最多 max_findings_per_audit 条命中
+  │     （默认 200/pass；同文件命中尽量落在同一批）
+  │     超出部分写 details.llm_review.status=partial + reviewed_count 游标，
+  │     下次继续；单个 pass 内用
+  │     community_priority/risk_rank/issue_count/audited_at/id keyset 游标
+  │     保证每条审计只处理一次，超大审计不会挤占其他审计。一个 pass 扫完后若窗口
+  │     未结束且仍有剩余，立即重置游标开始下一个 pass（round-robin），
+  │     因此队列空闲时同一条超大审计当晚可连续推进多个 200 条
+  ├── 每 max_findings_per_call 条一批调用 OpenAI 兼容接口
+  │     （默认硅基流动 Qwen/Qwen3.5-4B，temperature=0，关闭 thinking）
+  ├── 删除规则：
+  │     显式 is_vulnerability=false 且 confidence 达到误报删除门槛
+  │     （默认 0.85，HIGH/CRITICAL 为 0.9）的命中；
+  │     确认为真但 confidence < min_confidence（默认 0.6，与上游
+  │     meta_analyzer 的置信度过滤一致）的命中；
+  │     未出现在模型结果里的命中一律保留（避免漏报）；
+  │     命中所在文件上下文为 snippet/missing 时不做任何删除
+  ├── LP1/LP3（MCP 最小权限）不走模型：直接按 SKILL.md
+  │     frontmatter 的 permissions/allowed-tools 静态判定
+  │     （支持空格/逗号分隔与 Bash(man:*) 作用域写法）
+  └── 全部命中复核完成后写回：
+        security_audits.risk_level / risk_signals
+        details.skillspector_report.issues / risk_assessment
+        details.skillspector_score / recommendation
+        details.llm_review（复核模型、时间、误报/低置信度明细、分数变化）
+        skills.risk_score 或 skill_versions.risk_score
+```
+
+约束与容错：
+
+- 单条审计复核完成后写入 `details.llm_review.status=completed`，后续轮次不再重复
+  消耗模型调用；失败记录 `status=failed` 与 `attempts`，超过 `max_attempts`
+  后不再自动重试。
+- 置信度门槛：模型对每条命中返回 `confidence`（缺省 `0.7`）。显式
+  `is_vulnerability=false` 的命中还需达到误报删除门槛
+  `min_false_positive_confidence`（默认 `0.85`，HIGH/CRITICAL 使用
+  `min_false_positive_confidence_high`，默认 `0.9`），否则保留并计入
+  `findings_false_positive_below_threshold`；确认为真但 `confidence` 低于
+  `min_confidence`（默认 `0.6`）的命中按上游 `meta_analyzer` 口径丢弃，
+  单独记录在 `details.llm_review.low_confidence_findings`，不计入误报数；
+  两个门槛均可用 `0` 关闭。
+- 上下文保护：若命中所在文件的上下文来自 snippet 兜底或缺失，本轮不做任何
+  删除（误报/低置信度命中全部保留），计入
+  `findings_kept_incomplete_context`。
+- 只记录被删除命中的理由：误报写入 `false_positive_findings`（含
+  `confidence`），低置信度写入 `low_confidence_findings`；确认项不写入
+  额外字段，保持原始 issue 结构不变，避免报告 JSONB 膨胀。
+- 全部命中被删除时直接应用结果（分数归零、等级 low），
+  `details.llm_review.all_removed=true` 仅作标记，不保留原分数，
+  也不进入二次复核或人工审核。
+- 分数对**保留命中**用 SkillSpector 原生算法重算（与上游
+  `nodes/report.py:_compute_risk_score` 完全一致）：按规则 ID 统计出现次数，
+  前 3 次分别按 1 / 0.5 / 0.25 递减权重计入 `severity_points × weight ×
+  confidence`，第 4 次起不计分；存在可执行脚本时总分 ×1.3；最终 `int()`
+  截断并封顶 100。没有命中被删除时重算结果与原分完全相同（测试库 540 条
+  审计实测 100% 一致）；全部剔除时为 0。风险等级按 0-20 low / 21-50
+  medium / 51-80 high / 81-100 critical 重算。
+- 模型返回合法但空的 findings 数组时先追加纠正提示重试一次，仍为空则整条审计
+  按失败处理，不删除任何命中。
+- 连续失败达到阈值时熔断本轮，避免供应商不可用时把整个待复核队列消耗成失败。
+- 写回前用报告指纹（`metadata.scanned_at` / `skill.scanned_at`）做乐观校验，
+  复核期间被重新扫描的审计直接丢弃本次结果。
+- 复核上下文按 **本地 repo 缓存 → 远端 raw → snippet** 解析：
+  - 本地缓存使用 `security_audits.commit_id` 对应的 skill 目录，只读执行
+    `git cat-file` / `git show`，不修改 shared cache；
+  - 本地缺失时按平台 raw 地址拉取（GitHub / GitCode / GitLab / Gitee），
+    固定域名白名单、15s 超时、单文件 512KB 上限、单审计最多 40 个远端文件；
+  - 远端超时/404/403/429/超大小/二进制时回退该文件的 `code_snippet`，不影响审计状态。
+- 小文件（≤64KB）送全文；大文件按命中位置合并窗口行（默认前后各 40 行，
+  文件头 40 行），单次上下文最多 60000 字符；`details.llm_review` 记录
+  `context_version` / `context_mode` / `context_blocks_*` / `context_sources_*`。
+  partial 记录在 context_version 升级后从头复核，避免旧游标错位。
+
+配置见 `config.yaml` 的 `audit_llm_review` 段：`model` / `base_url` / `api_key`
+留空时复用 `model.providers` 当前 provider（默认 siliconflow / Qwen3.5-4B），
+与分类、翻译共用同一份凭据；需要为复核单独指定模型或 Key 时再通过
+`AUDIT_LLM_REVIEW__MODEL` / `__BASE_URL` / `__API_KEY` 覆盖；全部为空时任务
+自动跳过。请求体复用 `src/ai/llm.build_chat_payload`，仅额外开启
+`response_format=json_object`。
+
 ---
 
 ## 四、模块架构
@@ -197,6 +293,17 @@ src/security/detector.py          ← 唯一核心（扫描逻辑 + Collector �
 
 src/api/services/security.py      ← 编排层
   └── SecurityService.audit_skill()
+src/jobs/audit_llm_review.py  ← 后台 LLM 误报复核（见 3.3）
+  ├── AuditLLMReviewScheduler.run_once()
+  └── start_audit_llm_review_scheduler()
+src/security/audit_review/review.py       ← 单条审计复核流程
+src/security/audit_review/apply.py        ← 误报剔除 + 分数/等级重算（纯函数）
+src/security/audit_review/context.py      ← 复核上下文（本地缓存/远端/窗口）
+src/security/audit_review/remote_raw.py   ← GitLab/Gitee/GitHub/GitCode raw 适配
+src/security/audit_review/prompt.py       ← 提示词与模型响应解析
+src/security/audit_review/llm.py          ← OpenAI 兼容模型客户端
+src/security/audit_review/persistence.py  ← 复核结果/游标/失败状态写回
+src/utils/skill_path.py                   ← skill 目录推导（crawler/手动审计共用）
 
 src/api/routes/skills.py          ← 业务入口
   ├── trigger_skill_audit()       ← POST /skills/{id}/audit  手动触发
@@ -800,6 +907,7 @@ SC4 模块实时查询 [OSV.dev](https://osv.dev) 检查依赖包已知 CVE：
 | `skillspector_jenkins_user` | `SKILLSPECTOR_JENKINS_USER` | Basic Auth 用户名 |
 | `skillspector_jenkins_token` | `SKILLSPECTOR_JENKINS_TOKEN` | Basic Auth Token |
 | `skillspector_timeout` | `SECURITY__SKILLSPECTOR_TIMEOUT` | 同步扫描等待 Jenkins 构建结束的超时（秒），默认 600（10 分钟） |
+| `audit_llm_review.*` | `AUDIT_LLM_REVIEW__*` | 后台定时 LLM 复核（见 3.3）：开关、时间窗口、模型、并发、单条审计复核上限、限流等 |
 
 ---
 
