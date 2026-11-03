@@ -178,6 +178,8 @@ def create_app() -> FastAPI:
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+        # 下载接口用响应头回传制品摘要，浏览器端需要能读到
+        expose_headers=["X-Artifact-SHA256", "Content-Disposition"],
     )
     install_response_wrapper(app)
 

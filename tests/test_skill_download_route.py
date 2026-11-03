@@ -39,11 +39,13 @@ async def test_download_skill_returns_file_and_commits_statistics(tmp_path):
     skill_repository.increment_download = AsyncMock(return_value=True)
     history_repository = MagicMock()
     history_repository.create = AsyncMock()
+    digest = "a" * 64
     manager = MagicMock()
     manager.create_skill_archive = AsyncMock(
         return_value=SkillArchive(
             path=archive_path,
             filename="clean-code-1.1.0.zip",
+            sha256=digest,
         )
     )
     db = AsyncMock()
@@ -65,6 +67,8 @@ async def test_download_skill_returns_file_and_commits_statistics(tmp_path):
     assert isinstance(response, FileResponse)
     assert Path(response.path) == archive_path
     assert response.media_type == "application/zip"
+    # 制品摘要通过响应头回传，供客户端校验下载内容
+    assert response.headers["x-artifact-sha256"] == digest
     manager.create_skill_archive.assert_awaited_once_with(
         skill=skill,
         repository=repository,
