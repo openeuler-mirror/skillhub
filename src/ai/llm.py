@@ -1,4 +1,4 @@
-"""OpenAI 兼容 LLM 统一调用封装（skill 分类 / 搜索翻译共用）。
+"""OpenAI 兼容 LLM 统一调用封装（skill 分类 / 搜索翻译 / 安全审计复核共用）。
 
 收敛此前散落在 ``src/ai/category_classifier.py`` 与
 ``src/ai/translation.py`` 的重复实现：请求体构造、``enable_thinking`` 开关、
@@ -8,6 +8,7 @@
 调用方自行决定异常处理：
 - 分类：让它抛出，交给外层重试/降级
 - 翻译：捕获后记日志，跳过翻译腿
+- 复核：捕获后按状态码/网络错误退避重试
 """
 
 from __future__ import annotations
@@ -28,13 +29,15 @@ DEFAULT_TEMPERATURE = 0.0
 _async_client: httpx.AsyncClient | None = None
 
 
-def _chat_url() -> str:
-    return f"{get_settings().model.base_url.rstrip('/')}/chat/completions"
+def _chat_url(base_url: str | None = None) -> str:
+    base = base_url or get_settings().model.base_url
+    return f"{base.rstrip('/')}/chat/completions"
 
 
-def _auth_headers() -> dict[str, str]:
+def _auth_headers(api_key: str | None = None) -> dict[str, str]:
+    key = api_key or get_settings().model.api_key
     return {
-        "Authorization": f"Bearer {get_settings().model.api_key}",
+        "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
     }
 
@@ -71,13 +74,21 @@ def build_chat_payload(
 
 
 def extract_chat_content(data: dict[str, Any]) -> str:
-    """从 OpenAI 兼容响应中取出 assistant 文本（去掉思维链等额外字段）。"""
-    return (
-        data.get("choices", [{}])[0]
-        .get("message", {})
-        .get("content", "")
-        .strip()
-    )
+    """从 OpenAI 兼容响应中取出 assistant 文本（去掉思维链等额外字段）。
+
+    兼容 ``content`` 为字符串或分段列表（部分 provider 会把多段文本放进
+    list）两种形态；结构缺失时返回空串，由调用方决定是否当作失败处理。
+    """
+    choices = data.get("choices") if isinstance(data, dict) else None
+    message = choices[0].get("message") if choices and isinstance(choices[0], dict) else {}
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content", "")
+    if isinstance(content, list):
+        content = "".join(
+            str(part.get("text") or "") for part in content if isinstance(part, dict)
+        )
+    return str(content or "").strip()
 
 
 def chat_completion_sync(
@@ -119,31 +130,50 @@ def chat_completion_sync(
 async def chat_completion(
     messages: list[dict[str, str]],
     *,
+    model: str | None = None,
     max_tokens: int = DEFAULT_MAX_TOKENS,
     temperature: float = DEFAULT_TEMPERATURE,
     timeout: float | None = None,
     enable_thinking: bool = False,
+    response_format: dict[str, Any] | None = None,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    client: httpx.AsyncClient | None = None,
 ) -> str:
-    """异步调用（供搜索翻译使用），异常原样抛出。"""
+    """异步调用，异常原样抛出。
+
+    默认使用 ``settings.model`` 与进程级 client；需要独立 provider 或连接池的
+    调用方（如安全审计复核）可显式传 ``model`` / ``base_url`` / ``api_key`` /
+    ``client``，无需另写一套 HTTP 请求与响应解析。
+    """
     settings = get_settings()
     payload = build_chat_payload(
         messages,
+        model=model,
         max_tokens=max_tokens,
         temperature=temperature,
         enable_thinking=enable_thinking,
+        response_format=response_format,
     )
     started_at = time.perf_counter()
     status: int | str = "request_error"
     try:
-        response = await _get_async_client().post(
-            _chat_url(),
-            headers=_auth_headers(),
+        response = await (client or _get_async_client()).post(
+            _chat_url(base_url),
+            headers=_auth_headers(api_key),
             json=payload,
             timeout=timeout or settings.model.timeout,
         )
         status = response.status_code
         response.raise_for_status()
         data = response.json()
+        usage = data.get("usage") if isinstance(data, dict) else None
+        if isinstance(usage, dict):
+            _logger.debug(
+                "LLM usage: prompt=%s completion=%s",
+                usage.get("prompt_tokens"),
+                usage.get("completion_tokens"),
+            )
     finally:
         _logger.debug(
             "LLM chat: model=%s status=%s elapsed=%.3fs",

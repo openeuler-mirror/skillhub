@@ -8,13 +8,12 @@ from typing import Any
 
 import httpx
 
-from src.ai.llm import build_chat_payload
+from src.ai.llm import chat_completion
 from src.core.config import AuditLLMReviewConfig
 from src.security.audit_review.constants import (
     _RETRYABLE_STATUS,
     _TRANSIENT_ATTEMPTS,
 )
-from src.security.audit_review.log import logger
 from src.security.audit_review.prompt import (
     _EMPTY_VERDICT_REMINDER,
     SYSTEM_PROMPT,
@@ -62,60 +61,42 @@ async def post_chat(
     api_key: str,
     messages: list[dict[str, str]],
 ) -> str:
-    url = f"{config.base_url.rstrip('/')}/chat/completions"
-    # 复用主模型调用封装：请求体字段、enable_thinking（Qwen3.x 关闭思考）
-    # 与共享配置保持一致，这里只额外打开 JSON 输出。
-    payload = build_chat_payload(
-        messages,
-        model=config.model,
-        max_tokens=config.max_output_tokens,
-        response_format={"type": "json_object"},
-    )
+    """带限流与退避重试的 JSON 模式调用：HTTP 细节复用 ``src.ai.llm``。
+
+    复核特有的只有限流预留、可重试状态码与退避策略；请求体、鉴权头、
+    响应解析都走共享封装，避免两套实现漂移。
+    """
     estimated_tokens = (
         sum(len(message.get("content") or "") for message in messages) // 4
         + config.max_output_tokens
     )
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
 
     last_error = ""
     for attempt in range(_TRANSIENT_ATTEMPTS):
         await limiter.acquire(estimated_tokens)
         try:
-            response = await client.post(url, headers=headers, json=payload)
+            return await chat_completion(
+                messages,
+                model=config.model,
+                base_url=config.base_url,
+                api_key=api_key,
+                client=client,
+                max_tokens=config.max_output_tokens,
+                timeout=config.timeout,
+                response_format={"type": "json_object"},
+            )
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            if status not in _RETRYABLE_STATUS:
+                raise LLMReviewError(
+                    f"HTTP {status}: {exc.response.text[:300]}"
+                ) from exc
+            last_error = f"HTTP {status}: {exc.response.text[:200]}"
         except (httpx.TimeoutException, httpx.TransportError) as exc:
             last_error = f"{type(exc).__name__}: {exc}"
-        else:
-            if response.status_code in _RETRYABLE_STATUS:
-                last_error = f"HTTP {response.status_code}: {response.text[:200]}"
-            elif response.status_code >= 400:
-                raise LLMReviewError(f"HTTP {response.status_code}: {response.text[:300]}")
-            else:
-                try:
-                    data = response.json()
-                except ValueError as exc:
-                    last_error = f"invalid JSON response: {exc}"
-                else:
-                    usage = data.get("usage") if isinstance(data, dict) else None
-                    if isinstance(usage, dict):
-                        logger.debug(
-                            "LLM usage: prompt=%s completion=%s",
-                            usage.get("prompt_tokens"),
-                            usage.get("completion_tokens"),
-                        )
-                    return extract_message_content(data)
+        except ValueError as exc:
+            # 响应不是合法 JSON：与网络错误一样按瞬时失败重试
+            last_error = f"invalid JSON response: {exc}"
         if attempt + 1 < _TRANSIENT_ATTEMPTS:
             await asyncio.sleep(3.0 * (attempt + 1))
     raise LLMReviewError(f"LLM request failed after retries: {last_error}")
-
-
-def extract_message_content(data: Any) -> str:
-    try:
-        content = data["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError) as exc:
-        raise LLMReviewError("unexpected chat completion payload") from exc
-    if isinstance(content, list):
-        content = "".join(str(part.get("text") or "") for part in content if isinstance(part, dict))
-    return str(content or "").strip()
