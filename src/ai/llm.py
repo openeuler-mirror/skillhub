@@ -46,6 +46,7 @@ def build_chat_payload(
     max_tokens: int = DEFAULT_MAX_TOKENS,
     temperature: float = DEFAULT_TEMPERATURE,
     enable_thinking: bool = False,
+    response_format: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """构造 /chat/completions 请求体。
 
@@ -53,14 +54,20 @@ def build_chat_payload(
     分类、翻译这类短任务用不上还拖慢调用。硅基流动仅识别**顶层**
     ``enable_thinking``（``chat_template_kwargs`` 写法无效）；不识别该参数的
     模型会静默忽略，无需区分 provider。
+
+    ``response_format`` 用于需要结构化输出的调用方（如安全审计复核的
+    ``json_object`` 模式）；不传时不写入请求体，保持旧行为。
     """
-    return {
+    payload: dict[str, Any] = {
         "model": model or get_settings().model.name,
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
         "enable_thinking": enable_thinking,
     }
+    if response_format is not None:
+        payload["response_format"] = response_format
+    return payload
 
 
 def extract_chat_content(data: dict[str, Any]) -> str:

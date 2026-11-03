@@ -8,6 +8,7 @@ from typing import Any
 
 import httpx
 
+from src.ai.llm import build_chat_payload
 from src.core.config import AuditLLMReviewConfig
 from src.security.audit_review.constants import (
     _RETRYABLE_STATUS,
@@ -62,15 +63,14 @@ async def post_chat(
     messages: list[dict[str, str]],
 ) -> str:
     url = f"{config.base_url.rstrip('/')}/chat/completions"
-    payload = {
-        "model": config.model,
-        "messages": messages,
-        "temperature": 0.0,
-        "max_tokens": config.max_output_tokens,
-        # Qwen3.x 关闭思考模式（不支持的模型会忽略该参数）
-        "enable_thinking": False,
-        "response_format": {"type": "json_object"},
-    }
+    # 复用主模型调用封装：请求体字段、enable_thinking（Qwen3.x 关闭思考）
+    # 与共享配置保持一致，这里只额外打开 JSON 输出。
+    payload = build_chat_payload(
+        messages,
+        model=config.model,
+        max_tokens=config.max_output_tokens,
+        response_format={"type": "json_object"},
+    )
     estimated_tokens = (
         sum(len(message.get("content") or "") for message in messages) // 4
         + config.max_output_tokens
