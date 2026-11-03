@@ -3188,7 +3188,7 @@ class TestConfig:
         with patch.dict(
             "os.environ",
             {
-                "DATABASE_URL": "postgresql+asyncpg://user:pass@localhost:5432/wittyhub",
+                "DATABASE_URL": "postgresql+asyncpg://user:pass@localhost:5432/skillhub",
             },
         ):
             settings = get_settings()

@@ -50,7 +50,7 @@
 | R-04 | Web浏览功能 | P1 | 已实现 | 首页、搜索结果、详情、分类浏览、排行榜 |
 | R-05 | 数据库索引存储 | P0 | 已实现 | PostgreSQL存储索引，不存储Skill内容 |
 | R-06 | 全文搜索引擎 | P0 | 已实现 | PostgreSQL tsvector 全文检索 |
-| R-07 | CLI工具 | P0 | 已实现 | wittyhub CLI（add, use, list, update, audit, get, init 等命令） |
+| R-07 | CLI工具 | P0 | 已实现 | skillhub CLI（add, use, list, update, audit, get, init 等命令） |
 | R-08 | Web前端 | P1 | 已实现 | Vue.js + TypeScript + Tailwind CSS |
 | R-09 | Docker部署 | P0 | 已实现 | Docker Compose一键部署 |
 | R-10 | 多版本支持 | P1 | 已实现 | Skill版本管理，历史版本查询 |
@@ -284,7 +284,7 @@
 ### 5.2 项目目录结构
 
 ```
-wittyhub/
+skillhub/
 ├── src/                           # 后端源代码
 │   ├── __init__.py
 │   ├── api/                      # FastAPI 应用
@@ -389,22 +389,22 @@ wittyhub/
 | `src/security/detector.py` | 安全检测 | `SkillSpectorClient`, `SecurityResultCollector` |
 | `src/storage/downloader.py` | 下载管理 | `DownloadManager.create_skill_archive()` |
 | `src/core/config.py` | 配置管理 | `Settings` (从 YAML 加载) |
-| `wittyhub-cli` (独立 npm 包) | CLI 命令 | `add`, `use`, `list`, `update`, `audit`, `get`, `init` |
+| `skillhub-cli` (独立 npm 包) | CLI 命令 | `add`, `use`, `list`, `update`, `audit`, `get`, `init` |
 
 ---
 
 ## 6. CLI 工具设计
 
-> CLI 已独立为 npm 包 `wittyhub`（仓库 `wittyhub-cli`），由平台 API
+> CLI 已独立为 npm 包 `skillhub`（仓库 `skillhub-cli`），由平台 API
 > 提供检索/下载/审计数据。本节描述 CLI 的命令面与本地存储约定。
 
 ### 6.1 CLI 功能概览
 
 ```
-wittyhub - open agent skills ecosystem CLI
+skillhub-cli - open agent skills ecosystem CLI
 
 用法:
-  wittyhub <command> [options]
+  skillhub-cli <command> [options]
 
 命令:
   add <pkg>              从 git 仓库/URL/本地路径安装 Skills
@@ -427,7 +427,7 @@ wittyhub - open agent skills ecosystem CLI
 #### 6.2.1 add - 安装命令
 
 ```
-wittyhub add <source> [选项]
+skillhub-cli add <source> [选项]
 
 参数:
   <source>                 git 仓库地址 / GitHub 简写 / 本地路径
@@ -438,8 +438,8 @@ wittyhub add <source> [选项]
   -y, --yes                跳过交互确认
 
 示例:
-  wittyhub add vercel-labs/agent-skills
-  wittyhub add https://github.com/anthropics/skills --list
+  skillhub-cli add vercel-labs/agent-skills
+  skillhub-cli add https://github.com/anthropics/skills --list
 ```
 
 #### 6.2.2 其他命令
@@ -798,7 +798,7 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      - DATABASE_URL=postgresql://wittyhub:wittyhub@postgres:5432/wittyhub
+      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
 
   web:
     build: ./web
@@ -828,9 +828,9 @@ services:
 postgres:
   host: "localhost"
   port: 5432
-  user: "wittyhub"
+  user: ""
   password: ""
-  db: "wittyhub"
+  db: ""
 
 storage:
   local_path: /opt/wittyhub

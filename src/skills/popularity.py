@@ -258,7 +258,7 @@ class PopularityFetcher:
     def _github_headers(self) -> dict[str, str]:
         headers = {
             "Accept": "application/vnd.github+json",
-            "User-Agent": "wittyhub-popularity-collector",
+            "User-Agent": "skillhub-popularity-collector",
         }
         if self.github_token:
             headers["Authorization"] = f"Bearer {self.github_token}"
@@ -267,7 +267,7 @@ class PopularityFetcher:
     def _atomgit_headers(self) -> dict[str, str]:
         headers = {
             "Accept": "application/json",
-            "User-Agent": "wittyhub-popularity-collector",
+            "User-Agent": "skillhub-popularity-collector",
         }
         if self.atomgit_token:
             headers["PRIVATE-TOKEN"] = self.atomgit_token

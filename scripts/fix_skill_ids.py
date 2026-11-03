@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import re
 import sys
-sys.path.insert(0, '/home/ubuntu/wittyhub')
+sys.path.insert(0, '/home/ubuntu/skillhub')
 
 from sqlalchemy import text
 from core.database import SyncSessionLocal

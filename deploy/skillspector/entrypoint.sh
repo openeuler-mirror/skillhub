@@ -21,7 +21,7 @@ import sys
 try:
     import yaml
 except ImportError:
-    print("[wittyhub-entrypoint] ERROR: pyyaml is required to read config", file=sys.stderr)
+    print("[skillhub-entrypoint] ERROR: pyyaml is required to read config", file=sys.stderr)
     sys.exit(1)
 
 config_path = os.environ["SKILLSPECTOR_CONFIG"]
@@ -48,10 +48,10 @@ PY
 )"
 fi
 
-echo "[wittyhub-entrypoint] JENKINS_OPTS=${JENKINS_OPTS:-}"
-echo "[wittyhub-entrypoint] JENKINS_ADMIN_PASS set: $([ -n "${JENKINS_ADMIN_PASS:-}" ] && echo yes || echo no)"
-echo "[wittyhub-entrypoint] JENKINS_NUM_EXECUTORS=${JENKINS_NUM_EXECUTORS:-}"
-echo "[wittyhub-entrypoint] JENKINS_QUIET_PERIOD=${JENKINS_QUIET_PERIOD:-}"
-echo "[wittyhub-entrypoint] WITTYHUB_REPOSITORY_ROOT=${WITTYHUB_REPOSITORY_ROOT:-}"
+echo "[skillhub-entrypoint] JENKINS_OPTS=${JENKINS_OPTS:-}"
+echo "[skillhub-entrypoint] JENKINS_ADMIN_PASS set: $([ -n "${JENKINS_ADMIN_PASS:-}" ] && echo yes || echo no)"
+echo "[skillhub-entrypoint] JENKINS_NUM_EXECUTORS=${JENKINS_NUM_EXECUTORS:-}"
+echo "[skillhub-entrypoint] JENKINS_QUIET_PERIOD=${JENKINS_QUIET_PERIOD:-}"
+echo "[skillhub-entrypoint] WITTYHUB_REPOSITORY_ROOT=${WITTYHUB_REPOSITORY_ROOT:-}"
 
 exec /usr/local/bin/jenkins.sh "$@"

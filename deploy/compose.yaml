@@ -12,7 +12,7 @@ services:
     volumes:
       - postgres-data:/var/lib/postgresql/data
     networks:
-      - wittyhub-network
+      - skillhub-network
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
       interval: 10s
@@ -42,7 +42,7 @@ services:
       - ../config.yaml:/app/config.yaml:ro
       - huggingface-cache:/models-cache
     networks:
-      - wittyhub-network
+      - skillhub-network
     healthcheck:
       # 用标准库 urllib：embedding 镜像不含 httpx，healthcheck 需零第三方依赖
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8082/health', timeout=5)"]
@@ -82,7 +82,7 @@ services:
       - ../config.yaml:/app/config.yaml:ro
       - /opt/wittyhub:/opt/wittyhub
     networks:
-      - wittyhub-network
+      - skillhub-network
     depends_on:
       db:
         condition: service_healthy
@@ -109,7 +109,7 @@ services:
       - "8080:8080"
       - "443:8443"
     networks:
-      - wittyhub-network
+      - skillhub-network
     depends_on:
       api:
         condition: service_healthy
@@ -174,7 +174,7 @@ services:
       SKILLSPECTOR_LLM_TIMEOUT: ${SKILLSPECTOR_LLM_TIMEOUT:-90}
       # LLM 复核总时长预算（秒）。超时后剩余批次不再调用模型，其静态命中原样保留，
       # 报告偏保守，不会静默丢命中。0 = 不限。
-      # 必须小于上游等待预算：wittyhub security.skillspector_timeout(600s) 与
+      # 必须小于上游等待预算：skillhub security.skillspector_timeout(600s) 与
       # nginx proxy_read_timeout(300s)，留 60s 给静态分析 + 出报告，故取 540s。
       SKILLSPECTOR_LLM_BUDGET_SECONDS: ${SKILLSPECTOR_LLM_BUDGET_SECONDS:-540}
       # 必填：缺失时 compose 直接报错，避免无凭证时静默退化成纯静态扫描
@@ -184,7 +184,7 @@ services:
       - jenkins-data:/var/jenkins_home
       - /opt/wittyhub:/opt/wittyhub:ro
     networks:
-      - wittyhub-network
+      - skillhub-network
     healthcheck:
       test: ["CMD-SHELL", "curl --fail --silent http://localhost:8083/login >/dev/null"]
       interval: 30s
@@ -199,5 +199,5 @@ volumes:
   jenkins-data:
 
 networks:
-  wittyhub-network:
+  skillhub-network:
     driver: bridge

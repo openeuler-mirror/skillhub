@@ -45,7 +45,7 @@ RUN git init /tmp/skillspector && \
     git -C /tmp/skillspector fetch --depth 1 origin "${GIT_REF}" && \
     git -C /tmp/skillspector checkout -q FETCH_HEAD
 
-# wittyhub 侧的 patch（按序应用）：
+# skillhub 侧的 patch（按序应用）：
 #   0001 按节点开关大模型（A 方案 = 只有 meta_analyzer 调用，做静态误报剔除 + 富化）
 #   0002 硅基流动 Qwen3.5 适配：原生 json_schema 结构化输出、temperature=0、
 #        关闭 thinking、客户端 RPM/TPM 限流与统一重试

@@ -109,7 +109,7 @@ def configure_logging() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger = structlog.get_logger()
-    logger.info("wittyhub starting up")
+    logger.info("skillhub starting up")
 
     collector = None
     if settings.security.enable_audit:
@@ -177,14 +177,14 @@ async def lifespan(app: FastAPI):
     from src.ai.translation import close_translation_service
 
     await close_translation_service()
-    logger.info("wittyhub shutting down")
+    logger.info("skillhub shutting down")
 
 
 def create_app() -> FastAPI:
     configure_logging()
 
     app = FastAPI(
-        title="WittyHub API",
+        title="SkillHub API",
         description="Agent and Skill Discovery Platform",
         version="0.1.0",
         lifespan=lifespan,
