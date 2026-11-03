@@ -140,9 +140,11 @@ class AuditLLMReviewConfig(BaseSettings):
     enabled: bool = False
     start_time: str = "01:00"
     end_time: str = "08:00"
-    # OpenAI 兼容接口；默认硅基流动免费档 Qwen3.5-4B（与 skillspector 复核模型一致）
-    model: str = "Qwen/Qwen3.5-4B"
-    base_url: str = "https://api.siliconflow.cn/v1"
+    # OpenAI 兼容接口。model/base_url/api_key 留空时复用 model.providers
+    # 当前 provider（默认 siliconflow / Qwen3.5-4B），避免与主模型配置重复；
+    # 需要为复核单独指定模型时再用 AUDIT_LLM_REVIEW__* 覆盖。
+    model: str = ""
+    base_url: str = ""
     api_key: str = ""
     timeout: float = 90.0
     # 同一时刻最多并发的 LLM 请求数；硅基流动免费档实测可用并发约 3-4

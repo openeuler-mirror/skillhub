@@ -78,18 +78,19 @@ discover_scheduler:
 
 # 后台定时 LLM 复核：每天 01:00-08:00（本地时区，容器 TZ=Asia/Shanghai）
 # 在窗口内分批复核未复核过的 SkillSpector 风险项，剔除误报后回写
-# security_audits 与 skills/skill_versions。API Key 建议通过
-# AUDIT_LLM_REVIEW__API_KEY 环境变量注入；为空时回退复用
-# model.providers.siliconflow 的凭据，仍为空则任务自动跳过（仅告警）。
+# security_audits 与 skills/skill_versions。model/base_url/api_key 留空时
+# 复用 model.providers 当前 provider（默认 siliconflow / Qwen3.5-4B）；
+# 需要单独指定复核模型时再用 AUDIT_LLM_REVIEW__MODEL / __BASE_URL / __API_KEY
+# 覆盖。全部为空时任务自动跳过（仅告警）。
 # 环境变量覆盖示例：AUDIT_LLM_REVIEW__START_TIME=01:00、
 # AUDIT_LLM_REVIEW__CONCURRENCY=3、AUDIT_LLM_REVIEW__MAX_FINDINGS_PER_AUDIT=200
 audit_llm_review:
   enabled: true
   start_time: "01:00"
   end_time: "08:00"
-  model: "Qwen/Qwen3.5-4B"              # 硅基流动免费档，与 skillspector 复核模型一致
-  base_url: "https://api.siliconflow.cn/v1"
-  api_key: ""
+  model: ""                             # 留空复用 model.providers 的模型名
+  base_url: ""                          # 留空复用 model.providers 的 base_url
+  api_key: ""                           # 留空复用 model.providers 的 key
   timeout: 90
   concurrency: 3
   max_findings_per_call: 10
