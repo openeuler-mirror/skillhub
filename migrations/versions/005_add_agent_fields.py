@@ -5,14 +5,12 @@ Revises: 004_skill_repos
 Create Date: 2026-06-28 00:00:00
 
 """
-from typing import Sequence, Union
-
-from alembic import op
+from collections.abc import Sequence
 
 revision: str = "005_add_agent_fields"
-down_revision: Union[str, None] = "004_skill_repos"
-branch_labels: Union[str, Sequence[str], None] = None
-depends_on: Union[str, Sequence[str], None] = None
+down_revision: str | None = "004_skill_repos"
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
