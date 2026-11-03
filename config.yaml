@@ -76,6 +76,54 @@ discover_scheduler:
   weekday: "sun"      # 仅 weekly 生效：mon/tue/wed/thu/fri/sat/sun
   result_dir: ""      # 每轮结果 JSON 保存目录；留空则用 storage.local_path/logs
 
+# 后台定时 LLM 复核：每天 01:00-08:00（本地时区，容器 TZ=Asia/Shanghai）
+# 在窗口内分批复核未复核过的 SkillSpector 风险项，剔除误报后回写
+# security_audits 与 skills/skill_versions。model/base_url/api_key 留空时
+# 复用 model.providers 当前 provider（默认 siliconflow / Qwen3.5-4B）；
+# 需要单独指定复核模型时再用 AUDIT_LLM_REVIEW__MODEL / __BASE_URL / __API_KEY
+# 覆盖。全部为空时任务自动跳过（仅告警）。
+# 环境变量覆盖示例：AUDIT_LLM_REVIEW__START_TIME=01:00、
+# AUDIT_LLM_REVIEW__CONCURRENCY=3、AUDIT_LLM_REVIEW__MAX_FINDINGS_PER_AUDIT=200
+audit_llm_review:
+  enabled: true
+  start_time: "01:00"
+  end_time: "08:00"
+  model: ""                             # 留空复用 model.providers 的模型名
+  base_url: ""                          # 留空复用 model.providers 的 base_url
+  api_key: ""                           # 留空复用 model.providers 的 key
+  timeout: 90
+  concurrency: 3
+  max_findings_per_call: 10
+  max_findings_per_audit: 200           # 单轮 pass 上限；一轮扫完后立即开始下一轮，窗口内可连续推进；0=不限
+  # 复核上下文：本地 repo 缓存 -> 远端 raw -> 现有 snippet。
+  # window 模式对小文件送全文，大文件按命中位置取窗口行。
+  context_mode: "window"                # snippet | window | full
+  window_lines: 40
+  window_header_lines: 40
+  window_max_ranges: 24
+  window_gap: 3
+  full_file_max_bytes: 65536
+  max_file_bytes: 524288
+  max_context_chars: 60000
+  repo_cache_root: "/opt/wittyhub/skill-repositories"
+  git_timeout: 20
+  remote_fetch_enabled: true
+  remote_fetch_timeout: 15
+  remote_fetch_max_bytes: 524288
+  remote_fetch_max_files_per_audit: 40
+  github_token: ""
+  gitcode_token: ""
+  gitlab_token: ""
+  gitee_token: ""
+  context_cache_max_bytes: 67108864
+  max_output_tokens: 2048               # 判定仅返回 index/is_vulnerability/confidence/reason
+  min_confidence: 0.6                   # 确认为真但置信度低于该值的命中按上游口径丢弃；0=关闭
+  min_false_positive_confidence: 0.85   # 误报删除门槛：false 判定低于该值不删除；0=关闭
+  min_false_positive_confidence_high: 0.9  # HIGH/CRITICAL 命中使用更严格的删除门槛
+  max_attempts: 3                       # 失败重试轮次（跨天累计）
+  rpm: 1000
+  tpm: 80000
+
 logging:
   level: "INFO"
   format: "json"
