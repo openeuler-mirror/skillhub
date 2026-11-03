@@ -907,6 +907,13 @@ SC4 模块实时查询 [OSV.dev](https://osv.dev) 检查依赖包已知 CVE：
 | `skillspector_jenkins_user` | `SKILLSPECTOR_JENKINS_USER` | Basic Auth 用户名 |
 | `skillspector_jenkins_token` | `SKILLSPECTOR_JENKINS_TOKEN` | Basic Auth Token |
 | `skillspector_timeout` | `SECURITY__SKILLSPECTOR_TIMEOUT` | 同步扫描等待 Jenkins 构建结束的超时（秒），默认 600（10 分钟） |
+| `skillspector_llm_nodes` | `SKILLSPECTOR_LLM_NODES`（容器入口注入） | 调用大模型的节点白名单，默认 `meta_analyzer`（仅静态误报剔除 + 富化） |
+| `skillspector_model` / `skillspector_base_url` / `skillspector_api_key` | `SKILLSPECTOR_MODEL` / `OPENAI_BASE_URL` / `OPENAI_API_KEY` | 复核模型配置；留空时复用 `model.providers` 当前 provider |
+| `skillspector_text_only` / `skillspector_rule_scope` | `SKILLSPECTOR_TEXT_ONLY` / `SKILLSPECTOR_RULE_SCOPE` | 跳过二进制文件、按「规则 × 文件类别」裁剪命中 |
+| `skillspector_window_lines` / `skillspector_window_header_lines` | `SKILLSPECTOR_WINDOW_LINES` / `SKILLSPECTOR_WINDOW_HEADER_LINES` | 只送命中前后 N 行与文件头，控制上下文长度 |
+| `skillspector_rpm` / `skillspector_tpm` / `skillspector_max_output_tokens` | `SKILLSPECTOR_RPM` / `SKILLSPECTOR_TPM` / `SKILLSPECTOR_MAX_OUTPUT_TOKENS` | 客户端限流与单次输出预算 |
+| `skillspector_disable_thinking` / `skillspector_log_level` | `SKILLSPECTOR_DISABLE_THINKING` / `SKILLSPECTOR_LOG_LEVEL` | 关闭模型思考模式、设置容器日志级别 |
+| `skillspector_max_concurrency` / `skillspector_batch_timeout` / `skillspector_llm_timeout` / `skillspector_llm_budget_seconds` | `SKILLSPECTOR_MAX_CONCURRENCY` / `SKILLSPECTOR_BATCH_TIMEOUT` / `SKILLSPECTOR_LLM_TIMEOUT` / `SKILLSPECTOR_LLM_BUDGET_SECONDS` | 并发数、批次/单次请求超时与 LLM 复核总时长预算 |
 | `audit_llm_review.*` | `AUDIT_LLM_REVIEW__*` | 后台定时 LLM 复核（见 3.3）：开关、时间窗口、模型、并发、单条审计复核上限、限流等 |
 
 ---

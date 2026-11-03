@@ -107,6 +107,25 @@ class SecurityConfig(BaseSettings):
     skillspector_jenkins_num_executors: int = 10
     skillspector_jenkins_quiet_period: int = 5
     skillspector_repository_root: str = "/opt/wittyhub/skill-repositories"
+    # 大模型复核参数（skillspector 容器入口读取后注入为
+    # SKILLSPECTOR_* / OPENAI_* 环境变量；后端仅解析 config.yaml，不消费这些字段）
+    skillspector_llm_nodes: str = "meta_analyzer"
+    skillspector_model: str = ""
+    skillspector_base_url: str = ""
+    skillspector_api_key: str = ""
+    skillspector_text_only: bool = True
+    skillspector_rule_scope: bool = True
+    skillspector_window_lines: int = 20
+    skillspector_window_header_lines: int = 40
+    skillspector_rpm: int = 1000
+    skillspector_tpm: int = 80000
+    skillspector_max_output_tokens: int = 4096
+    skillspector_disable_thinking: bool = True
+    skillspector_log_level: str = "INFO"
+    skillspector_max_concurrency: int = 4
+    skillspector_batch_timeout: int = 300
+    skillspector_llm_timeout: int = 90
+    skillspector_llm_budget_seconds: int = 540
 
 
 class AppConfig(BaseSettings):

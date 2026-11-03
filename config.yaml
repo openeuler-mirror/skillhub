@@ -46,6 +46,33 @@ security:
   skillspector_jenkins_num_executors: 10
   skillspector_jenkins_quiet_period: 1
   skillspector_repository_root: "/opt/wittyhub/skill-repositories"
+  # SkillSpector 大模型复核参数：生产部署不读 deploy/compose.yaml 的环境变量，
+  # 统一由本文件提供给 skillspector 容器（容器入口启动时读取，注入为
+  # SKILLSPECTOR_* / OPENAI_* 环境变量）。
+  # model/base_url/api_key 留空时复用 model.providers 当前 provider
+  #（默认 siliconflow / Qwen3.5-4B），需要为扫描单独指定时再覆盖。
+  skillspector_llm_nodes: "meta_analyzer"   # 仅 meta 复核节点调用大模型，语义发现节点不调用
+  skillspector_model: ""
+  skillspector_base_url: ""
+  skillspector_api_key: ""
+  # 成本/上下文控制：跳过二进制、按规则×文件类别裁剪、只送命中窗口行
+  skillspector_text_only: true
+  skillspector_rule_scope: true
+  skillspector_window_lines: 20
+  skillspector_window_header_lines: 40
+  # 客户端限流，与 Qwen3.5-4B 免费档配额对齐（0 = 不限流）
+  skillspector_rpm: 1000
+  skillspector_tpm: 80000
+  # 输出预算与思考模式：4096 足够单批判定，也能为 TPM 预留留出并发空间
+  skillspector_max_output_tokens: 4096
+  skillspector_disable_thinking: true
+  skillspector_log_level: "INFO"
+  # 并发与超时：免费档实测可用并发约 4；BATCH_TIMEOUT 需覆盖 LLM 重试总时长；
+  # BUDGET_SECONDS 必须小于 security.skillspector_timeout 与 nginx 读超时
+  skillspector_max_concurrency: 4
+  skillspector_batch_timeout: 300
+  skillspector_llm_timeout: 90
+  skillspector_llm_budget_seconds: 540
 
 postgres:
   host: "localhost"
