@@ -83,7 +83,7 @@ class ModelConfig(BaseSettings):
 
 class CrawlerConfig(BaseSettings):
     github_token: str = ""
-    gitcode_token: str = ""
+    atomgit_token: str = ""
     github_username: str = "git"
     max_tags_per_repo: int = 5
 

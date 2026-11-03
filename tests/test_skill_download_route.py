@@ -59,7 +59,7 @@ async def test_download_skill_returns_file_and_commits_statistics(tmp_path):
         patch("src.api.routes.skills.DownloadManager", return_value=manager),
     ):
         response = await download_skill(
-            skill_id="gitcode/openeuler/repo/skills/clean-code",
+            skill_id="atomgit/openeuler/repo/skills/clean-code",
             request=_request(),
             db=db,
         )
@@ -100,7 +100,7 @@ async def test_download_skill_maps_archive_errors(archive_error, expected_status
         pytest.raises(HTTPException) as error,
     ):
         await download_skill(
-            skill_id="gitcode/openeuler/repo/skills/clean-code",
+            skill_id="atomgit/openeuler/repo/skills/clean-code",
             request=_request(),
             db=db,
         )

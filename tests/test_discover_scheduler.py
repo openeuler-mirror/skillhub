@@ -94,7 +94,7 @@ class TestConfigIntegration:
 
 
 def _fake_result(**flags):
-    return SimpleNamespace(skill_num=2, url="https://gitcode.com/a/b", **flags)
+    return SimpleNamespace(skill_num=2, url="https://atomgit.com/a/b", **flags)
 
 
 @pytest.fixture(autouse=True)
@@ -115,9 +115,9 @@ class TestRunDiscoverOnce:
     def requests(self):
         return (
             [
-                SimpleNamespace(url="https://gitcode.com/a/b"),
-                SimpleNamespace(url="https://gitcode.com/c/d"),
-                SimpleNamespace(url="https://gitcode.com/e/f"),
+                SimpleNamespace(url="https://atomgit.com/a/b"),
+                SimpleNamespace(url="https://atomgit.com/c/d"),
+                SimpleNamespace(url="https://atomgit.com/e/f"),
             ],
             ["community"],
         )
@@ -263,7 +263,7 @@ class TestRunDiscoverOnce:
 
         by_url = {repo["url"]: repo for repo in document["repos"]}
         assert len(by_url) == 3
-        created = by_url["https://gitcode.com/a/b"]
+        created = by_url["https://atomgit.com/a/b"]
         assert created["outcome"] == "created"
         assert created["skill_num"] == 2
         assert "duration_seconds" in created

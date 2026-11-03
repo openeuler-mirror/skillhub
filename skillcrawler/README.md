@@ -113,7 +113,7 @@ openEuler-skills/{community,enterprise,personal}/*/skill.yaml
 # community/Infrastructure/skill.yaml
 name: Infrastructure
 skill_repos:
-  - url: https://gitcode.com/openeuler/IB_Robot
+  - url: https://atomgit.com/openeuler/IB_Robot
 skills:                                          # 可选：单 Skill URL 贡献
   - skill_name: skill-name
     skill_url: https://github.com/example/skills/blob/main/skills/skill-name/SKILL.md
@@ -163,7 +163,7 @@ storage:
 示例：
 
 ```text
-/opt/wittyhub/skill-repositories/gitcode.com_openeuler_wittyhub-cli
+/opt/wittyhub/skill-repositories/atomgit.com_openeuler_wittyhub-cli
 ```
 
 `repo_name` 的生成方式：

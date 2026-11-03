@@ -26,6 +26,7 @@ from src.skills.skill_parser import (
     normalize_git_clone_url,
 )
 from src.skills.skill_scanner import SkillScanner
+from src.skills.skill_id import build_skill_id, extract_owner_repo
 from src.core.config import get_settings
 from src.models.orm import Skill, SkillVersion
 from src.models.repository import (
@@ -42,6 +43,10 @@ if TYPE_CHECKING:
 _logger = logging.getLogger(__name__)
 settings = get_settings()
 
+# catalog 仓库的三个渠道（按 skill_repos.platform 判定）；用于「同步删除」时
+# 识别哪些仓库属于 openEuler-skills catalog 登记、可从删除同步中清理。
+CATALOG_PLATFORMS = ("community", "enterprise", "personal")
+
 
 class SkillRepositoryRequest(BaseModel):
     branch: str | None = None
@@ -51,6 +56,10 @@ class SkillRepositoryRequest(BaseModel):
     # URL 方式贡献的单 Skill 收窄扫描（skills[].skill_url）：非空时只收录
     # 这些 SKILL.md 相对路径；None 表示整仓扫描
     skill_paths: list[str] | None = None
+    # 原文件方式贡献（local_skills）：相对路径 → author / platform 两个平行映射，
+    # 用于同一仓库（openEuler-skills catalog）内多个作者各自的 Skill 归属覆盖。
+    skill_authors: dict[str, str] | None = None
+    skill_platforms: dict[str, str] | None = None
 
 
 class SkillDiscoverStatus:
@@ -253,6 +262,8 @@ class SkillManager:
                 skill_paths=skill_paths,
                 skill_path_filter=skill_path_filter,
                 author=normalized.sig_name,
+                skill_authors=normalized.skill_authors,
+                skill_platforms=normalized.skill_platforms,
             )
         except Exception as exc:
             error_summary = self._git_ops.summarize_exception(exc)
@@ -285,6 +296,8 @@ class SkillManager:
         skill_paths: list[str] | None = None,
         skill_path_filter: set[str] | None = None,
         author: str | None = None,
+        skill_authors: dict[str, str] | None = None,
+        skill_platforms: dict[str, str] | None = None,
     ) -> SkillRepoModel:
         author = author or self._resolve_skill_author(repo.platform, repo_name)
         latest_skills, tagged_skills, repository_commit_id = await self._discover_skills(
@@ -293,6 +306,8 @@ class SkillManager:
             author=author,
             skill_paths=skill_paths,
             skill_path_filter=skill_path_filter,
+            skill_authors=skill_authors,
+            skill_platforms=skill_platforms,
         )
         # enterprise/personal 仓库 author 未显式传入（community 走 sig_name）时，
         # 用扫描结果里 URL 推导的 author 兜底，保证 skill_repos.author 与
@@ -378,6 +393,105 @@ class SkillManager:
         except Exception as exc:
             _logger.warning('[Discover] Failed to reconcile skill statistics after scan: %s', exc)
 
+    async def delete_removed_catalog_repos(
+        self, requests: list[SkillRepositoryRequest]
+    ) -> int:
+        """同步删除 catalog 中已消失的仓库及其级联数据，返回删除的仓库数。
+
+        按 (platform, author, repo_name) 求交集：数据库中在 catalog 期望集合
+        外的组合即已删除。author 口径与扫描写入 skill_repos.author 一致。
+
+        skill / skill_versions 走外键 CASCADE；security_audits / download_history
+        软关联由 ``delete_skill_repositories`` 清理；删除后重算 contributors
+        .skill_count 并清理名下已无 skill 的孤儿作者。
+        """
+        expected_keys: set[tuple[str, str | None, str]] = set()
+        for request in requests:
+            if request.platform not in CATALOG_PLATFORMS:
+                continue
+            normalized = self._normalize_repository_request(request)
+            expected_keys.add(
+                (
+                    normalized.platform,
+                    self._derive_catalog_author(normalized),
+                    self._derive_repo_name(normalized),
+                )
+            )
+
+        repos = await self.skill_repo_repository.list_skill_repositories()
+        removed = [
+            repo for repo in repos
+            if repo.platform in CATALOG_PLATFORMS
+            and (repo.platform, repo.author, repo.repo_name) not in expected_keys
+        ]
+        if not removed:
+            return 0
+
+        removed_ids = [repo.id for repo in removed]
+        _logger.info(
+            '[Discover] syncing catalog removals: deleting %d repo(s) %s',
+            len(removed_ids),
+            [repo.repo_name for repo in removed],
+        )
+        await self.skill_repo_repository.delete_skill_repositories(removed_ids)
+
+        # 删除后自愈统计值并清理孤儿作者；内部容错，失败仅告警不影响删除结果
+        await self._reconcile_skill_statistics()
+        deleted_contributors = 0
+        if self.contributor_repository is not None:
+            deleted_contributors = (
+                await self.contributor_repository.delete_contributors_without_skills()
+            )
+        _logger.info(
+            '[Discover] catalog removal sync done: repos_deleted=%d, '
+            'empty_contributors_deleted=%d',
+            len(removed_ids),
+            deleted_contributors,
+        )
+        return len(removed_ids)
+
+    async def delete_removed_catalog_skills(
+        self, requests: list[SkillRepositoryRequest]
+    ) -> int:
+        """同步删除 catalog 中已撤销登记的单 Skill（URL / local_skills 条目移除）。
+
+        对每条「部分扫描」请求（``skill_paths`` 非空：``skills[].skill_url``
+        单 Skill 与 ``local_skills`` 原文件方式），按同一口径推导该仓库期望
+        存在的 skill_id 集合，删除仓库下不属于集合的 skill（含 version 与
+        security_audits / download_history 软关联）。整仓移除由
+        ``delete_removed_catalog_repos`` 负责；整仓请求（skill_paths=None）
+        在这里跳过——它是全量扫描，store 的 diff 已覆盖。
+        返回删除的 skill 行数。
+        """
+        deleted = 0
+        for request in requests:
+            if not request.skill_paths:
+                continue
+            normalized = self._normalize_repository_request(request)
+            repo_name = self._derive_repo_name(normalized)
+            repository = await self.skill_repo_repository.get_skill_repository_by_repo_name(repo_name)
+            if repository is None:
+                continue
+            source, _ = derive_skill_source(normalized.url)
+            owner_repo = extract_owner_repo(normalized.url)
+            expected_skill_ids = {
+                build_skill_id(source, owner_repo, path)
+                for path in normalized.skill_paths
+            }
+            removed = await self.skill_repository.delete_skills_not_in_skill_ids(
+                repository.id, expected_skill_ids
+            )
+            if removed:
+                deleted += removed
+                _logger.info(
+                    '[Discover] removed %d revoked skill(s) from %s',
+                    removed,
+                    repo_name,
+                )
+        if deleted:
+            await self._reconcile_skill_statistics()
+        return deleted
+
     def _contributor_profile(self, platform: str | None, author: str) -> dict[str, Any]:
         """Lookup catalog profile fields (name/description/git_profile) for a contributor.
 
@@ -415,6 +529,8 @@ class SkillManager:
         author: str | None,
         skill_paths: list[str] | None = None,
         skill_path_filter: set[str] | None = None,
+        skill_authors: dict[str, str] | None = None,
+        skill_platforms: dict[str, str] | None = None,
     ) -> tuple[list[Skill], list[SkillVersion], str | None]:
         clone_url = normalize_clone_url_for_git(repo.url)
         repository_git_metadata = await asyncio.to_thread(
@@ -448,6 +564,8 @@ class SkillManager:
             author=author,
             skill_paths=skill_paths,
             skill_path_filter=skill_path_filter,
+            skill_authors=skill_authors,
+            skill_platforms=skill_platforms,
         )
         return latest_skills, tagged_skills, repository_commit_id
 
@@ -566,6 +684,10 @@ class SkillManager:
         若后续在锚点目录中登记（如 ``platform='community'``），则下一次采集时
         必须迁移其 ``platform``/``source`` 字段，即使 git 提交未变化也是如此。
         否则技能列表会一直显示旧来源，直到仓库内容发生变化。
+
+        author 与 catalog 的差异不在此处原地迁移，统一交由同步删除阶段
+        （``delete_removed_catalog_repos``）处理：数据库有、catalog 无的
+        (platform, author, repo) 组合会被删除，之后重新扫描写入正确归属。
         """
         target_source: str | None = None
         try:
@@ -675,12 +797,26 @@ class SkillManager:
             if request.skill_paths
             else None
         )
+        skill_authors = (
+            {path.strip(): str(val).strip() for path, val in request.skill_authors.items()
+             if path.strip() and str(val).strip()}
+            if request.skill_authors
+            else None
+        )
+        skill_platforms = (
+            {path.strip(): str(val).strip() for path, val in request.skill_platforms.items()
+             if path.strip() and str(val).strip()}
+            if request.skill_platforms
+            else None
+        )
         return SkillRepositoryRequest(
             branch=branch,
             url=url,
             platform=platform,
             sig_name=sig_name,
             skill_paths=skill_paths or None,
+            skill_authors=skill_authors or None,
+            skill_platforms=skill_platforms or None,
         )
 
     @staticmethod
@@ -692,6 +828,21 @@ class SkillManager:
         name = name.removesuffix('.git')
         name = name.replace('/', '_')
         return name
+
+    @staticmethod
+    def _derive_catalog_author(request: SkillRepositoryRequest) -> str | None:
+        """catalog 仓库的期望 author 口径，与扫描写入 skill_repos.author 一致。
+
+        community 归属 SIG 目录名（sig_name）；enterprise/personal 取仓库 URL
+        的 owner 段（扫描时 skill.author 的 URL 兜底口径 derive_skill_source）。
+        """
+        if request.platform == 'community':
+            return request.sig_name
+        try:
+            _, owner = derive_skill_source(request.url)
+            return owner
+        except ValueError:
+            return None
 
     def _get_openeuler_sig_name(self, repo_name: str) -> str | None:
         if self._openeuler_sig_by_repo_name is None:

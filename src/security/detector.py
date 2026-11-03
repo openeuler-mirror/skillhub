@@ -47,7 +47,6 @@ ALLOWED_GIT_HOSTS = frozenset({
     "bitbucket.org",
     "gitea.io",
     "gitee.com",
-    "gitcode.com",
     "atomgit.com",
     "codeberg.org",
     "git.sr.ht",
@@ -659,6 +658,8 @@ class SkillspectorCollector:
         processed = 0
         async with self._session_factory() as session:
             pending = await self._fetch_pending(session)
+            if not pending:
+                return 0
             _log_collector_event(
                 "batch_started",
                 pending_count=len(pending),

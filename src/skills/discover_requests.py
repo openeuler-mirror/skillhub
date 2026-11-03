@@ -13,9 +13,11 @@ from typing import Any
 
 from src.skills.config import (
     load_catalog_skill_url_entries,
+    load_catalog_local_skill_entries,
     load_crawler_config,
     load_single_catalog_entry,
     sync_openEuler_skills_repo,
+    OPENEULER_SKILLS_URL,
 )
 from src.skills.skill_manager import SkillRepositoryRequest
 from src.skills.skill_parser import normalize_git_clone_url, parse_skill_md_url
@@ -133,7 +135,7 @@ def _build_requests_from_skill_urls(
     ]
 
 
-def _build_requests_from_skill_yaml(skill_yaml: str) -> list[SkillRepositoryRequest]:
+def build_requests_from_skill_yaml(skill_yaml: str) -> list[SkillRepositoryRequest]:
     """从单个 skill.yaml 构建 discover 请求（``--url`` 单文件模式）。
 
     与全量构建同口径：``skill_repos`` 整仓条目 + ``skills[].skill_url`` 单
@@ -172,6 +174,44 @@ def _build_requests_from_skill_yaml(skill_yaml: str) -> list[SkillRepositoryRequ
     return requests
 
 
+def _build_local_skills_request(
+    entries: list[dict[str, Any]],
+) -> SkillRepositoryRequest | None:
+    """把 catalog 的原文件方式贡献（local_skills）合并为一条 catalog 自扫描请求。
+
+    openEuler-skills 仓库自身的 ``skills/<name>/SKILL.md`` 原文件统一归入
+    同一个仓库（openEuler-skills），因此只构建一条请求；不同作者的归属通过
+    ``skill_authors`` / ``skill_platforms``（相对路径 → author / platform）逐
+    skill 覆盖。扫描全部三个渠道（community/enterprise/personal），不受
+    PLATFORM_CHOICES 影响（local_skills 是 catalog 级机制，与其测试开关无关）。
+    """
+    if not entries:
+        return None
+    skill_paths: set[str] = set()
+    skill_authors: dict[str, str] = {}
+    skill_platforms: dict[str, str] = {}
+    for item in entries:
+        skill_path = str(item.get("skill_path") or "").strip()
+        if not skill_path:
+            continue
+        skill_paths.add(skill_path)
+        author = str(item.get("author") or "").strip()
+        platform = str(item.get("platform") or "").strip()
+        if author:
+            skill_authors[skill_path] = author
+        if platform:
+            skill_platforms[skill_path] = platform
+    if not skill_paths:
+        return None
+    return SkillRepositoryRequest(
+        url=OPENEULER_SKILLS_URL,
+        platform=None,
+        skill_paths=sorted(skill_paths),
+        skill_authors=skill_authors,
+        skill_platforms=skill_platforms,
+    )
+
+
 def build_configured_discover_requests(
     platform: str | None = None,
     repository_path: Path | None = None,
@@ -185,8 +225,6 @@ def build_configured_discover_requests(
     # The default source is the openEuler-skills catalog repository.
     if repository_path is not None:
         repository_path = repository_path.expanduser()
-        if not repository_path.exists():
-            raise ValueError(f"openEuler-skills repository path does not exist: {repository_path}")
         if not repository_path.is_dir():
             raise ValueError(f"openEuler-skills repository path is not a directory: {repository_path}")
     else:
@@ -218,5 +256,13 @@ def build_configured_discover_requests(
             seen_urls,
         )
     )
+
+    # 原文件方式贡献（local_skills）：单独扫描 openEuler-skills 仓库自身的
+    # skills/<name>/SKILL.md，按 skill_authors / skill_platforms 标记归属
+    local_request = _build_local_skills_request(
+        load_catalog_local_skill_entries(repository_path)
+    )
+    if local_request is not None:
+        requests.append(local_request)
 
     return requests, platform_keys

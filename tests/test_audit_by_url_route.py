@@ -22,7 +22,7 @@ def _service(result: dict | None = None, report_md: str | None = None) -> MagicM
 async def test_audit_by_url_repo_mode_derives_target():
     service = _service(
         result={
-            "git_url": "https://gitcode.com/openeuler/foo",
+            "git_url": "https://atomgit.com/openeuler/foo",
             "ref": "main",
             "skill_path": "",
             "risk_level": "low",
@@ -34,15 +34,15 @@ async def test_audit_by_url_repo_mode_derives_target():
     db = AsyncMock()
     with patch("src.api.routes.skills.SecurityService", return_value=service):
         response = await audit_by_url(
-            payload=AuditByUrlRequest(repo_url="https://gitcode.com/openeuler/foo"),
+            payload=AuditByUrlRequest(repo_url="https://atomgit.com/openeuler/foo"),
             db=db,
         )
     assert response.risk_level == "low"
     assert response.risk_score == 10
-    assert response.git_url == "https://gitcode.com/openeuler/foo"
+    assert response.git_url == "https://atomgit.com/openeuler/foo"
     assert response.skill_path == ""
     service.audit_external.assert_awaited_once_with(
-        git_url="https://gitcode.com/openeuler/foo",
+        git_url="https://atomgit.com/openeuler/foo",
         ref="main",
         skill_path="",
         scanners=None,
@@ -54,7 +54,7 @@ async def test_audit_by_url_repo_mode_derives_target():
 async def test_audit_by_url_skill_mode_derives_blob_target():
     service = _service(
         result={
-            "git_url": "https://gitcode.com/openeuler/foo",
+            "git_url": "https://atomgit.com/openeuler/foo",
             "ref": "main",
             "skill_path": "skills/bar",
             "risk_level": "high",
@@ -67,11 +67,11 @@ async def test_audit_by_url_skill_mode_derives_blob_target():
     with patch("src.api.routes.skills.SecurityService", return_value=service):
         response = await audit_by_url(
             payload=AuditByUrlRequest(
-                skill_url="https://gitcode.com/openeuler/foo/blob/main/skills/bar/SKILL.md"
+                skill_url="https://atomgit.com/openeuler/foo/blob/main/skills/bar/SKILL.md"
             ),
             db=db,
         )
-    assert response.git_url == "https://gitcode.com/openeuler/foo"
+    assert response.git_url == "https://atomgit.com/openeuler/foo"
     assert response.ref == "main"
     assert response.skill_path == "skills/bar"
     assert response.risk_level == "high"
@@ -109,7 +109,7 @@ async def test_audit_by_url_rejects_when_disabled():
     with patch("src.api.routes.skills.SecurityService", return_value=service):
         with pytest.raises(HTTPException) as exc_info:
             await audit_by_url(
-                payload=AuditByUrlRequest(repo_url="https://gitcode.com/openeuler/foo"),
+                payload=AuditByUrlRequest(repo_url="https://atomgit.com/openeuler/foo"),
                 db=db,
             )
     assert exc_info.value.status_code == 503

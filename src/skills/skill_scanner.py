@@ -105,6 +105,8 @@ class SkillScanner:
         author: str | None = None,
         skill_paths: list[str] | None = None,
         skill_path_filter: set[str] | None = None,
+        skill_authors: dict[str, str] | None = None,
+        skill_platforms: dict[str, str] | None = None,
     ) -> tuple[list[Skill], list[SkillVersion]]:
         self._security_cache_hits = 0
         self._security_audit_submitted = 0
@@ -150,6 +152,8 @@ class SkillScanner:
             existing_versions=existing_versions,
             category_cache=category_cache,
             security_cache=security_cache,
+            skill_authors=skill_authors,
+            skill_platforms=skill_platforms,
         )
 
         tagged_skills: list[SkillVersion] = []
@@ -166,6 +170,8 @@ class SkillScanner:
                 category_cache=category_cache,
                 security_cache=security_cache,
                 skill_path_filter=skill_path_filter,
+                skill_authors=skill_authors,
+                skill_platforms=skill_platforms,
                 # HEAD 声明了 frontmatter version 的 skill 自管版本，
                 # 完全跳过 tag 扫描（不再以 tag 作为版本来源）。
                 skip_skill_ids={row.skill_id for row in metadata_version_rows},
@@ -185,6 +191,8 @@ class SkillScanner:
         existing_versions: dict[tuple[str, str | None], SkillVersion],
         category_cache: dict[str, str | None],
         security_cache: dict[str, SecurityResolution] | None = None,
+        skill_authors: dict[str, str] | None = None,
+        skill_platforms: dict[str, str] | None = None,
     ) -> tuple[list[Skill], list[SkillVersion]]:
         discovered: list[Skill] = []
         metadata_version_rows: list[SkillVersion] = []
@@ -232,6 +240,8 @@ class SkillScanner:
                 continue
             input_elapsed = time.perf_counter() - scan_started_at
             tree_hash = tree_hashes.get(relative_path)
+            skill_author = (skill_authors or {}).get(relative_path)
+            skill_platform = (skill_platforms or {}).get(relative_path)
             skill = await self._build_skill_record(
                 repo=repo,
                 repo_root=repo_root,
@@ -250,6 +260,8 @@ class SkillScanner:
                 input_elapsed=input_elapsed,
                 existing_record=existing_skills.get(skill_id),
                 security_cache=security_cache,
+                skill_author=skill_author,
+                skill_platform=skill_platform,
             )
             _logger.info(
                 '[Discover] Discovered skill(latest version:%s): skill_id=%s',
@@ -282,6 +294,8 @@ class SkillScanner:
                         (skill_id, declared_version),
                     ),
                     security_cache=security_cache,
+                    skill_author=skill_author,
+                    skill_platform=skill_platform,
                 )
                 _logger.info(
                     '[Discover] Discovered skill(metadata version:%s): skill_id=%s',
@@ -303,6 +317,8 @@ class SkillScanner:
         security_cache: dict[str, SecurityResolution] | None = None,
         skill_path_filter: set[str] | None = None,
         skip_skill_ids: set[str] | None = None,
+        skill_authors: dict[str, str] | None = None,
+        skill_platforms: dict[str, str] | None = None,
     ) -> list[SkillVersion]:
         discovered: list[SkillVersion] = []
         seen_versions: set[tuple[str, str]] = set()
@@ -368,6 +384,8 @@ class SkillScanner:
                     continue
                 input_elapsed = time.perf_counter() - scan_started_at
                 tree_hash = tree_hashes.get(relative_path)
+                skill_author = (skill_authors or {}).get(relative_path)
+                skill_platform = (skill_platforms or {}).get(relative_path)
                 skill_id = build_skill_id(
                     repo.source, extract_owner_repo(repo.url), relative_path,
                 )
@@ -433,6 +451,8 @@ class SkillScanner:
                     return_skill_model=False,
                     existing_record=existing_versions.get((skill_id, effective_version)),
                     security_cache=security_cache,
+                    skill_author=skill_author,
+                    skill_platform=skill_platform,
                 )
                 version_key = (skill.skill_id, skill.version) if skill.version else None
                 if version_key is not None and version_key in seen_versions:
@@ -479,6 +499,8 @@ class SkillScanner:
         return_skill_model: bool = True,
         existing_record: Skill | SkillVersion | None = None,
         security_cache: dict[str, SecurityResolution] | None = None,
+        skill_author: str | None = None,
+        skill_platform: str | None = None,
     ) -> Skill | SkillVersion:
         prepare_started_at = time.perf_counter()
         skill_file = repo_root / relative_path
@@ -497,7 +519,7 @@ class SkillScanner:
 
         context_started_at = time.perf_counter()
         host, source_author = derive_skill_source(repo.url)
-        author = author or source_author
+        author = skill_author or author or source_author
         prepare_elapsed += time.perf_counter() - context_started_at
 
         category_started_at = time.perf_counter()
@@ -541,7 +563,9 @@ class SkillScanner:
             'repo_url': repo.url,
             'category': category,
             'tags': extract_declared_tags(metadata),
-            'platform': as_optional_str(getattr(repo, 'platform', None)) or as_optional_str(metadata.get('platform')),
+            'platform': skill_platform
+            or as_optional_str(getattr(repo, 'platform', None))
+            or as_optional_str(metadata.get('platform')),
             'extra_metadata': merged_metadata,
             'content': content or None,
             'risk_score': security.risk_score,

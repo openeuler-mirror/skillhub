@@ -186,16 +186,8 @@ class DiscoverScheduler:
             build_configured_discover_requests,
             repository_path=repository_path,
         )
-        total = len(requests)
         run_started = time.monotonic()
         run_started_wall = datetime.now()
-        logger.info(
-            "%s round started: %d repos from %s (catalog: %s)",
-            LOG_PREFIX,
-            total,
-            ", ".join(config_keys),
-            repository_path,
-        )
 
         counters = {
             "created": 0,
@@ -214,6 +206,31 @@ class DiscoverScheduler:
                 skill_repo_repository=SkillRepoRepository(session),
                 contributor_repository=ContributorRepository(session),
                 catalog_path=repository_path,
+            )
+            # 先同步删除 catalog 中已消失的仓库，再开始扫描新增/更新。
+            # 失败仅记录日志，不阻断本轮扫描（清理属于自愈，非主流程）。
+            try:
+                removed_repos = await manager.delete_removed_catalog_repos(requests)
+                removed_skills = await manager.delete_removed_catalog_skills(requests)
+                if removed_repos or removed_skills:
+                    logger.info(
+                        "%s synced catalog removals before scan: %d repo(s), %d skill(s) deleted",
+                        LOG_PREFIX,
+                        removed_repos,
+                        removed_skills,
+                    )
+                else:
+                    logger.info("%s no catalog repo/skill removed before scan", LOG_PREFIX)
+            except Exception:
+                logger.exception("%s catalog removal sync failed", LOG_PREFIX)
+
+            total = len(requests)
+            logger.info(
+                "%s round started: %d repos from %s (catalog: %s)",
+                LOG_PREFIX,
+                total,
+                ", ".join(config_keys),
+                repository_path,
             )
             for index, request in enumerate(requests, start=1):
                 label = request.url or "<missing-url>"
@@ -272,10 +289,10 @@ class DiscoverScheduler:
             )
 
         # 补跑衍生字段缺口（security 风险分 / category 分类 / embedding 向量）：
-        # 本轮新入库或中断留下的缺口行在此补齐，使其立即可用；各任务自持
-        # pg_advisory_lock 互斥（embedding 的锁另与全量重建脚本互斥），单任务
-        # 失败/跳过只记录在该任务的统计里。失败不重试，漏掉的行由下轮 discover
-        # 或 API 启动后的低频补齐循环自愈。
+        # 本轮新入库或中断留下的缺口行在此补齐，使其立即可用；
+        # 各任务自持pg_advisory_lock 互斥（embedding 的锁另与全量重建脚本互斥），单任务
+        # 失败/跳过只记录在该任务的统计里。
+        # 失败不重试，漏掉的行由下轮 discover 或 API 启动时的补齐自愈。
         remediation_run: dict[str, Any] | None = None
         try:
             from src.jobs.remediation import run_remediations

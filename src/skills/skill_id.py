@@ -16,7 +16,7 @@ def build_skill_id(
     """Build a public skill_id.
 
     Args:
-        source: e.g. ``"github"``, ``"gitcode"``.
+        source: e.g. ``"github"``, ``"atomgit"``.
         owner_repo: e.g. ``"owner/repo"`` (from ``extract_owner_repo``).
         relative_skill_path: repo-relative SKILL.md path, e.g.
             ``"skills/foo/SKILL.md"`` or ``"SKILL.md"`` (root-level).

@@ -10,7 +10,7 @@
 
 ## 上架方式：提交 PR 登记 Skill
 
-SkillHub 贡献仓库是 **`https://gitcode.com/openeuler/openEuler-skills`**（镜像于 atomgit 的 `openEuler/openEuler-skills`）。它按照贡献来源分为三个目录，你在其中新建对应的一种 `skill.yaml` 即可：
+SkillHub 贡献仓库是 **`https://atomgit.com/openeuler/openEuler-skills`**（镜像于 atomgit 的 `openEuler/openEuler-skills`）。它按照贡献来源分为三个目录，你在其中新建对应的一种 `skill.yaml` 即可：
 
 ```
 openEuler-skills/
@@ -30,7 +30,7 @@ openEuler-skills/
    author:
      name: 你的用户名
    skill_repos:
-   - url: https://gitcode.com/你的用户名/你的仓库名
+   - url: https://atomgit.com/你的用户名/你的仓库名
    skills: []
    ```
 

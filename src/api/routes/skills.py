@@ -490,7 +490,7 @@ async def audit_by_url_report(
 
 @router.get("/contributors/{source}/{author}", response_model=ContributorSkillsResponse)
 async def get_contributor_skills(
-    source: Annotated[str, Path(max_length=50, description="平台来源：github / gitcode")],
+    source: Annotated[str, Path(max_length=50, description="平台来源：github / atomgit")],
     author: Annotated[str, Path(max_length=255, description="contributor 名称（skills.author 精确匹配）")],
     skip: Annotated[int, Query(ge=0)] = 0,
     limit: Annotated[int, Query(ge=1, le=100)] = 20,

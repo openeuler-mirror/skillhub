@@ -7,7 +7,7 @@ popularity metrics (stars, forks, watchers). Results are stored on the
 
 Supported platforms:
 - GitHub  : https://api.github.com/repos/{owner}/{repo}
-- GitCode : https://api.gitcode.com/api/v5/repos/{owner}/{repo}
+- AtomGit : https://api.atomgit.com/api/v5/repos/{owner}/{repo}
 """
 
 from __future__ import annotations
@@ -31,10 +31,10 @@ _logger = logging.getLogger(__name__)
 settings = get_settings()
 
 GITHUB_API_BASE = "https://api.github.com"
-GITCODE_API_BASE = "https://api.gitcode.com/api/v5"
+ATOMGIT_API_BASE = "https://api.atomgit.com/api/v5"
 
 GITHUB_TIMEOUT_SECONDS = 20.0
-GITCODE_TIMEOUT_SECONDS = 20.0
+ATOMGIT_TIMEOUT_SECONDS = 20.0
 
 # Max concurrent API requests per collect run.
 MAX_CONCURRENT_FETCHES = 5
@@ -249,11 +249,11 @@ def _int_value(data: dict[str, Any], *keys: str) -> int:
 
 
 class PopularityFetcher:
-    """Fetches popularity metrics from GitHub / GitCode public APIs."""
+    """Fetches popularity metrics from GitHub / AtomGit public APIs."""
 
     def __init__(self) -> None:
         self.github_token = settings.crawler.github_token or None
-        self.gitcode_token = settings.crawler.gitcode_token or None
+        self.atomgit_token = settings.crawler.atomgit_token or None
 
     def _github_headers(self) -> dict[str, str]:
         headers = {
@@ -264,21 +264,21 @@ class PopularityFetcher:
             headers["Authorization"] = f"Bearer {self.github_token}"
         return headers
 
-    def _gitcode_headers(self) -> dict[str, str]:
+    def _atomgit_headers(self) -> dict[str, str]:
         headers = {
             "Accept": "application/json",
             "User-Agent": "wittyhub-popularity-collector",
         }
-        if self.gitcode_token:
-            headers["PRIVATE-TOKEN"] = self.gitcode_token
+        if self.atomgit_token:
+            headers["PRIVATE-TOKEN"] = self.atomgit_token
         return headers
 
     async def fetch(self, repo_url: str, source: str) -> RepoPopularity:
         """Fetch popularity for one repository URL."""
         if source == "github":
             return await self._fetch_github(repo_url)
-        if source == "gitcode":
-            return await self._fetch_gitcode(repo_url)
+        if source == "atomgit":
+            return await self._fetch_atomgit(repo_url)
         raise PopularityError(f"Unsupported popularity source: {source}")
 
     async def _fetch_github(self, repo_url: str) -> RepoPopularity:
@@ -315,30 +315,30 @@ class PopularityFetcher:
             watchers=_int_value(data, "watchers_count"),
         )
 
-    async def _fetch_gitcode(self, repo_url: str) -> RepoPopularity:
+    async def _fetch_atomgit(self, repo_url: str) -> RepoPopularity:
         owner_repo = extract_owner_repo(repo_url)
-        url = f"{GITCODE_API_BASE}/repos/{owner_repo}"
+        url = f"{ATOMGIT_API_BASE}/repos/{owner_repo}"
         try:
             async with httpx.AsyncClient(
-                timeout=GITCODE_TIMEOUT_SECONDS,
-                headers=self._gitcode_headers(),
+                timeout=ATOMGIT_TIMEOUT_SECONDS,
+                headers=self._atomgit_headers(),
                 follow_redirects=True,
             ) as client:
                 resp = await client.get(url)
         except httpx.RequestError as exc:
-            raise PopularityError(f"GitCode API request failed: {exc}") from exc
+            raise PopularityError(f"AtomGit API request failed: {exc}") from exc
 
         if resp.status_code == 404:
-            raise PopularityError(f"GitCode repo not found: {owner_repo}")
+            raise PopularityError(f"AtomGit repo not found: {owner_repo}")
         if resp.status_code != 200:
             raise PopularityError(
-                f"GitCode API returned {resp.status_code}: {resp.text[:200]}"
+                f"AtomGit API returned {resp.status_code}: {resp.text[:200]}"
             )
 
         data = resp.json()
         return RepoPopularity(
             url=repo_url,
-            source="gitcode",
+            source="atomgit",
             stars=_int_value(data, "star_count", "stargazers_count"),
             forks=_int_value(data, "forks_count"),
             watchers=_int_value(data, "watch_count", "watchers_count"),
@@ -378,8 +378,8 @@ class PopularityCollector:
         host = parsed.netloc.lower()
         if host == "github.com":
             return "github"
-        if host == "gitcode.com":
-            return "gitcode"
+        if host == "atomgit.com":
+            return "atomgit"
         try:
             source, _ = derive_skill_source(repo_url)
             return source

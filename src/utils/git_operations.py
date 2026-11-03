@@ -29,7 +29,7 @@ DEFAULT_MAX_TAGS_PER_REPO = 5
 TAG_CANDIDATE_REF_PREFIX = 'refs/crawler/tag-candidates'
 UNSUPPORTED_FILTER_MESSAGES = ( # 检测服务端不支持 partial clone filter 的错误关键词
     'filtering not recognized by server', # Git < 2.25 / 旧版 GitLab
-    'server does not support filter', # Gitea / gitcode.com
+    'server does not support filter', # Gitea / atomgit.com
 )
 # 禁止 git 弹出交互式认证提示: 
 # 后台服务运行时没有 TTY，如果 git 遇到需要认证的私有仓库（或 token 过期），没有这个环境变量会 挂住等待输入 ，

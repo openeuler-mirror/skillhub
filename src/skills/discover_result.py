@@ -303,12 +303,15 @@ def resolve_discover_result_dir(result_dir: str = "") -> Path:
 
 
 def save_discover_result_file(
-    document: dict[str, Any], result_dir: str = "", file_prefix: str = "discover"
+    document: dict[str, Any], result_dir: str = "", file_prefix: str = "discover",
+    log: bool = True,
 ) -> Path | None:
     """把一轮结果写入 JSON 文件；失败仅记录 warning，不影响主流程。
 
     file_prefix 决定文件名前缀（``<prefix>-<时间戳>.json``）；补齐循环
-    （src/jobs/remediation.py）以 ``remediation`` 前缀复用本函数。
+    （src/jobs/remediation.py）以 ``remediation`` 前缀复用本函数并以
+    ``log=False`` 关掉这里的成功日志，改用自身的 ``[Remediation]`` 前缀打印，
+    避免同一结果文件重复打印成功日志。
     """
     try:
         target_dir = resolve_discover_result_dir(result_dir)
@@ -318,7 +321,8 @@ def save_discover_result_file(
         path.write_text(
             json.dumps(document, ensure_ascii=False, indent=2), encoding="utf-8"
         )
-        logger.info("[Discover] %s result saved to %s", file_prefix, path)
+        if log:
+            logger.info("[Discover] %s result saved to %s", file_prefix, path)
         return path
     except Exception:
         # 前缀随 file_prefix 变化：discover 调用打 "discover"，补齐调用打

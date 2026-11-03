@@ -31,7 +31,7 @@ def build_skill_md_url(
         branch = repo.branch
     else:
         # GitHub supports /blob/HEAD/ as a placeholder for the default branch;
-        # other platforms (GitCode, Gitee, GitLab) do not and need an actual
+        # other platforms (AtomGit, Gitee, GitLab) do not and need an actual
         # branch name.  Fall back to 'master' which is the most common default
         # on those platforms.
         branch = 'HEAD' if repo.source == 'github' else 'master'
@@ -115,8 +115,10 @@ def derive_skill_source(repo_url: str | None) -> tuple[str, str]:
 
     if raw_host == 'github.com':
         host = 'github'
+    elif raw_host == 'atomgit.com':
+        host = 'atomgit'
     elif raw_host == 'gitcode.com':
-        host = 'gitcode'
+        host = 'atomgit'
     elif raw_host == 'gitlab.com':
         host = 'gitlab'
     elif raw_host == 'gitee.com':
@@ -381,8 +383,8 @@ def normalize_git_clone_url(url: str | None) -> str:
     ssh_match = re.match(r'git@([^:]+):(.+)', stripped)
     if ssh_match:
         host = ssh_match.group(1)
-        if host.lower() == 'atomgit.com':
-            host = 'gitcode.com'
+        if host.lower() == 'gitcode.com':
+            host = 'atomgit.com'
         path = ssh_match.group(2).strip('/')
         return f'git@{host}:{path}'
 
@@ -391,8 +393,8 @@ def normalize_git_clone_url(url: str | None) -> str:
         return ''
 
     host = parsed.netloc
-    if host.lower() == 'atomgit.com':
-        host = 'gitcode.com'
+    if host.lower() == 'gitcode.com':
+        host = 'atomgit.com'
     path = parsed.path.strip('/')
     if path.endswith('.git'):
         path = path[:-4]

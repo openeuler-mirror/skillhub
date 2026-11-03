@@ -981,6 +981,52 @@ class SkillRepository:
 
         return (version_result.rowcount or 0) > 0 or (summary_result.rowcount or 0) > 0
 
+    async def delete_skills_not_in_skill_ids(
+        self, skill_repo_id: uuid.UUID, expected_skill_ids: set[str],
+    ) -> int:
+        """删除仓库下 skill_id 不在期望集合内的 skill 及其版本，返回删除的 skill 行数。
+
+        与 ``store_skills_and_versions`` 的 diff 删除同口径，但额外清理
+        security_audits / download_history 软关联（store 的 diff 删除不清理，
+        会留下孤儿数据）。用于扫描前的「同步删除」：catalog 中撤销登记的
+        ``skills[].skill_url`` / ``local_skills`` 条目对应的 skill 据此删除，
+        即使远端仓库 commit 未变化（``discover`` 的 commit 短路会跳过扫描）。
+        """
+        if not expected_skill_ids:
+            return 0
+        removed_result = await self.session.execute(
+            select(Skill.id).where(
+                Skill.skill_repo_id == skill_repo_id,
+                Skill.skill_id.not_in(expected_skill_ids),
+            )
+        )
+        removed_uuids = [row[0] for row in removed_result.all()]
+        version_ids_result = await self.session.execute(
+            select(SkillVersion.id).where(
+                SkillVersion.skill_repo_id == skill_repo_id,
+                SkillVersion.skill_id.not_in(expected_skill_ids),
+            )
+        )
+        version_ids = [row[0] for row in version_ids_result.all()]
+
+        if not removed_uuids and not version_ids:
+            return 0
+
+        if removed_uuids:
+            await self.session.execute(
+                delete(Skill).where(Skill.id.in_(removed_uuids))
+            )
+        if version_ids:
+            await self.session.execute(
+                delete(SkillVersion).where(SkillVersion.id.in_(version_ids))
+            )
+        await self.session.flush()
+
+        # 清理 security_audits / download_history 软关联（无外键，不会级联）
+        await self.delete_skill_related_records([*removed_uuids, *version_ids])
+        await self.session.commit()
+        return len(removed_uuids)
+
     async def increment_download(self, skill_id: str) -> uuid.UUID | None:
         """累加下载计数，返回该 Skill 的主键 UUID（未命中返回 None），供调用方落 DownloadHistory。"""
         existing = await self.get_by_skill_id(skill_id)
@@ -1272,6 +1318,28 @@ class ContributorRepository:
                 )
             )
             .execution_options(synchronize_session=False)
+        )
+        if commit:
+            await self.session.commit()
+        return int(result.rowcount or 0)
+
+    async def delete_contributors_without_skills(self, commit: bool = True) -> int:
+        """物理删除名下已无任何 skill 记录的 contributor，返回删除行数。
+
+        判定口径为 skills 表中 (source, author) 是否存在任何行（而非
+        ``reconcile_skill_counts`` 的可见口径——后者会把仅有未审计 skill 的
+        贡献者也算作空并误删）。用于 catalog 删除仓库后清理孤儿作者，幂等。
+        """
+        skill_exists = (
+            select(func.count(Skill.id))
+            .where(
+                Skill.source == Contributor.source,
+                Skill.author == Contributor.author,
+            )
+            .scalar_subquery()
+        )
+        result = await self.session.execute(
+            delete(Contributor).where(skill_exists == 0)
         )
         if commit:
             await self.session.commit()

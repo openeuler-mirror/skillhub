@@ -25,7 +25,7 @@ class SkillSource(str, Enum):
     CLAWHUB = "clawhub"
     GITHUB = "github"
     GITE = "gitee"
-    GITCODE = "gitcode"
+    ATOMGIT = "atomgit"
 
 
 @dataclass

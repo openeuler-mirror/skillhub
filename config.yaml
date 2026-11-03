@@ -27,7 +27,7 @@ model:
 
 crawler:
   github_token: ""
-  gitcode_token: ""
+  atomgit_token: ""
 
 security:
   # Skillspector (Jenkins-based scanner) — sensitive fields via env vars

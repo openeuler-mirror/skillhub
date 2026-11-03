@@ -49,7 +49,7 @@ wittyhub --help      # 应显示 add / install / find / list / audit 等命令
 {source_type}:{owner}/{repo}/{skill_dir}
 ```
 
-例如：`gitcode:openeuler/ib_robot/deepwiki-config`（`skill_dir` 为 SKILL.md 所在目录名）。
+例如：`atomgit:openeuler/ib_robot/deepwiki-config`（`skill_dir` 为 SKILL.md 所在目录名）。
 
 ### 1) 已知 skill_id（推荐）
 
@@ -156,7 +156,7 @@ AdaL = adal
 注意：
 
 - 必须使用完整的 skill_id（含 `source_type:` 前缀与冒号），不要自行拼写或改写
-- `-a` 的值必须是上表或「完整 Agent 标识」中的 CLI 标识；写成显示名或未知名称会报 `Invalid agents` 并直接退出，不会退回默认安装
+- `-a` 的值必须是 Agent 的 CLI 标识；写成显示名或未知名称会报 `Invalid agents` 并直接退出，不会退回默认安装。上表只是常用子集，完整标识见 [wittyhub-cli README 的 Supported Agents 表](https://atomgit.com/openeuler/wittyhub-cli/blob/master/README.md#supported-agents)；也可运行 `wittyhub list -a <任意无效标识>`，报错输出的 `Valid agents: ...` 会列出全部合法标识
 - 必须显式带上 `-a <agent>`，不要依赖 CLI 自动识别（部分 Agent 识别不出来，可能装到其他 Agent 目录）
 
 ### 2) 只知道技能名：先查 skill_id 再安装
