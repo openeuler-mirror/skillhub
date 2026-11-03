@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import subprocess
 import zipfile
 from pathlib import Path
@@ -119,12 +120,35 @@ def test_create_skill_archive_exports_only_target_skill(tmp_path):
 
     assert archive.filename == "clean-code-1.1.0.zip"
     assert archive.media_type == "application/zip"
+    assert archive.sha256 == hashlib.sha256(archive.path.read_bytes()).hexdigest()
     with zipfile.ZipFile(archive.path) as packaged_skill:
         files = set(packaged_skill.namelist())
     assert "clean-code/SKILL.md" in files
     assert "clean-code/references/guard-clause.md" in files
     assert not any("other-skill" in name for name in files)
     assert not any(".git" in name for name in files)
+
+
+def test_create_skill_archive_hash_is_stable_across_cache_hits(tmp_path):
+    repository, commit_id = _create_git_repository(tmp_path)
+    manager = DownloadManager(storage_path=tmp_path / "storage")
+
+    first = asyncio.run(
+        manager.create_skill_archive(
+            skill=_skill(commit_id),
+            repository=_repository(repository),
+        )
+    )
+    second = asyncio.run(
+        manager.create_skill_archive(
+            skill=_skill(commit_id),
+            repository=_repository(repository),
+        )
+    )
+
+    assert first.sha256 is not None
+    assert second.sha256 == first.sha256
+    assert second.sha256 == hashlib.sha256(second.path.read_bytes()).hexdigest()
 
 
 def test_create_skill_archive_reuses_commit_cache(tmp_path):

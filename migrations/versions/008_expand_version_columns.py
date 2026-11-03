@@ -5,15 +5,15 @@ Revises: 007_add_repo_url_column
 Create Date: 2026-08-06 00:00:00
 
 """
-from typing import Sequence, Union
+from collections.abc import Sequence
 
 import sqlalchemy as sa
 from alembic import op
 
 revision: str = "008_expand_version_columns"
-down_revision: Union[str, None] = "007_add_repo_url_column"
-branch_labels: Union[str, Sequence[str], None] = None
-depends_on: Union[str, Sequence[str], None] = None
+down_revision: str | None = "007_add_repo_url_column"
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
 
 
 VERSION_TABLES = (

@@ -122,12 +122,12 @@ async def lifespan(app: FastAPI):
     # 但整体放到后台，避免迁移（约 18s）阻塞 API 启动。
     # discover scheduler 的引用经 app.state 回传，供 shutdown 阶段停止。
     app.state.discover_scheduler = None
-
+    app.state.audit_llm_review = None
+    
     async def _bootstrap() -> None:
         # 一次性幂等迁移先于 discover 扫描执行；失败仅记录，不阻断后续步骤。
         try:
             from src.jobs.migration import run_migration
-
             await run_migration()
         except asyncio.CancelledError:
             raise
@@ -154,6 +154,18 @@ async def lifespan(app: FastAPI):
                 raise
             except Exception:
                 logger.exception("discover scheduler start failed")
+        
+        # LLM 审核调度器：依赖 migration 与 discover 均完成后启动，
+        # 引用经 app.state 回传，供 shutdown 阶段停止。
+        if settings.audit_llm_review.enabled:
+            from src.jobs.audit_llm_review import start_audit_llm_review_scheduler
+    
+            try:
+                app.state.audit_llm_review = await start_audit_llm_review_scheduler()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("audit llm review scheduler start failed")               
 
     bootstrap_task = asyncio.create_task(_bootstrap(), name="startup-bootstrap")
 
@@ -169,6 +181,9 @@ async def lifespan(app: FastAPI):
     discover_scheduler = app.state.discover_scheduler
     if discover_scheduler is not None:
         await discover_scheduler.stop()
+    audit_llm_review = app.state.audit_llm_review
+    if audit_llm_review is not None:
+        await audit_llm_review.stop()       
     if collector is not None:
         await collector.stop()
     from src.ai.embedding import close_embedding_service
@@ -198,6 +213,8 @@ def create_app() -> FastAPI:
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+        # 下载接口用响应头回传制品摘要，浏览器端需要能读到
+        expose_headers=["X-Artifact-SHA256", "Content-Disposition"],
     )
     install_response_wrapper(app)
 
