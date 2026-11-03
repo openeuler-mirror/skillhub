@@ -79,11 +79,10 @@ services:
       SECURITY__SKILLSPECTOR_JENKINS_TOKEN: ${SECURITY__SKILLSPECTOR_JENKINS_TOKEN:-}
       # 后台定时 LLM 复核：每天 01:00-08:00（下方 TZ 为北京时间）复核数据库中
       # 未复核过的 SkillSpector 风险项，剔除误报并回写审计结果。
-      # 默认硅基流动 Qwen3.5-4B；API Key 为空时任务自动跳过，不影响 API 启动。
+      # model/base_url/api_key 留空时复用 model.providers 当前 provider
+      # （默认 siliconflow / Qwen3.5-4B）；需要单独指定时再覆盖。
       AUDIT_LLM_REVIEW__ENABLED: ${AUDIT_LLM_REVIEW__ENABLED:-true}
       AUDIT_LLM_REVIEW__API_KEY: ${AUDIT_LLM_REVIEW__API_KEY:-}
-      AUDIT_LLM_REVIEW__MODEL: ${AUDIT_LLM_REVIEW__MODEL:-Qwen/Qwen3.5-4B}
-      AUDIT_LLM_REVIEW__BASE_URL: ${AUDIT_LLM_REVIEW__BASE_URL:-https://api.siliconflow.cn/v1}
       AUDIT_LLM_REVIEW__START_TIME: "${AUDIT_LLM_REVIEW__START_TIME:-01:00}"
       AUDIT_LLM_REVIEW__END_TIME: "${AUDIT_LLM_REVIEW__END_TIME:-08:00}"
       AUDIT_LLM_REVIEW__CONCURRENCY: ${AUDIT_LLM_REVIEW__CONCURRENCY:-3}

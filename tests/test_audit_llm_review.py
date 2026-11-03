@@ -150,8 +150,8 @@ class TestDeadline:
             )
 
 
-class TestApiKeyFallback:
-    def test_explicit_key_wins(self, monkeypatch):
+class TestModelFallback:
+    def test_explicit_values_win(self, monkeypatch):
         import src.jobs.audit_llm_review as module
 
         monkeypatch.setattr(
@@ -159,14 +159,24 @@ class TestApiKeyFallback:
             "get_settings",
             lambda: SimpleNamespace(
                 model=SimpleNamespace(
-                    providers={"siliconflow": SimpleNamespace(api_key="provider-key")}
+                    name="provider-model",
+                    base_url="https://provider.example/v1",
+                    api_key="provider-key",
                 )
             ),
         )
-        scheduler = AuditLLMReviewScheduler(AuditLLMReviewConfig(api_key="explicit-key"))
+        scheduler = AuditLLMReviewScheduler(
+            AuditLLMReviewConfig(
+                model="explicit-model",
+                base_url="https://explicit.example/v1",
+                api_key="explicit-key",
+            )
+        )
+        assert scheduler._config.model == "explicit-model"
+        assert scheduler._config.base_url == "https://explicit.example/v1"
         assert scheduler._api_key == "explicit-key"
 
-    def test_falls_back_to_siliconflow_provider(self, monkeypatch):
+    def test_falls_back_to_active_provider(self, monkeypatch):
         import src.jobs.audit_llm_review as module
 
         monkeypatch.setattr(
@@ -174,11 +184,15 @@ class TestApiKeyFallback:
             "get_settings",
             lambda: SimpleNamespace(
                 model=SimpleNamespace(
-                    providers={"siliconflow": SimpleNamespace(api_key="provider-key")}
+                    name="provider-model",
+                    base_url="https://provider.example/v1",
+                    api_key="provider-key",
                 )
             ),
         )
         scheduler = AuditLLMReviewScheduler(AuditLLMReviewConfig())
+        assert scheduler._config.model == "provider-model"
+        assert scheduler._config.base_url == "https://provider.example/v1"
         assert scheduler._api_key == "provider-key"
 
     def test_no_provider_config_keeps_empty(self, monkeypatch):
@@ -190,6 +204,8 @@ class TestApiKeyFallback:
             lambda: SimpleNamespace(model=SimpleNamespace()),
         )
         scheduler = AuditLLMReviewScheduler(AuditLLMReviewConfig())
+        assert scheduler._config.model == ""
+        assert scheduler._config.base_url == ""
         assert scheduler._api_key == ""
 
 
@@ -199,6 +215,8 @@ class TestConfig:
         assert config.enabled is False
         assert config.start_time == "01:00"
         assert config.end_time == "08:00"
+        assert config.model == ""
+        assert config.base_url == ""
         assert config.max_findings_per_audit == 200
 
     def test_config_yaml_section_parsed(self):
@@ -208,6 +226,9 @@ class TestConfig:
         assert settings.audit_llm_review.enabled is True
         assert settings.audit_llm_review.start_time == "01:00"
         assert settings.audit_llm_review.end_time == "08:00"
+        # 留空表示复用 model.providers 当前 provider
+        assert settings.audit_llm_review.model == ""
+        assert settings.audit_llm_review.base_url == ""
 
     def test_env_override_keeps_hhmm_string(self, monkeypatch):
         from src.core.config import Settings

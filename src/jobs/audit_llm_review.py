@@ -69,8 +69,9 @@ class AuditLLMReviewScheduler:
     """
 
     def __init__(self, config: AuditLLMReviewConfig):
+        config = _resolve_review_config(config, get_settings())
         self._config = config
-        self._api_key = _resolve_review_api_key(config)
+        self._api_key = config.api_key
         self._context_config = ContextConfig(
             mode=config.context_mode,
             window_lines=config.window_lines,
@@ -540,21 +541,28 @@ class AuditLLMReviewScheduler:
         await mark_skipped(audit_id, reason)
 
 
-def _resolve_review_api_key(config: AuditLLMReviewConfig) -> str:
-    """复核 API Key：优先 audit_llm_review.api_key。
+def _resolve_review_config(
+    config: AuditLLMReviewConfig,
+    settings: Any,
+) -> AuditLLMReviewConfig:
+    """Fill model/base_url/api_key from the active model provider when unset.
 
-    未单独配置时回退复用 ``model.providers.siliconflow`` 的凭据
-    （兼容 skillhub 分支的多 provider 配置）；仍为空则任务自动跳过。
+    复核任务默认跟随 ``model.providers`` 当前 provider（默认 siliconflow /
+    Qwen3.5-4B），避免与主模型配置重复；审计专用值仍可通过
+    ``AUDIT_LLM_REVIEW__MODEL / __BASE_URL / __API_KEY`` 覆盖。
     """
-    if config.api_key:
-        return config.api_key
-    providers = getattr(get_settings().model, "providers", None)
-    if not isinstance(providers, dict):
-        return ""
-    entry = providers.get("siliconflow")
-    if isinstance(entry, dict):
-        return str(entry.get("api_key") or "")
-    return str(getattr(entry, "api_key", "") or "")
+    model = getattr(settings, "model", None)
+    if model is None:
+        return config
+    # Settings.from_yaml 已经通过 ModelConfig.resolve() 把当前 provider 的
+    # name/base_url/api_key 填到平铺字段，这里直接复用，无需再查 providers。
+    return config.model_copy(
+        update={
+            "model": config.model or str(getattr(model, "name", "") or ""),
+            "base_url": config.base_url or str(getattr(model, "base_url", "") or ""),
+            "api_key": config.api_key or str(getattr(model, "api_key", "") or ""),
+        }
+    )
 
 
 async def start_audit_llm_review_scheduler() -> AuditLLMReviewScheduler | None:
