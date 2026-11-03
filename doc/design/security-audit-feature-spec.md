@@ -247,8 +247,12 @@ AuditLLMReviewScheduler（src/jobs/audit_llm_review.py）
   `context_version` / `context_mode` / `context_blocks_*` / `context_sources_*`。
   partial 记录在 context_version 升级后从头复核，避免旧游标错位。
 
-配置见 `config.yaml` 的 `audit_llm_review` 段，API Key 建议通过
-`AUDIT_LLM_REVIEW__API_KEY` 注入；未配置时任务自动跳过。
+配置见 `config.yaml` 的 `audit_llm_review` 段：`model` / `base_url` / `api_key`
+留空时复用 `model.providers` 当前 provider（默认 siliconflow / Qwen3.5-4B），
+与分类、翻译共用同一份凭据；需要为复核单独指定模型或 Key 时再通过
+`AUDIT_LLM_REVIEW__MODEL` / `__BASE_URL` / `__API_KEY` 覆盖；全部为空时任务
+自动跳过。请求体复用 `src/ai/llm.build_chat_payload`，仅额外开启
+`response_format=json_object`。
 
 ---
 
