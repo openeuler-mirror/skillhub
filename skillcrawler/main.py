@@ -45,16 +45,31 @@ from src.models.repository import (
 settings = get_settings()
 
 _LOG_DIR = Path(settings.storage.local_path).expanduser().resolve() / "logs"
-_LOG_DIR.mkdir(parents=True, exist_ok=True)
 _LOG_LEVEL = getattr(logging, settings.logging.level.strip().upper(), logging.INFO)
+
+
+def _build_log_handlers() -> list[logging.Handler]:
+    """构建日志 handler：文件日志不可用时降级为仅 stderr。
+
+    默认 storage.local_path 是 /opt/wittyhub（容器内写入路径）。在普通开发机
+    上该目录通常不可写，若在导入期直接失败，会连带让任何 import 本模块的代码
+    （含 pytest 收集）无法运行，因此这里只记录告警并降级。
+    """
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    try:
+        _LOG_DIR.mkdir(parents=True, exist_ok=True)
+        handlers.append(logging.FileHandler(_LOG_DIR / "skillcrawler.log"))
+    except OSError as exc:  # 非容器环境 / 只读文件系统：不影响模块可用性
+        logging.getLogger(__name__).warning(
+            "skillcrawler file logging disabled (%s): %s", _LOG_DIR, exc
+        )
+    return handlers
+
 
 logging.basicConfig(
     level=_LOG_LEVEL,
     format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler(_LOG_DIR / "skillcrawler.log"),
-    ],
+    handlers=_build_log_handlers(),
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
