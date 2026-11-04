@@ -146,61 +146,13 @@ services:
       - "8083:8083"
       - "50000:50000"
     environment:
-      # Jenkins 部署参数（含 admin 密码）由 config.yaml（WITTYHUB_CONFIG）统一管理，
-      # 容器入口会把 security.skillspector_* 注入为 JENKINS_* 环境变量。
+      # Jenkins 部署参数与大模型复核参数（admin 密码、模型、API Key、限流、
+      # 并发与超时等）统一由 config.yaml（WITTYHUB_CONFIG）管理：容器入口启动时
+      # 读取 security.skillspector_*，注入为 JENKINS_* / SKILLSPECTOR_* / OPENAI_*。
+      # 生产部署不依赖本文件；确需临时覆盖时可用 docker -e（仅当 config.yaml
+      # 对应值为空时生效，例如 OPENAI_API_KEY）。
       WITTYHUB_CONFIG: /app/config.yaml
       TZ: Asia/Shanghai
-      # 大模型复核（A 方案）：只有 meta_analyzer 调用大模型（剔除静态误报 + 富化），
-      # 语义发现节点不调用。依赖镜像里已打入
-      # deploy/skillspector/patches/0001-per-node-llm-allowlist.patch 与
-      # deploy/skillspector/patches/0002-qwen-native-json-schema.patch。
-      SKILLSPECTOR_LLM_NODES: ${SKILLSPECTOR_LLM_NODES:-meta_analyzer}
-      # 默认模型：硅基流动免费档 Qwen/Qwen3.5-4B。
-      # 实测特性（2026-10-29）：256K(262144) 上下文；max_tokens 8K~262144 均被接受，
-      # 输出上限等于上下文；json_object 可用；json_schema(strict) 会被强制执行；
-      # thinking 可关闭。补丁对 Qwen3.5 走原生 json_schema 结构化输出 + temperature=0，
-      # 其他模型仍回落到 json_object + prompt 内 schema（SKILLSPECTOR_NATIVE_JSON_SCHEMA=0 可强制回落）。
-      # 换模型时必须同步在 deploy/skillspector/patches/*model_registry.yaml 里补该模型的
-      # context_length / max_output_tokens，否则会回落到 128K/32K 默认值（日志会告警）。
-      SKILLSPECTOR_MODEL: ${SKILLSPECTOR_MODEL:-Qwen/Qwen3.5-4B}
-      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.siliconflow.cn/v1}
-      # 成本/上下文控制（在 openshift-docs 1696 文件上实测）：
-      #   TEXT_ONLY     跳过图片、压缩包、PDF 等二进制，只扫文本
-      #   RULE_SCOPE    按「规则 × 文件类别」矩阵剔除不适用于该文件类型的命中
-      #   WINDOW_LINES  只送命中前后 N 行 + 文件头，而不是整篇文档
-      # 三者叠加后发送给 LLM 的 token 显著下降，且不改变静态扫描覆盖面。
-      SKILLSPECTOR_TEXT_ONLY: ${SKILLSPECTOR_TEXT_ONLY:-1}
-      SKILLSPECTOR_RULE_SCOPE: ${SKILLSPECTOR_RULE_SCOPE:-1}
-      SKILLSPECTOR_WINDOW_LINES: ${SKILLSPECTOR_WINDOW_LINES:-20}
-      SKILLSPECTOR_WINDOW_HEADER_LINES: ${SKILLSPECTOR_WINDOW_HEADER_LINES:-40}
-      # 客户端限流，与 Qwen3.5-4B 免费档配额一致（1000 RPM / 80000 TPM），
-      # 否则会频繁触发 429/503。换用付费档或其他模型时按供应商配额调整；0 表示不限流。
-      SKILLSPECTOR_RPM: ${SKILLSPECTOR_RPM:-1000}
-      SKILLSPECTOR_TPM: ${SKILLSPECTOR_TPM:-80000}
-      # 输出预算与思考模式（按 Qwen3.5-4B 实测特性）：
-      #   模型本身接受 max_tokens 到 262144，但限流器按「prompt + max_output」预留 TPM，
-      #   8192 的预留会让 80k TPM 只能同时排 ~6 个请求；实测单批输出最大 2115 token，
-      #   压到 4096 后并发提升约 45%，且仍有 2 倍余量。
-      #   enable_thinking=false 关闭 Qwen3.x 的思考模式，否则延迟和输出 token 翻数倍。
-      SKILLSPECTOR_MAX_OUTPUT_TOKENS: ${SKILLSPECTOR_MAX_OUTPUT_TOKENS:-4096}
-      SKILLSPECTOR_DISABLE_THINKING: ${SKILLSPECTOR_DISABLE_THINKING:-1}
-      # 日志级别：镜像内默认 WARNING 会隐藏批次划分、token 用量等关键信息
-      SKILLSPECTOR_LOG_LEVEL: ${SKILLSPECTOR_LOG_LEVEL:-INFO}
-      # 并发与超时（在 10 个中风险 skill 上实测）：
-      #   硅基流动免费档实测可用并发上限约 4（8 并发时 4 个请求 120s 超时），因此取 4。
-      #   限流器按「prompt + 4096」预留，80k TPM 理论可排 ~11 个请求，瓶颈是供应商时延而不是 TPM。
-      #   BATCH_TIMEOUT 必须明显大于 LLM_TIMEOUT：单次尝试 90s + 退避 3s + 重试 90s ≈ 183s，
-      #   300s 才能让补丁里的重试完整执行。
-      SKILLSPECTOR_MAX_CONCURRENCY: ${SKILLSPECTOR_MAX_CONCURRENCY:-4}
-      SKILLSPECTOR_BATCH_TIMEOUT: ${SKILLSPECTOR_BATCH_TIMEOUT:-300}
-      SKILLSPECTOR_LLM_TIMEOUT: ${SKILLSPECTOR_LLM_TIMEOUT:-90}
-      # LLM 复核总时长预算（秒）。超时后剩余批次不再调用模型，其静态命中原样保留，
-      # 报告偏保守，不会静默丢命中。0 = 不限。
-      # 必须小于上游等待预算：wittyhub security.skillspector_timeout(600s) 与
-      # nginx proxy_read_timeout(300s)，留 60s 给静态分析 + 出报告，故取 540s。
-      SKILLSPECTOR_LLM_BUDGET_SECONDS: ${SKILLSPECTOR_LLM_BUDGET_SECONDS:-540}
-      # 必填：缺失时 compose 直接报错，避免无凭证时静默退化成纯静态扫描
-      OPENAI_API_KEY: ${OPENAI_API_KEY:?OPENAI_API_KEY is required for skillspector LLM review}
     volumes:
       - ../config.yaml:/app/config.yaml:ro
       - jenkins-data:/var/jenkins_home
