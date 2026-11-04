@@ -3,7 +3,7 @@ import re
 import subprocess
 import sys
 from sqlalchemy import text
-sys.path.insert(0, '/home/ubuntu/wittyhub')
+sys.path.insert(0, '/home/ubuntu/skillhub')
 
 from core.database import SyncSessionLocal
 from src.models.orm import Skill

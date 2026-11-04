@@ -792,7 +792,7 @@ discover 写入路径涉及三张关键表，字段约定如下，供 §11 仓�
 
 | 字段 | 含义 |
 |------|------|
-| `repo_name` | 由仓库 URL 生成的本地唯一名称，如 `atomgit.com_openeuler_wittyhub-cli` |
+| `repo_name` | 由仓库 URL 生成的本地唯一名称，如 `atomgit.com_openeuler_skillhub-cli` |
 | `source` | 仓库来源，如 `atomgit` / `github` |
 | `platform` | 平台分类，如 `openeuler` / `enterprise` / `personal` |
 | `branch` | 当前扫描分支 |
@@ -808,7 +808,7 @@ discover 写入路径涉及三张关键表，字段约定如下，供 §11 仓�
 
 | 字段 | 含义 |
 |------|------|
-| `skill_id` | 全局唯一 Skill ID，格式类似 `atomgit:openeuler/wittyhub-cli/find-skills` |
+| `skill_id` | 全局唯一 Skill ID，格式类似 `atomgit:openeuler/skillhub-cli/find-skills` |
 | `skill_repo_id` | 所属 `skill_repos.id` |
 | `commit_id` | `SKILL.md` 所在 skill 文件夹的最新 commit，不是 repo HEAD |
 | `platform` | 优先继承 `skill_repos.platform` |

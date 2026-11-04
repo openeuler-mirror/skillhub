@@ -25,7 +25,7 @@ const searchInput = ref('')
 const showSearchHistory = ref(false)
 const searchHistory = ref<string[]>([])
 
-const SEARCH_HISTORY_KEY = 'wittyhub-search-history'
+const SEARCH_HISTORY_KEY = 'skillhub-search-history'
 const SEARCH_HISTORY_LIMIT = 8
 
 const sortOptions = [

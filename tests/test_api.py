@@ -36,7 +36,7 @@ def test_health_check(client):
     body = response.json()
     assert body["code"] == 200
     assert body["msg"] == "ok"
-    assert body["data"] == {"status": "healthy", "service": "wittyhub"}
+    assert body["data"] == {"status": "healthy", "service": "skillhub"}
 
 
 @requires_db

@@ -128,7 +128,7 @@ async def receive_telemetry(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
-    """Receive telemetry data from wittyhub CLI and update counters for installs.
+    """Receive telemetry data from skillhub CLI and update counters for installs.
 
     Matched skills also get a download_history record (with IP/User-Agent),
     which feeds the weekly/monthly download ranking.

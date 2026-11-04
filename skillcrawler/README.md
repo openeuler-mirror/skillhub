@@ -163,7 +163,7 @@ storage:
 示例：
 
 ```text
-/opt/wittyhub/skill-repositories/atomgit.com_openeuler_wittyhub-cli
+/opt/wittyhub/skill-repositories/atomgit.com_openeuler_skillhub-cli
 ```
 
 `repo_name` 的生成方式：
@@ -187,7 +187,7 @@ storage:
 推荐从项目根目录执行：
 
 ```bash
-cd wittyhub
+cd skillhub
 python skillcrawler/main.py query
 python skillcrawler/main.py discover
 ```
@@ -195,7 +195,7 @@ python skillcrawler/main.py discover
 也支持从 `skillcrawler/` 目录执行：
 
 ```bash
-cd wittyhub/skillcrawler
+cd skillhub/skillcrawler
 python main.py query
 python main.py discover
 ```

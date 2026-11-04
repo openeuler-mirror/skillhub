@@ -8,8 +8,8 @@ from src.security.detector import validate_git_url
     [
         "https://github.com/openai/codex.git",
         "ssh://git@gitlab.com/group/project.git",
-        "https://atomgit.com/openeuler/wittyhub",
-        "https://atomgit.com/openeuler/wittyhub",
+        "https://atomgit.com/openeuler/skillhub",
+        "https://atomgit.com/openeuler/skillhub",
     ],
 )
 def test_validate_git_url_accepts_allowlisted_repository_urls(url):

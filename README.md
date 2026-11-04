@@ -30,8 +30,8 @@ AI Agent Skills 检索与分发平台。发现、评估和获取可复用的 AI 
 ### 准备环境变量
 
 ```bash
-git clone https://atomgit.com/openeuler/wittyhub.git
-cd wittyhub
+git clone https://atomgit.com/openeuler/skillhub.git
+cd skillhub
 cp deploy/.env.example deploy/.env
 ```
 
@@ -87,7 +87,7 @@ docker compose -f compose.yaml exec api alembic upgrade head
 flowchart LR
     User["Browser / CLI User"]
 
-    subgraph Compose["Docker Compose / wittyhub-network"]
+    subgraph Compose["Docker Compose / skillhub-network"]
         Web["web<br/>Nginx :80<br/>映射宿主机 8080"]
         API["api<br/>FastAPI + Uvicorn :8081<br/>映射宿主机 8081"]
         Embedding["embedding<br/>Embedding Service :8082<br/>模型: BAAI/bge-base-zh-v1.5"]
@@ -276,10 +276,10 @@ SkillSpector 的大模型复核参数（模型、API Key、调用节点、限流
 ### CLI 工具
 
 ```bash
-wittyhub search "api framework"
-wittyhub show python-api-framework
-wittyhub install python-api-framework
-wittyhub list
+skillhub-cli search "api framework"
+skillhub-cli show python-api-framework
+skillhub-cli install python-api-framework
+skillhub-cli list
 ```
 
 ### API 调用
@@ -304,7 +304,7 @@ curl http://localhost:8081/api/v1/skills/python/api-framework/versions
 ## 项目结构
 
 ```text
-wittyhub/
+skillhub/
 ├── src/
 │   ├── ai/                 # AI 与向量能力
 │   ├── api/                # FastAPI 应用、路由、Schema 和服务

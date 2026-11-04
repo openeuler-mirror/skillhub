@@ -72,7 +72,7 @@ graph LR
 | 参与者 | 说明 | 典型操作 |
 |--------|------|----------|
 | Web User | 浏览器访问平台 | 搜索、浏览详情、查看安全报告、获取安装命令 |
-| CLI User | 使用 `wittyhub` 命令行 | search / install / download / audit |
+| CLI User | 使用 `skillhub-cli` 命令行 | search / install / download / audit |
 | System Admin | 运维人员 | 触发重索引、查看统计、Docker 部署 |
 | Skill Developer | 本地管理 Skill | install 到 `~/.agents/skills/` |
 
@@ -479,7 +479,7 @@ graph TB
         U[用户浏览器 / CLI]
     end
 
-    subgraph Docker Compose : wittyhub-network
+    subgraph Docker Compose : skillhub-network
         NG[web<br/>nginx:alpine<br/>:8080→8080]
         API[api<br/>FastAPI uvicorn<br/>:8081→8081]
         EMB[embedding<br/>BGE 模型服务<br/>:8082→8082]
@@ -625,7 +625,7 @@ sequenceDiagram
     participant PG as PostgreSQL
     participant REPO as 本地仓库克隆
 
-    User->>CLI: wittyhub add <skill_id>
+    User->>CLI: skillhub-cli add <skill_id>
 
     CLI->>API: GET /skills/{skill_id}/download
     API->>PG: 查询 skill 记录
@@ -761,8 +761,8 @@ GET /api/v1/index/search?q={query}&mode=hybrid&category=&tags=&skip=0&limit=20
 **命令**：
 
 ```bash
-wittyhub add vercel-labs/agent-skills
-wittyhub add anthropics/skills
+skillhub-cli add vercel-labs/agent-skills
+skillhub-cli add anthropics/skills
 ```
 
 ---
@@ -798,7 +798,7 @@ curl -X POST http://localhost:8081/api/v1/index/reindex
 │  Host Machine                                                            │
 │                                                                          │
 │  ┌────────────────────────────────────────────────────────────────────┐  │
-│  │  Docker Network: wittyhub-network                                  │  │
+│  │  Docker Network: skillhub-network                                  │  │
 │  │                                                                    │  │
 │  │  ┌─────────────┐   proxy /api/   ┌─────────────┐                   │  │
 │  │  │  web:8080   │  ──────────────►│  api:8081   │                   │  │
@@ -846,7 +846,7 @@ curl -X POST http://localhost:8081/api/v1/index/reindex
 - [ ] `GET /api/v1/index/search?q=测试&mode=hybrid` 返回结果
 - [ ] Web 首页 `http://localhost:8080` 可访问
 - [ ] PostgreSQL 扩展：`vector`, `pg_trgm`, `unaccent`, `zhcfg`
-- [ ] `wittyhub add vercel-labs/agent-skills --list` 正常列出 Skills
+- [ ] `skillhub-cli add vercel-labs/agent-skills --list` 正常列出 Skills
 
 ---
 
@@ -863,7 +863,7 @@ curl -X POST http://localhost:8081/api/v1/index/reindex
 | GET | `/api/v1/skills/versions/{skill_id}` | 版本历史列表 |
 | GET | `/api/v1/health` | 健康检查 |
 
-### 8.2 CLI 命令（`wittyhub` npm 包）
+### 8.2 CLI 命令（`skillhub-cli` npm 包）
 
 | 命令 | 说明 |
 |------|------|

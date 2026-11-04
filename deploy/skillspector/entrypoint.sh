@@ -25,7 +25,7 @@ import sys
 try:
     import yaml
 except ImportError:
-    print("[wittyhub-entrypoint] ERROR: pyyaml is required to read config", file=sys.stderr)
+    print("[skillhub-entrypoint] ERROR: pyyaml is required to read config", file=sys.stderr)
     sys.exit(1)
 
 config_path = os.environ["SKILLSPECTOR_CONFIG"]
@@ -112,18 +112,18 @@ PY
 )"
 fi
 
-echo "[wittyhub-entrypoint] JENKINS_OPTS=${JENKINS_OPTS:-}"
-echo "[wittyhub-entrypoint] JENKINS_ADMIN_PASS set: $([ -n "${JENKINS_ADMIN_PASS:-}" ] && echo yes || echo no)"
-echo "[wittyhub-entrypoint] JENKINS_NUM_EXECUTORS=${JENKINS_NUM_EXECUTORS:-}"
-echo "[wittyhub-entrypoint] JENKINS_QUIET_PERIOD=${JENKINS_QUIET_PERIOD:-}"
-echo "[wittyhub-entrypoint] WITTYHUB_REPOSITORY_ROOT=${WITTYHUB_REPOSITORY_ROOT:-}"
-echo "[wittyhub-entrypoint] SKILLSPECTOR_LLM_NODES=${SKILLSPECTOR_LLM_NODES:-}"
-echo "[wittyhub-entrypoint] SKILLSPECTOR_MODEL=${SKILLSPECTOR_MODEL:-}"
-echo "[wittyhub-entrypoint] OPENAI_BASE_URL=${OPENAI_BASE_URL:-}"
-echo "[wittyhub-entrypoint] OPENAI_API_KEY set: $([ -n "${OPENAI_API_KEY:-}" ] && echo yes || echo no)"
-echo "[wittyhub-entrypoint] SKILLSPECTOR_MAX_CONCURRENCY=${SKILLSPECTOR_MAX_CONCURRENCY:-}"
-echo "[wittyhub-entrypoint] SKILLSPECTOR_LLM_TIMEOUT=${SKILLSPECTOR_LLM_TIMEOUT:-}"
-echo "[wittyhub-entrypoint] SKILLSPECTOR_LLM_BUDGET_SECONDS=${SKILLSPECTOR_LLM_BUDGET_SECONDS:-}"
+echo "[skillhub-entrypoint] JENKINS_OPTS=${JENKINS_OPTS:-}"
+echo "[skillhub-entrypoint] JENKINS_ADMIN_PASS set: $([ -n "${JENKINS_ADMIN_PASS:-}" ] && echo yes || echo no)"
+echo "[skillhub-entrypoint] JENKINS_NUM_EXECUTORS=${JENKINS_NUM_EXECUTORS:-}"
+echo "[skillhub-entrypoint] JENKINS_QUIET_PERIOD=${JENKINS_QUIET_PERIOD:-}"
+echo "[skillhub-entrypoint] WITTYHUB_REPOSITORY_ROOT=${WITTYHUB_REPOSITORY_ROOT:-}"
+echo "[skillhub-entrypoint] SKILLSPECTOR_LLM_NODES=${SKILLSPECTOR_LLM_NODES:-}"
+echo "[skillhub-entrypoint] SKILLSPECTOR_MODEL=${SKILLSPECTOR_MODEL:-}"
+echo "[skillhub-entrypoint] OPENAI_BASE_URL=${OPENAI_BASE_URL:-}"
+echo "[skillhub-entrypoint] OPENAI_API_KEY set: $([ -n "${OPENAI_API_KEY:-}" ] && echo yes || echo no)"
+echo "[skillhub-entrypoint] SKILLSPECTOR_MAX_CONCURRENCY=${SKILLSPECTOR_MAX_CONCURRENCY:-}"
+echo "[skillhub-entrypoint] SKILLSPECTOR_LLM_TIMEOUT=${SKILLSPECTOR_LLM_TIMEOUT:-}"
+echo "[skillhub-entrypoint] SKILLSPECTOR_LLM_BUDGET_SECONDS=${SKILLSPECTOR_LLM_BUDGET_SECONDS:-}"
 
 if [ -z "${OPENAI_API_KEY:-}" ]; then
     echo "[wittyhub-entrypoint] WARNING: OPENAI_API_KEY 未配置，SkillSpector 大模型复核将不可用" >&2

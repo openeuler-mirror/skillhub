@@ -37,7 +37,7 @@ LOG_PREFIX = "[Embedding]"
 REMEDIATION_LOG_PREFIX = "[Remediation][Embedding]"
 
 # advisory lock 的 bigint key（pg_advisory_lock 单参数版）
-_REINDEX_LOCK_KEY = 742_301_990_122  # hashtext('wittyhub:embedding_reindex') 量级的固定值
+_REINDEX_LOCK_KEY = 742_301_990_122  # hashtext('skillhub:embedding_reindex') 量级的固定值
 
 # 批量编码大小：批越大单次请求内存峰值越高（批内全部文本的向量同时在内存中），
 # 且服务端推理耗时随条数线性增长（实测 ~25s 固定开销 + ~7s/条，CPU 受限环境）。
