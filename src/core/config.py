@@ -209,11 +209,24 @@ class AuditLLMReviewConfig(BaseSettings):
     # 客户端限流（与硅基流动免费档 1000 RPM / 80000 TPM 对齐；0 = 不限流）
     rpm: int = 1000
     tpm: int = 80000
+    # 单次 LLM 调用耗时超过该值（秒）记为慢调用并打 warning；0 = 关闭
+    slow_llm_seconds: float = 30.0
+    # 客户端限流单次等待超过该值（秒）打 warning；0 = 关闭
+    rate_limit_slow_wait_seconds: float = 30.0
+    # 每轮结果 JSON 保存目录；留空则用 storage.local_path/logs（不跟随
+    # discover_scheduler.result_dir，避免两类任务结果混在同一目录）
+    result_dir: str = ""
+    # 结果文件保留策略：按天数和份数双重限制，0 表示不限制该维度
+    result_keep_days: int = 30
+    result_max_files: int = 200
 
 
 class LoggingConfig(BaseSettings):
     level: str = "INFO"
     format: str = "json"
+    # api.log 轮转：单文件上限（字节）与保留份数；max_bytes=0 表示不轮转
+    max_bytes: int = 100 * 1024 * 1024
+    backup_count: int = 5
 
 
 class AIConfig(BaseSettings):
