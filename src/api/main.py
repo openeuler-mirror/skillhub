@@ -168,12 +168,16 @@ async def lifespan(app: FastAPI):
             except Exception:
                 logger.exception("discover scheduler start failed")
         
-        # LLM 审核调度器：依赖 migration 与 discover 均完成后启动，
+        # LLM 审核调度器：依赖 migration 与 discover 首轮扫描完成后启动。
+        # 等待 discover 首轮结束信号，避免审核与首轮扫描并发争抢资源；
         # 引用经 app.state 回传，供 shutdown 阶段停止。
         if settings.audit_llm_review.enabled:
             from src.jobs.audit_llm_review import start_audit_llm_review_scheduler
     
             try:
+                discover_scheduler = app.state.discover_scheduler
+                if discover_scheduler is not None:
+                    await discover_scheduler.first_round_done.wait()
                 app.state.audit_llm_review = await start_audit_llm_review_scheduler()
             except asyncio.CancelledError:
                 raise

@@ -1527,9 +1527,9 @@ class SecurityAuditRepository:
         return audit
 
     async def get_latest_by_resource(
-        self, resource_type: str, resource_id: uuid.UUID
+        self, resource_type: str, resource_id: uuid.UUID, for_update: bool = False
     ) -> SecurityAudit | None:
-        result = await self.session.execute(
+        stmt = (
             select(SecurityAudit)
             .where(
                 SecurityAudit.resource_type == resource_type,
@@ -1538,6 +1538,9 @@ class SecurityAuditRepository:
             .order_by(SecurityAudit.audited_at.desc())
             .limit(1)
         )
+        if for_update:
+            stmt = stmt.with_for_update()
+        result = await self.session.execute(stmt)
         return result.scalar_one_or_none()
 
     async def list_by_resource(
@@ -1565,7 +1568,7 @@ class SecurityAuditRepository:
         fields are updated and the ``collected`` flag is reset so the
         background collector picks it up again.
         """
-        existing = await self.get_latest_by_resource(resource_type, resource_id)
+        existing = await self.get_latest_by_resource(resource_type, resource_id, for_update=True)
         if existing is not None:
             for key, value in audit_data.items():
                 setattr(existing, key, value)
@@ -1596,10 +1599,12 @@ class SecurityAuditRepository:
 
         resource_ids = [resource_id for resource_id, _ in entries]
         result = await self.session.execute(
-            select(SecurityAudit).where(
+            select(SecurityAudit)
+            .where(
                 SecurityAudit.resource_type == resource_type,
                 SecurityAudit.resource_id.in_(resource_ids),
             )
+            .with_for_update()
         )
         existing_by_id = {
             audit.resource_id: audit for audit in result.scalars().all()

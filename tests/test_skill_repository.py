@@ -8,7 +8,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import httpx
 import pytest
@@ -1748,7 +1748,12 @@ repositories:
             source="github",
             url="https://github.com/wordpress/agent-skills",
         )
-        scanned_skill = SimpleNamespace(skill_id="github/wordpress/agent-skills/x", author="wordpress")
+        scanned_skill = SimpleNamespace(
+            skill_id="github/wordpress/agent-skills/x",
+            author="wordpress",
+            source="github",
+            platform="enterprise",
+        )
 
         with (
             patch.object(
@@ -1791,6 +1796,109 @@ repositories:
             skill_num=1,
             author="wordpress",
         )
+
+    async def test_discover_store_upserts_contributors_per_skill_platform(self, tmp_path):
+        """local_skills 自扫描（仓库级 platform=None）下，仓库内多个 skill 分属
+        community/enterprise/personal 不同渠道，应逐 skill 用各自 platform 聚合
+        contributor，而非统一使用仓库级空 platform。"""
+        skill_repository = MagicMock()
+        skill_repository.store_skills_and_versions = AsyncMock()
+        repo_repository = MagicMock()
+        updated_repo = SimpleNamespace(id=uuid.uuid4())
+        repo_repository.update_skill_repository = AsyncMock(return_value=updated_repo)
+        contributor_repository = MagicMock()
+        contributor_repository.upsert = AsyncMock()
+        contributor_repository.count_skills = AsyncMock(return_value=1)
+        manager = SkillManager(
+            skill_repository,
+            repo_repository,
+            contributor_repository=contributor_repository,
+            catalog_path=Path("/nonexistent-catalog"),
+        )
+        repo = SimpleNamespace(
+            id=updated_repo.id,
+            platform=None,  # local_skills 自扫描：仓库级 platform 为空
+            repo_name="atomgit.com_openeuler_openEuler-skills",
+            source="atomgit",
+            url="https://atomgit.com/openeuler/openEuler-skills",
+        )
+        scanned_skills = [
+            SimpleNamespace(
+                skill_id="atomgit:openeuler/openEuler-skills/openeuler-mr",
+                author="alice",
+                source="atomgit",
+                platform="personal",
+            ),
+            SimpleNamespace(
+                skill_id="atomgit:openeuler/openEuler-skills/sig-foo",
+                author="foo",
+                source="atomgit",
+                platform="community",
+            ),
+            SimpleNamespace(
+                skill_id="atomgit:openeuler/openEuler-skills/ent-bar",
+                author="bar",
+                source="atomgit",
+                platform="enterprise",
+            ),
+        ]
+
+        with (
+            patch.object(
+                SkillManager,
+                "_discover_skills",
+                AsyncMock(return_value=(scanned_skills, [], "c" * 40)),
+            ),
+            patch.object(SkillManager, "_store_to_security_audits", AsyncMock()),
+        ):
+            await manager._discover_and_store_skills(
+                repo,
+                clone_dir=tmp_path,
+                repo_name="atomgit.com_openeuler_openEuler-skills",
+            )
+
+        contributor_repository.upsert.assert_has_calls(
+            [
+                call(
+                    source="atomgit",
+                    author="alice",
+                    platform="personal",
+                    repo_url=repo.url,
+                    skill_count=1,
+                    name=None,
+                    description=None,
+                    git_profile=None,
+                    website=None,
+                    commit=False,
+                ),
+                call(
+                    source="atomgit",
+                    author="foo",
+                    platform="community",
+                    repo_url=repo.url,
+                    skill_count=1,
+                    name=None,
+                    description=None,
+                    git_profile=None,
+                    website=None,
+                    commit=False,
+                ),
+                call(
+                    source="atomgit",
+                    author="bar",
+                    platform="enterprise",
+                    repo_url=repo.url,
+                    skill_count=1,
+                    name=None,
+                    description=None,
+                    git_profile=None,
+                    website=None,
+                    commit=False,
+                ),
+            ],
+            any_order=True,
+        )
+        assert contributor_repository.upsert.call_count == 3
 
     async def test_security_audit_store_uses_runtime_trigger_flag(self):
         skill_repository = MagicMock()

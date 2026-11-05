@@ -11,6 +11,10 @@ from src.utils.git_operations import GitOperations
 
 OPENEULER_SKILLS_URL = "https://atomgit.com/openeuler/openEuler-skills"
 
+# catalog 的三个平台渠道（community/enterprise/personal）统一在此定义，
+# 供本模块与 skill_manager / discover_requests 引用，避免多处硬编码不同步。
+CATALOG_PLATFORMS = ("community", "enterprise", "personal")
+
 logger = logging.getLogger(__name__)
 
 
@@ -31,7 +35,7 @@ def _iter_catalog_entries(path: Path) -> Iterator[tuple[str, str, dict[str, Any]
     ``owner`` the directory name under it. Malformed YAML files are skipped
     with a warning instead of aborting the whole read.
     """
-    for platform in ("community", "enterprise", "personal"):
+    for platform in CATALOG_PLATFORMS:
         root = path / platform
         if not root.is_dir():
             continue
@@ -69,7 +73,7 @@ def load_crawler_config(repository_path: Path | None = None) -> dict[str, Any]:
     if not path.is_dir():
         raise ValueError(f"Catalog path must be a repository directory: {path}")
 
-    result: dict[str, Any] = {"community": [], "enterprise": [], "personal": []}
+    result: dict[str, Any] = {platform: [] for platform in CATALOG_PLATFORMS}
     for platform, owner, entry in _iter_catalog_entries(path):
         repos = entry.get("skill_repos", [])
         if not isinstance(repos, list):
@@ -161,7 +165,7 @@ def load_single_catalog_entry(skill_yaml: Path) -> tuple[str, str, dict[str, Any
         raise ValueError(f"expected a skill.yaml file: {skill_yaml}")
     owner = path.parent.name
     platform = path.parent.parent.name
-    if platform not in ("community", "enterprise", "personal") or not owner:
+    if platform not in CATALOG_PLATFORMS or not owner:
         raise ValueError(
             "skill.yaml must live at <catalog>/<platform>/<owner>/skill.yaml: "
             f"{skill_yaml}"

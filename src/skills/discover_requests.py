@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from src.skills.config import (
+    CATALOG_PLATFORMS,
     load_catalog_skill_url_entries,
     load_catalog_local_skill_entries,
     load_crawler_config,
@@ -24,15 +25,15 @@ from src.skills.skill_parser import normalize_git_clone_url, parse_skill_md_url
 
 logger = logging.getLogger(__name__)
 
-PLATFORM_CHOICES = ("personal", "community", "enterprise")
+# CLI --platform 的合法取值，与 catalog 平台渠道保持一致（单一来源为 config.CATALOG_PLATFORMS）。
+PLATFORM_CHOICES = CATALOG_PLATFORMS
 
 
 def _normalize_platform(platform: str) -> str:
     normalized = platform.strip().lower()
     if normalized not in PLATFORM_CHOICES:
-        raise ValueError(
-            f"Unsupported platform {platform!r}; expected community, enterprise, or personal"
-        )
+        allowed = ", ".join(PLATFORM_CHOICES[:-1]) + ", or " + PLATFORM_CHOICES[-1]
+        raise ValueError(f"Unsupported platform {platform!r}; expected {allowed}")
     return normalized
 
 
