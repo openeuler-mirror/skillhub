@@ -647,7 +647,7 @@ GET /api/v1/skills/{skill_id}/audit-report
     "score": 12,
     "level": "safe",
     "level_label": "安全",
-    "level_description": "无显著风险，可以放心使用",
+    "level_description": "SkillSpector 得分 0–20，处于安全区间",
     "recommendation": "SAFE",
     "summary": "该 Skill 综合得分 12/100，评估等级为安全，共检测到 2 项高风险、1 项中风险、1 项低风险。建议保持当前的权限与依赖管理实践。",
     "rule_count": 89,
