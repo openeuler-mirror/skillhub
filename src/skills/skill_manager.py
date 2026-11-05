@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any
 from pydantic import BaseModel
 from sqlalchemy import update
 
-from src.skills.config import load_contributor_profiles
+from src.skills.config import CATALOG_PLATFORMS, load_contributor_profiles
 from src.ai.category_classifier import (
     CategoryClassificationError,
     DeepSeekCategoryClassifier,
@@ -42,10 +42,6 @@ if TYPE_CHECKING:
 
 _logger = logging.getLogger(__name__)
 settings = get_settings()
-
-# catalog 仓库的三个渠道（按 skill_repos.platform 判定）；用于「同步删除」时
-# 识别哪些仓库属于 openEuler-skills catalog 登记、可从删除同步中清理。
-CATALOG_PLATFORMS = ("community", "enterprise", "personal")
 
 
 class SkillRepositoryRequest(BaseModel):
