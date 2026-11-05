@@ -100,6 +100,8 @@ class DiscoverScheduler:
         self._config = config
         self._running = False
         self._task: asyncio.Task[None] | None = None
+        # 首轮扫描结束信号：供依赖 discover 首轮完成的后台任务（如 LLM 审核）等待。
+        self.first_round_done = asyncio.Event()
 
     def _check_interval_args(self) -> str:
         """校验 interval / weekday 配置，返回规范化后的 interval。"""
@@ -151,6 +153,10 @@ class DiscoverScheduler:
             except Exception:
                 # 单轮整体异常不应终止调度循环，记录后等待下一个调度点
                 logger.exception("%s round failed", LOG_PREFIX)
+            finally:
+                # 首轮（无论成功/异常/被取消）一旦结束即释放等待者；
+                # Event.set 幂等，后续每轮重复设置无副作用。
+                self.first_round_done.set()
             if not self._running:
                 return
 
