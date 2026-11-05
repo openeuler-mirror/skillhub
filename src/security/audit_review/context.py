@@ -340,8 +340,18 @@ async def resolve_file(
         return local
 
     remote = await fetch_remote_file(client, target, file, config, tokens, budget)
-    if remote.content is not None and cache is not None:
-        cache.put(cache_key, remote.content)
+    if remote.content is not None:
+        if cache is not None:
+            cache.put(cache_key, remote.content)
+        return remote
+    # 远端未启用时保留本地失败原因：只返回 remote_disabled 会掩盖真正的
+    # 缓存缺失/路径错误，误导排障；远端实际尝试过的失败仍按原样返回。
+    if (
+        remote.reason == "remote_disabled"
+        and local.reason
+        and local.reason != remote.reason
+    ):
+        return ResolvedFile(None, "snippet", f"{local.reason}+{remote.reason}")
     return remote
 
 

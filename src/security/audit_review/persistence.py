@@ -14,7 +14,9 @@ from src.security.audit_review.analysis import _coerce_int
 from src.security.audit_review.apply import ReviewApplication, _merge_context_meta
 from src.security.audit_review.constants import PROMPT_VERSION
 from src.security.audit_review.context import CONTEXT_VERSION
-from src.security.audit_review.log import logger
+from src.security.audit_review.log import get_logger
+
+logger = get_logger("persistence")
 
 
 def report_fingerprint(report: dict[str, Any]) -> str:
@@ -198,6 +200,12 @@ async def record_failure(
                 update(SecurityAudit).where(SecurityAudit.id == audit_id).values(details=details)
             )
             await session.commit()
+            logger.info(
+                "audit=%s recorded failure attempts=%d error_type=%s",
+                audit_id,
+                failed_meta["attempts"],
+                error.split(":", 1)[0],
+            )
     except Exception:
         logger.exception("Failed to record review failure for audit %s", audit_id)
 
@@ -224,5 +232,6 @@ async def mark_skipped(audit_id: Any, reason: str) -> None:
                 update(SecurityAudit).where(SecurityAudit.id == audit_id).values(details=details)
             )
             await session.commit()
+            logger.debug("audit=%s marked skipped reason=%s", audit_id, reason)
     except Exception:
         logger.exception("Failed to mark audit %s as skipped", audit_id)
