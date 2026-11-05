@@ -19,16 +19,6 @@ function getSkillRoutePath(skillId: string): string {
   return `/skills/${encodeURIComponent(skillId)}`
 }
 
-function getSecurityLevel(score: number | null): { label: string; class: string } {
-  if (score === null) return { label: '未检测', class: 'tag-gray' }
-  if (score <= 20) return { label: '安全', class: 'tag-green' }
-  if (score <= 50) return { label: '低风险', class: 'tag-blue' }
-  if (score <= 80) return { label: '中风险', class: 'tag-orange' }
-  return { label: '高风险', class: 'tag-red' }
-}
-
-const securityLevel = computed(() => getSecurityLevel(props.skill.risk_score))
-
 const skillStore = useSkillStore()
 
 // 近7天/近30天排序时显示周期下载量，否则显示累计下载量
@@ -57,7 +47,7 @@ function truncate(text: string | null, length: number): string {
     @click="onClickCard"
   >
     <div class="mb-3">
-      <h3 class="skill-card-title"><span class="title-text">{{ skill.name }}</span><span :class="['tag', securityLevel.class]">{{ securityLevel.label }}</span></h3>
+      <h3 class="skill-card-title"><span class="title-text">{{ skill.name }}</span></h3>
     </div>
 
     <p class="skill-card-desc">{{ truncate(skill.description, 120) }}</p>
