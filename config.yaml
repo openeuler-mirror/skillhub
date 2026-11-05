@@ -150,7 +150,18 @@ audit_llm_review:
   max_attempts: 3                       # 失败重试轮次（跨天累计）
   rpm: 1000
   tpm: 80000
+  # 可观测性：单次 LLM 调用 / 限流等待超过阈值时打 warning（0=关闭）
+  slow_llm_seconds: 30
+  rate_limit_slow_wait_seconds: 30
+  # 每轮结果 JSON 保存目录（空则 storage.local_path/logs）；
+  # 按天数和份数双重保留，超出后自动清理（0=不限制该维度）
+  result_dir: ""
+  result_keep_days: 30
+  result_max_files: 200
 
 logging:
   level: "INFO"
   format: "json"
+  # api.log 轮转：单文件 100MB，保留 5 份（max_bytes=0 关闭轮转）
+  max_bytes: 104857600
+  backup_count: 5

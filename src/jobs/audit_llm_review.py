@@ -25,8 +25,9 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -39,7 +40,13 @@ from src.models.orm import SecurityAudit, Skill, SkillVersion
 from src.security.audit_review.apply import ReviewApplication
 from src.security.audit_review.context import ContextConfig, FileContentCache
 from src.security.audit_review.llm import call_llm_json, post_chat
-from src.security.audit_review.log import logger
+from src.security.audit_review.log import get_logger, reset_run_id, set_run_id
+from src.security.audit_review.metrics import (
+    AuditRecord,
+    RunStats,
+    current_audit,
+    save_run_result,
+)
 from src.security.audit_review.persistence import (
     mark_skipped,
     persist,
@@ -59,6 +66,26 @@ from src.security.audit_review.review import (
     build_partial_meta,
     review_one,
 )
+
+logger = get_logger("scheduler")
+
+
+def _tz_name() -> str:
+    """当前进程生效的本地时区名（由容器 TZ 决定），失败时返回 local。"""
+    try:
+        return datetime.now().astimezone().tzname() or "local"
+    except Exception:  # pragma: no cover - 极端环境缺少 tzinfo
+        return "local"
+
+
+def _format_target(target: datetime) -> str:
+    """把 naive 本地时间格式化为「本地 + UTC」双基准，便于跨时区排查。"""
+    local = target.astimezone()
+    utc = target.astimezone(timezone.utc)
+    return (
+        f"{local:%Y-%m-%d %H:%M} {local.tzname() or 'local'} "
+        f"(UTC {utc:%Y-%m-%d %H:%M})"
+    )
 
 
 class AuditLLMReviewScheduler:
@@ -119,14 +146,28 @@ class AuditLLMReviewScheduler:
         self._running = True
         self._task = asyncio.create_task(self._loop())
         logger.info(
-            "scheduler started (window=%s-%s, model=%s, concurrency=%d, "
-            "max_findings_per_audit=%d, context_mode=%s)",
+            "scheduler started (window=%s-%s %s, model=%s, concurrency=%d, "
+            "max_findings_per_audit=%d, context_mode=%s, rpm=%d, tpm=%d, "
+            "min_confidence=%.2f, min_false_positive_confidence=%.2f/%.2f, "
+            "max_attempts=%d, slow_llm=%.0fs, repo_cache_root=%s, "
+            "remote_fetch=%s, result_dir=%s)",
             self._config.start_time,
             self._config.end_time,
+            _tz_name(),
             self._config.model,
             self._config.concurrency,
             self._config.max_findings_per_audit,
             self._config.context_mode,
+            self._config.rpm,
+            self._config.tpm,
+            self._config.min_confidence,
+            self._config.min_false_positive_confidence,
+            self._config.min_false_positive_confidence_high,
+            self._config.max_attempts,
+            self._config.slow_llm_seconds,
+            self._config.repo_cache_root,
+            self._config.remote_fetch_enabled,
+            self._config.result_dir or "<storage.local_path/logs>",
         )
 
     async def stop(self) -> None:
@@ -149,7 +190,7 @@ class AuditLLMReviewScheduler:
                 target = next_window_start(now, start)
                 logger.info(
                     "Next review window starts at %s (in %.0fs)",
-                    target,
+                    _format_target(target),
                     max(0.0, (target - now).total_seconds()),
                 )
                 await self._sleep_until(target)
@@ -169,12 +210,12 @@ class AuditLLMReviewScheduler:
             if stats.get("stopped") == "no_credentials":
                 # 配置缺失时不空转：直接睡到下一个窗口（配置在进程启动时读取）
                 target = next_window_start(datetime.now(), start)
-                logger.info("Next review window starts at %s", target)
+                logger.info("Next review window starts at %s", _format_target(target))
                 await self._sleep_until(target)
                 continue
             if stats.get("stopped") in {"deadline", "no_work", "error"}:
                 target = next_window_start(datetime.now(), start)
-                logger.info("Next review window starts at %s", target)
+                logger.info("Next review window starts at %s", _format_target(target))
                 await self._sleep_until(target)
                 continue
             await asyncio.sleep(60)
@@ -195,124 +236,233 @@ class AuditLLMReviewScheduler:
         config = self._config
         if not config.base_url or not self._api_key:
             logger.warning("skipped: audit_llm_review.base_url/api_key is not configured")
-            return {"reviewed": 0, "failed": 0, "skipped": 0, "stopped": "no_credentials"}
+            return {
+                "reviewed": 0,
+                "partial": 0,
+                "failed": 0,
+                "skipped": 0,
+                "stopped": "no_credentials",
+            }
 
-        limiter = _RateLimiter(rpm=config.rpm, tpm=config.tpm)
+        run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
+        run_token = set_run_id(run_id)
+        stats = RunStats(run_id=run_id, config=config)
+        run_started = time.monotonic()
+        limiter = _RateLimiter(
+            rpm=config.rpm,
+            tpm=config.tpm,
+            slow_wait_seconds=config.rate_limit_slow_wait_seconds,
+        )
         # 每次多取一些，减少 JSONB 全表过滤的查询次数；实际写库仍按并发度推进
         page_size = max(10, config.concurrency * 10)
-        reviewed = failed = skipped = partial = 0
         consecutive_failures = 0
         # 供应商整体不可用时快速熔断，避免把整个待复核队列都消耗成失败重试
         failure_threshold = max(3, config.concurrency * 3)
         stopped = "no_work"
-        started_at = time.monotonic()
         # 一轮 pass 内用 keyset 游标保证每条审计只处理一次，避免一条超大审计
         # 挤占其他审计；一轮扫完后如果还有剩余且窗口未结束，立即开始下一轮，
         # 因此队列空闲时同一条审计可以在当晚连续推进多个 200 条。
         after: tuple[int, int, int, datetime, Any] | None = None
         pass_index = 1
         pass_base = 0
-
-        timeout = httpx.Timeout(config.timeout, connect=10.0)
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            while True:
-                if deadline is not None and datetime.now() >= deadline:
-                    stopped = "deadline"
-                    break
-                rows = await self._fetch_pending(page_size, after=after)
-                if not rows:
-                    if reviewed + partial > pass_base:
-                        # 本轮有实际推进，重置游标开始下一轮（round-robin）
-                        logger.info(
-                            "pass %d complete: reviewed=%d partial=%d; starting next pass",
-                            pass_index,
-                            reviewed,
-                            partial,
-                        )
-                        pass_index += 1
-                        pass_base = reviewed + partial
-                        after = None
-                        continue
-                    stopped = "no_work"
-                    break
-                after = (
-                    int(rows[-1].get("community_priority") or 0),
-                    int(rows[-1].get("risk_rank") or 0),
-                    int(rows[-1].get("issue_count") or 0),
-                    rows[-1]["audited_at"],
-                    rows[-1]["id"],
-                )
-
-                semaphore = asyncio.Semaphore(max(1, config.concurrency))
-
-                async def _run(
-                    row: dict[str, Any],
-                    _semaphore: asyncio.Semaphore = semaphore,
-                ) -> str:
-                    nonlocal reviewed, failed, skipped, partial, consecutive_failures
-                    async with _semaphore:
-                        if deadline is not None and datetime.now() >= deadline:
-                            return "deadline"
-                        try:
-                            outcome = await self._review_one(
-                                client, limiter, row, deadline=deadline
-                            )
-                        except ReviewDeadlineError:
-                            return "deadline"
-                        except asyncio.CancelledError:
-                            raise
-                        except Exception:
-                            logger.exception("Unexpected review error for audit %s", row.get("id"))
-                            outcome = "failed"
-                        if outcome in {"reviewed", "partial"}:
-                            consecutive_failures = 0
-                            if outcome == "reviewed":
-                                reviewed += 1
-                            else:
-                                partial += 1
-                        elif outcome == "failed":
-                            failed += 1
-                            consecutive_failures += 1
-                        elif outcome == "skipped":
-                            skipped += 1
-                        return outcome
-
-                outcomes = await asyncio.gather(*(_run(row) for row in rows))
-                if outcomes and all(outcome == "deadline" for outcome in outcomes):
-                    stopped = "deadline"
-                    break
-                if consecutive_failures >= failure_threshold:
-                    logger.error(
-                        "circuit breaker tripped after %d consecutive failures; stopping this run",
-                        consecutive_failures,
-                    )
-                    stopped = "error"
-                    break
-                logger.info(
-                    "progress: reviewed=%d partial=%d failed=%d skipped=%d elapsed=%.0fs",
-                    reviewed,
-                    partial,
-                    failed,
-                    skipped,
-                    time.monotonic() - started_at,
-                )
+        # 单轮内的处理序号，用于日志的 [i] 前缀（并发下也能看出推进顺序）
+        sequence = itertools.count(1)
 
         logger.info(
-            "run finished: reviewed=%d partial=%d failed=%d skipped=%d duration=%.0fs stopped=%s",
-            reviewed,
-            partial,
-            failed,
-            skipped,
-            time.monotonic() - started_at,
-            stopped,
+            "run started: id=%s window=%s-%s %s model=%s concurrency=%d "
+            "max_findings_per_audit=%d context_mode=%s",
+            run_id,
+            config.start_time,
+            config.end_time,
+            _tz_name(),
+            config.model,
+            config.concurrency,
+            config.max_findings_per_audit,
+            config.context_mode,
         )
-        return {
-            "reviewed": reviewed,
-            "partial": partial,
-            "failed": failed,
-            "skipped": skipped,
-            "stopped": stopped,
-        }
+
+        timeout = httpx.Timeout(config.timeout, connect=10.0)
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                while True:
+                    if deadline is not None and datetime.now() >= deadline:
+                        stopped = "deadline"
+                        break
+                    rows = await self._fetch_pending(page_size, after=after)
+                    if not rows:
+                        if stats.counters["reviewed"] + stats.counters["partial"] > pass_base:
+                            # 本轮有实际推进，重置游标开始下一轮（round-robin）
+                            logger.info(
+                                "pass %d complete: reviewed=%d partial=%d; starting next pass",
+                                pass_index,
+                                stats.counters["reviewed"],
+                                stats.counters["partial"],
+                            )
+                            pass_index += 1
+                            pass_base = stats.counters["reviewed"] + stats.counters["partial"]
+                            after = None
+                            continue
+                        stopped = "no_work"
+                        break
+                    after = (
+                        int(rows[-1].get("community_priority") or 0),
+                        int(rows[-1].get("risk_rank") or 0),
+                        int(rows[-1].get("issue_count") or 0),
+                        rows[-1]["audited_at"],
+                        rows[-1]["id"],
+                    )
+
+                    semaphore = asyncio.Semaphore(max(1, config.concurrency))
+
+                    async def _run(
+                        row: dict[str, Any],
+                        _semaphore: asyncio.Semaphore = semaphore,
+                    ) -> str:
+                        nonlocal consecutive_failures
+                        position = next(sequence)
+                        async with _semaphore:
+                            if deadline is not None and datetime.now() >= deadline:
+                                return "deadline"
+                            record = AuditRecord(
+                                audit_id=str(row.get("id")),
+                                skill_id=str(
+                                    row.get("skill_skill_id")
+                                    or row.get("version_skill_id")
+                                    or ""
+                                ),
+                                name=str(
+                                    row.get("skill_name")
+                                    or row.get("version_name")
+                                    or ""
+                                ),
+                                risk_level=str(row.get("risk_level") or ""),
+                            )
+                            audit_token = current_audit.set(record)
+                            item_started = time.monotonic()
+                            logger.info(
+                                "[%d] reviewing audit=%s skill=%s name=%s level=%s",
+                                position,
+                                record.audit_id,
+                                record.skill_id or "n/a",
+                                record.name or "n/a",
+                                record.risk_level or "unknown",
+                            )
+                            try:
+                                outcome = await self._review_one(
+                                    client, limiter, row, deadline=deadline
+                                )
+                            except ReviewDeadlineError:
+                                outcome = "deadline"
+                                record.skip_reason = "deadline"
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception as exc:
+                                logger.exception(
+                                    "Unexpected review error for audit %s", record.audit_id
+                                )
+                                outcome = "failed"
+                                record.error = f"{type(exc).__name__}: {exc}"
+                                record.error_type = type(exc).__name__
+                            finally:
+                                record.duration_seconds = time.monotonic() - item_started
+                                current_audit.reset(audit_token)
+                            if outcome in {"reviewed", "partial"}:
+                                consecutive_failures = 0
+                            elif outcome == "failed":
+                                consecutive_failures += 1
+                            if outcome == "skipped" and not record.skip_reason:
+                                record.skip_reason = "persist_discarded"
+                            if outcome == "deadline":
+                                # 窗口关闭导致的主动中断不算处理结果，不进入轮次统计
+                                logger.info(
+                                    "audit=%s outcome=deadline (window closed)",
+                                    record.audit_id,
+                                )
+                                return outcome
+                            record.outcome = outcome
+                            stats.record(record)
+                            logger.info(
+                                "audit=%s outcome=%s skill=%s name=%s issues=%d "
+                                "reviewed=%d confirmed=%d false_positive=%d "
+                                "low_confidence=%d score=%s->%s level=%s->%s "
+                                "duration=%.1fs context=%s llm_calls=%d retries=%d "
+                                "tokens~%d",
+                                record.audit_id,
+                                outcome,
+                                record.skill_id or "n/a",
+                                record.name or "n/a",
+                                record.issues_count,
+                                record.reviewed,
+                                record.confirmed,
+                                record.false_positive,
+                                record.low_confidence,
+                                record.score_before,
+                                record.score_after,
+                                record.level_before or "unknown",
+                                record.level_after or "unknown",
+                                record.duration_seconds,
+                                record.context_source or "n/a",
+                                record.llm_calls,
+                                record.llm_retries,
+                                record.estimated_tokens,
+                            )
+                            return outcome
+
+                    outcomes = await asyncio.gather(*(_run(row) for row in rows))
+                    if outcomes and all(outcome == "deadline" for outcome in outcomes):
+                        stopped = "deadline"
+                        break
+                    if consecutive_failures >= failure_threshold:
+                        logger.error(
+                            "circuit breaker tripped after %d consecutive failures; "
+                            "stopping this run",
+                            consecutive_failures,
+                        )
+                        stopped = "error"
+                        break
+                    stats.apply_limiter_stats(limiter)
+                    logger.info(
+                        "progress: reviewed=%d partial=%d failed=%d skipped=%d "
+                        "rate_limit_wait=%.0fs elapsed=%.0fs",
+                        stats.counters["reviewed"],
+                        stats.counters["partial"],
+                        stats.counters["failed"],
+                        stats.counters["skipped"],
+                        stats.rate_limit_wait_seconds,
+                        time.monotonic() - run_started,
+                    )
+        except asyncio.CancelledError:
+            stats.stopped = "cancelled"
+            reset_run_id(run_token)
+            raise
+        except Exception:
+            stats.stopped = "error"
+            await self._finalize_run(stats, limiter, run_started)
+            reset_run_id(run_token)
+            raise
+
+        stats.stopped = stopped
+        await self._finalize_run(stats, limiter, run_started)
+        reset_run_id(run_token)
+        return stats.summary()
+
+    async def _finalize_run(
+        self,
+        stats: RunStats,
+        limiter: _RateLimiter,
+        run_started: float,
+    ) -> None:
+        """一轮结束：合并限流统计、落盘结果文件并输出汇总日志。"""
+        stats.apply_limiter_stats(limiter)
+        duration = time.monotonic() - run_started
+        result_path = None
+        try:
+            document = stats.document()
+            result_path = await asyncio.to_thread(save_run_result, document, self._config)
+        except Exception:
+            # 结果文件失败只记录，不影响本轮已完成的数据回写
+            logger.exception("failed to save run result")
+        stats.log_summary(duration, result_path)
 
     # ------------------------------------------------------------------
     # 待复核查询
@@ -432,9 +582,20 @@ class AuditLLMReviewScheduler:
             )
             .limit(limit)
         )
+        query_started = time.monotonic()
         async with AsyncSessionLocal() as session:
             result = await session.execute(stmt)
-            return [dict(row._mapping) for row in result]
+            rows = [dict(row._mapping) for row in result]
+        elapsed = time.monotonic() - query_started
+        if elapsed >= 1.0:
+            logger.info(
+                "fetch_pending slow: %.2fs limit=%d rows=%d cursor=%s",
+                elapsed,
+                limit,
+                len(rows),
+                "keyset" if after is not None else "first",
+            )
+        return rows
 
     # ------------------------------------------------------------------
     # 单条审计

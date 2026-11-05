@@ -57,9 +57,13 @@ def make_details() -> dict:
 
 class TestMultiPass:
     @pytest.mark.asyncio
-    async def test_idle_queue_repeats_same_audit_in_one_run(self, monkeypatch):
+    async def test_idle_queue_repeats_same_audit_in_one_run(self, monkeypatch, tmp_path):
         scheduler = AuditLLMReviewScheduler(
-            AuditLLMReviewConfig(api_key="test", max_findings_per_audit=200)
+            AuditLLMReviewConfig(
+                api_key="test",
+                max_findings_per_audit=200,
+                result_dir=str(tmp_path),
+            )
         )
         row = {"id": "audit-1", "audited_at": datetime.now(), "details": make_details()}
         fetch_calls: list[object] = []
