@@ -22,12 +22,6 @@ const providers = computed(() => {
 
 const allCategories = computed(() => skillStore.categories)
 
-const ALL_SECURITY_LEVELS = ['安全', '低风险', '中风险', '高风险']
-
-const securityLevels = computed(() => {
-  return ALL_SECURITY_LEVELS.map(name => ({ name }))
-})
-
 function selectProviderAll() {
   skillStore.setFilter('provider', [])
   skillStore.fetchSkills()
@@ -35,11 +29,6 @@ function selectProviderAll() {
 
 function selectCategoryAll() {
   skillStore.setFilter('category', [])
-  skillStore.fetchSkills()
-}
-
-function selectSecurityLevelAll() {
-  skillStore.setFilter('securityLevel', [])
   skillStore.fetchSkills()
 }
 
@@ -61,15 +50,6 @@ function selectProvider(name: string) {
   if (current.length === 1 && current[0] === name) return
   oaReport('filter_change', { module: 'filter', dim: 'provider', value: name })
   skillStore.setFilter('provider', [name])
-  skillStore.fetchSkills()
-}
-
-function selectSecurityLevel(name: string) {
-  const current = skillStore.filter.securityLevel
-  // 单选语义：再次点击已选中的项保持选中不变
-  if (current.length === 1 && current[0] === name) return
-  oaReport('filter_change', { module: 'filter', dim: 'security_level', value: name })
-  skillStore.setFilter('securityLevel', [name])
   skillStore.fetchSkills()
 }
 
@@ -149,36 +129,6 @@ const hasActiveFilter = computed(() => {
                 </svg>
               </span>
               {{ cat.label || cat.name }}
-            </span>
-          </div>
-        </div>
-      </div>
-
-      <div>
-        <h3 class="filter-section-title">安全等级</h3>
-        <div class="space-y-[1px]">
-          <div
-            class="filter-item"
-            :class="{ 'filter-item-active': skillStore.filter.securityLevel.length === 0 }"
-            @click="selectSecurityLevelAll"
-          >
-            <span class="filter-item-label">
-              <span class="filter-radio" :class="{ 'filter-radio-active': skillStore.filter.securityLevel.length === 0 }">
-              </span>
-              全部
-            </span>
-          </div>
-          <div
-            v-for="level in securityLevels"
-            :key="level.name"
-            class="filter-item"
-            :class="{ 'filter-item-active': skillStore.filter.securityLevel.includes(level.name) }"
-            @click="selectSecurityLevel(level.name)"
-          >
-            <span class="filter-item-label">
-              <span class="filter-radio" :class="{ 'filter-radio-active': skillStore.filter.securityLevel.includes(level.name) }">
-              </span>
-              {{ level.name }}
             </span>
           </div>
         </div>
