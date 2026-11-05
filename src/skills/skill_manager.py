@@ -331,27 +331,42 @@ class SkillManager:
             latest_skills,
             tagged_skills,
         )
-        # Write author back to skill_repos + upsert contributors table
-        # (profile 字段取自 openEuler-skills catalog 各 platform 的 skill.yaml)
-        if author and self.contributor_repository is not None:
-            profile = self._contributor_profile(repo.platform, author)
-            # skill_count 从 skills 表实时聚合该 author 名下全部可见 skill
-            # （含同 author 的其他仓库），避免多仓库 upsert 互相覆盖单仓库扫描值
-            contributor_skill_count = await self.contributor_repository.count_skills(
-                repo.source, author
-            )
-            await self.contributor_repository.upsert(
-                source=repo.source,
-                author=author,
-                platform=repo.platform,
-                repo_url=repo.url,
-                skill_count=contributor_skill_count,
-                name=profile.get('name'),
-                description=profile.get('description'),
-                git_profile=profile.get('git_profile'),
-                website=profile.get('website'),
-                commit=False,
-            )
+        # 逐 skill 聚合 contributor：platform / author / source 取自每个 skill，
+        # 而非仓库级 repo.platform / 单一 author。local_skills 自扫描（仓库级
+        # platform=None）下一个仓库会混合 community/enterprise/personal 多个
+        # 作者，逐 skill 才能让每个贡献者落到正确的 platform（否则个人贡献者
+        # platform 落空，贡献者广场按 platform 过滤时会漏掉）。
+        # profile 字段取自 openEuler-skills catalog 各 platform 的 skill.yaml。
+        if self.contributor_repository is not None and latest_skills:
+            seen_contributors: set[tuple[str, str]] = set()
+            for skill in latest_skills:
+                skill_source = as_optional_str(skill.source)
+                skill_author = as_optional_str(skill.author)
+                skill_platform = as_optional_str(skill.platform)
+                if not skill_source or not skill_author:
+                    continue
+                dedup_key = (skill_source, skill_author)
+                if dedup_key in seen_contributors:
+                    continue
+                seen_contributors.add(dedup_key)
+                profile = self._contributor_profile(skill_platform, skill_author)
+                # skill_count 从 skills 表实时聚合该 author 名下全部可见 skill
+                # （含同 author 的其他仓库），避免多仓库 upsert 互相覆盖单仓库扫描值
+                contributor_skill_count = await self.contributor_repository.count_skills(
+                    skill_source, skill_author
+                )
+                await self.contributor_repository.upsert(
+                    source=skill_source,
+                    author=skill_author,
+                    platform=skill_platform,
+                    repo_url=repo.url,
+                    skill_count=contributor_skill_count,
+                    name=profile.get('name'),
+                    description=profile.get('description'),
+                    git_profile=profile.get('git_profile'),
+                    website=profile.get('website'),
+                    commit=False,
+                )
         repository = await self.skill_repo_repository.update_skill_repository(
             repo.id,
             repository_commit_id=repository_commit_id,
