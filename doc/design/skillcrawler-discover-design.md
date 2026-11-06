@@ -170,8 +170,8 @@ start_scan(...)
 **自动调度**（API 服务内置定时任务：服务启动时按 `discover_scheduler.enabled`
 决定是否拉起，实现见[`src/jobs/discover_scheduler.py`](../../src/jobs/discover_scheduler.py)）：
 
-- **每天 / 每周固定时刻（`discover_scheduler.interval` / `time` / `weekday`）触发一轮
-  全量 discover**（`time` 为 **UTC** 时间，如 `08:00` 即北京时间 16:00）：同步
+- **每天固定时刻（`discover_scheduler.start_time`，按 `timezone` 解释，默认北京时间）
+  触发一轮全量 discover**：同步
   openEuler-skills catalog、构建全部请求，逐仓库调用
   `SkillManager.discover_configured_skill_repository`（与 CLI 相同的执行路径）；
   **服务启动时额外立即执行一轮**（重启后当天触发点已过也不必等下个周期）；

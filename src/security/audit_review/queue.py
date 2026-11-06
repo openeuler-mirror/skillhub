@@ -1,12 +1,10 @@
-"""Client-side rate limiting and daily review window helpers."""
+"""Client-side rate limiting."""
 
 from __future__ import annotations
 
 import asyncio
 import time
 from collections import deque
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
 
 from src.security.audit_review.log import get_logger
 
@@ -69,53 +67,3 @@ class _RateLimiter:
             logger.debug(
                 "rate limit waited %.2fs (rpm=%d, tpm=%d)", waited, self._rpm, self._tpm
             )
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# 时间窗口
-# ═══════════════════════════════════════════════════════════════════════════
-
-# 未显式配置时按北京时间解释复核窗口，避免依赖容器 TZ（线上容器通常为 UTC）
-DEFAULT_WINDOW_TIMEZONE = "Asia/Shanghai"
-
-
-def resolve_timezone(name: str | None) -> ZoneInfo:
-    """解析复核窗口时区；留空时回退默认时区。"""
-    return ZoneInfo((name or DEFAULT_WINDOW_TIMEZONE).strip())
-
-
-def now_in(tz: ZoneInfo) -> datetime:
-    """当前时刻（带配置时区），窗口与截止判断统一用它。"""
-    return datetime.now(tz)
-
-
-def parse_hhmm(value: str) -> tuple[int, int]:
-    parts = str(value).strip().split(":")
-    if len(parts) != 2:
-        raise ValueError(f"Invalid time (expected HH:MM): {value!r}")
-    try:
-        hour, minute = int(parts[0]), int(parts[1])
-    except ValueError as exc:
-        raise ValueError(f"Invalid time (expected HH:MM): {value!r}") from exc
-    if not (0 <= hour <= 23 and 0 <= minute <= 59):
-        raise ValueError(f"Invalid time (expected HH:MM): {value!r}")
-    return hour, minute
-
-
-def resolve_window(
-    now: datetime, start: tuple[int, int], end: tuple[int, int]
-) -> tuple[datetime, datetime] | None:
-    """当前时刻在窗口内时返回 (窗口开始, 窗口结束)，否则返回 None。"""
-    start_at = now.replace(hour=start[0], minute=start[1], second=0, microsecond=0)
-    end_at = now.replace(hour=end[0], minute=end[1], second=0, microsecond=0)
-    if start_at <= now < end_at:
-        return start_at, end_at
-    return None
-
-
-def next_window_start(now: datetime, start: tuple[int, int]) -> datetime:
-    """下一个窗口开始时刻（今天已过则顺延到明天）。"""
-    candidate = now.replace(hour=start[0], minute=start[1], second=0, microsecond=0)
-    if candidate <= now:
-        candidate += timedelta(days=1)
-    return candidate

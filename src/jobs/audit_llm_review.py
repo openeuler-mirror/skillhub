@@ -55,14 +55,14 @@ from src.security.audit_review.persistence import (
     record_failure,
 )
 from src.security.audit_review.prompt import SYSTEM_PROMPT
-from src.security.audit_review.queue import (
-    _RateLimiter,
-    next_window_start,
+from src.core.scheduling import (
+    next_daily,
     now_in,
     parse_hhmm,
     resolve_timezone,
     resolve_window,
 )
+from src.security.audit_review.queue import _RateLimiter
 from src.security.audit_review.remote_raw import RemoteTokens
 from src.security.audit_review.review import (
     ReviewDeadlineError,
@@ -188,7 +188,7 @@ class AuditLLMReviewScheduler:
             now = self._now()
             window = resolve_window(now, start, end)
             if window is None:
-                target = next_window_start(now, start)
+                target = next_daily(now, start)
                 logger.info(
                     "Next review window starts at %s (in %.0fs)",
                     _format_target(target, self._tz),
@@ -210,7 +210,7 @@ class AuditLLMReviewScheduler:
 
             if stats.get("stopped") == "no_credentials":
                 # 配置缺失时不空转：直接睡到下一个窗口（配置在进程启动时读取）
-                target = next_window_start(self._now(), start)
+                target = next_daily(self._now(), start)
                 logger.info(
                     "Next review window starts at %s",
                     _format_target(target, self._tz),
@@ -218,7 +218,7 @@ class AuditLLMReviewScheduler:
                 await self._sleep_until(target)
                 continue
             if stats.get("stopped") in {"deadline", "no_work", "error"}:
-                target = next_window_start(self._now(), start)
+                target = next_daily(self._now(), start)
                 logger.info(
                     "Next review window starts at %s",
                     _format_target(target, self._tz),

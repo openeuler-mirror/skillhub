@@ -136,15 +136,15 @@ class AppConfig(BaseSettings):
 class DiscoverSchedulerConfig(BaseSettings):
     """后台定时 discover 调度配置。
 
-    interval 支持 "daily"（每天）或 "weekly"（每周），触发时刻由 time
-    （UTC HH:MM）决定；weekly 时 weekday 指定星期（mon/tue/wed/
-    thu/fri/sat/sun）。
+    每天在 ``start_time``（按 ``timezone`` 解释，默认北京时间）触发一轮，
+    与容器 TZ 解耦。
     """
 
     enabled: bool = False
-    interval: str = "daily"
-    time: str = "03:00"
-    weekday: str = "sun"
+    # 触发时刻（HH:MM），按 timezone 解释
+    start_time: str = "00:00"
+    # 触发时刻时区；可用 DISCOVER_SCHEDULER__TIMEZONE 覆盖
+    timezone: str = "Asia/Shanghai"
     result_dir: str = ""  # 每轮结果 JSON 保存目录；空则用 storage.local_path/logs
 
 

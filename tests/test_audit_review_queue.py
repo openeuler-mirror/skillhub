@@ -1,11 +1,11 @@
-"""复核时间窗口与限流工具测试。"""
+"""定时时间计算原语测试（共享模块）。"""
 
 from datetime import datetime
 
 import pytest
 
-from src.security.audit_review.queue import (
-    next_window_start,
+from src.core.scheduling import (
+    next_daily,
     parse_hhmm,
     resolve_window,
 )
@@ -29,10 +29,10 @@ class TestWindow:
         assert resolve_window(datetime(2026, 10, 29, 9, 0), (2, 0), (8, 0)) is None
         assert resolve_window(datetime(2026, 10, 29, 1, 59), (2, 0), (8, 0)) is None
 
-    def test_next_window_start(self):
-        assert next_window_start(datetime(2026, 10, 29, 9, 0), (2, 0)) == datetime(
+    def test_next_daily(self):
+        assert next_daily(datetime(2026, 10, 29, 9, 0), (2, 0)) == datetime(
             2026, 10, 30, 2, 0
         )
-        assert next_window_start(datetime(2026, 10, 29, 1, 0), (2, 0)) == datetime(
+        assert next_daily(datetime(2026, 10, 29, 1, 0), (2, 0)) == datetime(
             2026, 10, 29, 2, 0
         )
