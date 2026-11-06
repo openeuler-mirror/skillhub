@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from src.security.audit_review.log import get_logger
+from src.security.audit_review.queue import now_in, resolve_timezone
 
 if TYPE_CHECKING:  # pragma: no cover - 仅用于类型提示
     from src.core.config import AuditLLMReviewConfig
@@ -155,7 +156,8 @@ class RunStats:
     def __init__(self, run_id: str, config: AuditLLMReviewConfig):
         self.run_id = run_id
         self.config = config
-        self.started_at = datetime.now()
+        # 轮次时间与窗口时区保持一致，避免结果文件里出现两种时间基准
+        self.started_at = now_in(resolve_timezone(config.timezone))
         self.counters: dict[str, int] = {
             "reviewed": 0,
             "partial": 0,
@@ -307,7 +309,7 @@ class RunStats:
 
     def document(self, finished_at: datetime | None = None) -> dict[str, Any]:
         """构建结果文件文档；每个统计块内嵌 ``<key>_note`` 说明。"""
-        finished = finished_at or datetime.now()
+        finished = finished_at or now_in(resolve_timezone(self.config.timezone))
         duration = max(0.0, (finished - self.started_at).total_seconds())
         slowest = sorted(
             self.audits, key=lambda item: item.duration_seconds, reverse=True
@@ -323,7 +325,7 @@ class RunStats:
             "window": {
                 "start_time": self.config.start_time,
                 "end_time": self.config.end_time,
-                "timezone": _local_timezone_name(),
+                "timezone": self.config.timezone,
             },
             "model": {
                 "name": self.config.model,
@@ -388,14 +390,6 @@ def _with_notes(data: dict[str, Any], notes: dict[str, str]) -> dict[str, Any]:
         merged[key] = value
         merged[f"{key}_note"] = notes.get(key, "")
     return merged
-
-
-def _local_timezone_name() -> str:
-    """返回本地时区名（容器内由 TZ 决定），失败时返回 local。"""
-    try:
-        return datetime.now().astimezone().tzname() or "local"
-    except Exception:  # pragma: no cover - 极端环境下 tzinfo 缺失
-        return "local"
 
 
 def resolve_result_dir(configured: str) -> Path:

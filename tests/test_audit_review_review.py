@@ -27,6 +27,22 @@ class TestPartialMeta:
         assert meta["attempts"] == 0
         assert meta["prompt_version"] == PROMPT_VERSION
         assert meta["min_confidence"] == 0.6
+        # 元数据时间统一带窗口时区（默认北京时间）
+        assert meta["updated_at"].endswith("+08:00")
+
+    def test_metadata_time_uses_configured_timezone(self):
+        config = AuditLLMReviewConfig(api_key="test", timezone="UTC")
+        meta = build_partial_meta(
+            config,
+            issues_count=1,
+            reviewed_count=1,
+            false_positive_indices=set(),
+            false_positive_reasons=[],
+            low_confidence_indices=set(),
+            low_confidence_reasons=[],
+            started_at=None,
+        )
+        assert meta["updated_at"].endswith("+00:00")
 
     def test_keeps_low_confidence_indices(self):
         config = AuditLLMReviewConfig(api_key="test")

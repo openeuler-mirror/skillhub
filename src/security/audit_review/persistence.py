@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import copy
-from datetime import datetime
 from typing import Any
 
 from sqlalchemy import select, update
@@ -15,6 +14,7 @@ from src.security.audit_review.apply import ReviewApplication, _merge_context_me
 from src.security.audit_review.constants import PROMPT_VERSION
 from src.security.audit_review.context import CONTEXT_VERSION
 from src.security.audit_review.log import get_logger
+from src.security.audit_review.queue import now_in, resolve_timezone
 
 logger = get_logger("persistence")
 
@@ -141,6 +141,7 @@ async def record_failure(
     context_mode: str,
     context_stats: dict[str, Any] | None = None,
     reviewed_count: int | None = None,
+    timezone: str | None = None,
 ) -> None:
     """记录失败次数；超过 max_attempts 后不再自动重试。"""
     try:
@@ -190,7 +191,10 @@ async def record_failure(
                 {
                     "status": "failed",
                     "attempts": attempts + 1,
-                    "updated_at": datetime.now().isoformat(timespec="seconds"),
+                    # 与复核窗口同一时区，时间串带 +08:00，便于跨时区对账
+                    "updated_at": now_in(resolve_timezone(timezone)).isoformat(
+                        timespec="seconds"
+                    ),
                     "model": model,
                     "error": error[:500],
                 }
@@ -210,7 +214,7 @@ async def record_failure(
         logger.exception("Failed to record review failure for audit %s", audit_id)
 
 
-async def mark_skipped(audit_id: Any, reason: str) -> None:
+async def mark_skipped(audit_id: Any, reason: str, *, timezone: str | None = None) -> None:
     try:
         async with AsyncSessionLocal() as session:
             current = (
@@ -226,7 +230,9 @@ async def mark_skipped(audit_id: Any, reason: str) -> None:
             details["llm_review"] = {
                 "status": "skipped",
                 "reason": reason,
-                "updated_at": datetime.now().isoformat(timespec="seconds"),
+                "updated_at": now_in(resolve_timezone(timezone)).isoformat(
+                    timespec="seconds"
+                ),
             }
             await session.execute(
                 update(SecurityAudit).where(SecurityAudit.id == audit_id).values(details=details)
