@@ -41,14 +41,21 @@ from src.security.audit_review.context import (
     select_file_batch,
     split_chunks,
 )
-from src.security.audit_review.log import logger
+from src.security.audit_review.log import get_logger
+from src.security.audit_review.metrics import current_audit
 from src.security.audit_review.prompt import (
     SYSTEM_PROMPT,
     LLMReviewError,
     _match_verdicts,
     build_user_prompt,
 )
-from src.security.audit_review.queue import _RateLimiter
+from src.security.audit_review.queue import (
+    _RateLimiter,
+    now_in,
+    resolve_timezone,
+)
+
+logger = get_logger("review")
 
 
 class ReviewDeadlineError(Exception):
@@ -68,7 +75,8 @@ def build_partial_meta(
     started_at: str | None,
     context_stats: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    now = datetime.now().isoformat(timespec="seconds")
+    # 元数据时间与窗口同一时区，带 +08:00 偏移
+    now = now_in(resolve_timezone(config.timezone)).isoformat(timespec="seconds")
     meta: dict[str, Any] = {
         "status": "partial",
         "model": config.model,
@@ -106,19 +114,29 @@ async def review_one(
     deadline: datetime | None = None,
 ) -> str:
     audit_id = row.get("id")
+    record = current_audit.get()
     raw_details = row.get("details")
     details: dict[str, Any] = raw_details if isinstance(raw_details, dict) else {}
     raw_report = details.get("skillspector_report")
     report: dict[str, Any] = raw_report if isinstance(raw_report, dict) else {}
     raw_issues = report.get("issues")
     issues: list[Any] = raw_issues if isinstance(raw_issues, list) else []
+    if record is not None:
+        record.issues_count = len(issues)
     if not issues:
+        logger.info("audit=%s skipped reason=no_issues", audit_id)
+        if record is not None:
+            record.skip_reason = "no_issues"
         await scheduler._mark_skipped(audit_id, "no_issues")
         return "skipped"
 
     previous = details.get("llm_review")
     previous_meta: dict[str, Any] = previous if isinstance(previous, dict) else {}
     if previous_meta.get("status") in {"completed", "skipped"}:
+        reason = f"already_{previous_meta.get('status')}"
+        logger.info("audit=%s skipped reason=%s", audit_id, reason)
+        if record is not None:
+            record.skip_reason = reason
         return "skipped"
 
     reviewed_count = _coerce_int(previous_meta.get("reviewed_count")) or 0
@@ -168,7 +186,7 @@ async def review_one(
                     }
                 )
     started_at = str(previous_meta.get("started_at") or "") or None
-    if (
+    if previous_meta and (
         previous_meta.get("context_version") != CONTEXT_VERSION
         or previous_meta.get("prompt_version") != PROMPT_VERSION
     ):
@@ -308,6 +326,9 @@ async def review_one(
             # 但截断后的误报仍要按门槛决定是否删除。
             reasons_by_index[index] = reason
             confidence_by_index[index] = verdict.get("confidence")
+            if record is not None:
+                rule = _issue_rule_id(issues[index]) or "unknown"
+                record.false_positive_rules[rule] += 1
             if len(false_positive_reasons) < _MAX_FALSE_POSITIVE_DETAILS:
                 false_positive_reasons.append(
                     {
@@ -343,7 +364,7 @@ async def review_one(
 
     async def process_chunk(chunk: list[int], file_name: str) -> None:
         nonlocal reviewed_count
-        if deadline is not None and datetime.now() >= deadline:
+        if deadline is not None and scheduler._now() >= deadline:
             raise ReviewDeadlineError
         resolved = await resolve_file(
             client,
@@ -354,6 +375,19 @@ async def review_one(
             remote_budget,
             scheduler._file_cache,
         )
+        if record is not None:
+            degraded_reason = (
+                resolved.reason
+                if resolved.source == "snippet" and scheduler._config.context_mode != "snippet"
+                else ""
+            )
+            if record.note_context(resolved.source, degraded_reason):
+                logger.info(
+                    "audit=%s file=%s context degraded to snippet reason=%s",
+                    audit_id,
+                    file_name,
+                    degraded_reason,
+                )
         llm_chunk = list(chunk)
         if any(index in structural_candidates for index in chunk):
             manifest = await load_manifest()
@@ -382,6 +416,19 @@ async def review_one(
                 file=file_name,
             )
             record_context(context_stats, context)
+            if (
+                record is not None
+                and context.mode == "snippet"
+                and scheduler._config.context_mode != "snippet"
+            ):
+                reason = context.reason or "context_unavailable"
+                if record.note_context("snippet", reason):
+                    logger.info(
+                        "audit=%s file=%s context degraded to snippet reason=%s",
+                        audit_id,
+                        file_name,
+                        reason,
+                    )
             prompt = build_user_prompt(
                 skill_name=str(skill_name),
                 skill_description=str(skill_description),
@@ -443,7 +490,10 @@ async def review_one(
         raise
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
-        logger.warning("audit %s review failed: %s", audit_id, error)
+        logger.warning("audit %s review failed: %s", audit_id, error, exc_info=True)
+        if record is not None:
+            record.error = error
+            record.error_type = type(exc).__name__
         await scheduler._record_failure(
             audit_id,
             error,
@@ -452,7 +502,7 @@ async def review_one(
         )
         return "failed"
 
-    reviewed_at = datetime.now().isoformat(timespec="seconds")
+    reviewed_at = scheduler._now().isoformat(timespec="seconds")
     if reviewed_count < len(issues):
         # 本轮达到单条审计上限：保存游标，下一轮窗口从 reviewed_count 继续
         await scheduler._persist_partial(
@@ -477,6 +527,8 @@ async def review_one(
             len(issues),
             remaining,
         )
+        if record is not None:
+            record.reviewed = reviewed_count
         return "partial"
 
     verdicts: dict[int, dict[str, Any]] = {
@@ -522,6 +574,16 @@ async def review_one(
         context_meta=context_stats,
     )
     outcome = await scheduler._persist(row, report, application)
+    if record is not None:
+        meta = application.details.get("llm_review") or {}
+        record.reviewed = application.reviewed
+        record.confirmed = application.confirmed
+        record.false_positive = application.false_positives
+        record.low_confidence = application.low_confidence
+        record.score_before = meta.get("score_before")
+        record.score_after = application.score
+        record.level_before = str(meta.get("risk_level_before") or "")
+        record.level_after = application.risk_level
     if application.details.get("llm_review", {}).get("all_removed"):
         logger.warning(
             "audit=%s all findings removed after review; applied score=%s level=%s",
@@ -529,18 +591,6 @@ async def review_one(
             application.score,
             application.risk_level,
         )
-    logger.info(
-        "audit=%s outcome=%s reviewed=%d confirmed=%d false_positive=%d "
-        "low_confidence=%d score=%s->%s level=%s->%s",
-        audit_id,
-        outcome,
-        application.reviewed,
-        application.confirmed,
-        application.false_positives,
-        application.low_confidence,
-        (application.details.get("llm_review") or {}).get("score_before"),
-        application.score,
-        (application.details.get("llm_review") or {}).get("risk_level_before"),
-        application.risk_level,
-    )
+    # 每条审计的完整结果日志统一由调度器的 _run 输出（含 skill 标识、耗时、
+    # 上下文来源与 LLM 调用统计），此处不再重复打印。
     return outcome

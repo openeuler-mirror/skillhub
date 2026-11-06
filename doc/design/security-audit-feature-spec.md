@@ -164,7 +164,8 @@ collector 不属于 `python skillcrawler/main.py discover` 进程。discover 退
 ### 3.3 后台定时 LLM 复核（误报剔除）
 
 已入库的 SkillSpector 报告可能仍包含大量静态误报。新增的后台任务在每天
-`audit_llm_review.start_time` ~ `end_time`（默认 01:00-08:00，本地时区）窗口内，
+`audit_llm_review.start_time` ~ `end_time`（默认 01:00-08:00，按
+`audit_llm_review.timezone` 解释，默认 `Asia/Shanghai`，与容器 TZ 解耦）窗口内，
 分批对**尚未复核**的审计做 LLM 二次判定：
 
 ```
@@ -250,12 +251,97 @@ AuditLLMReviewScheduler（src/jobs/audit_llm_review.py）
   `context_version` / `context_mode` / `context_blocks_*` / `context_sources_*`。
   partial 记录在 context_version 升级后从头复核，避免旧游标错位。
 
-配置见 `config.yaml` 的 `audit_llm_review` 段：`model` / `base_url` / `api_key`
+配置见 `config.yaml` 的 `audit_llm_review` 段：`start_time` / `end_time` /
+`timezone` 控制窗口，`model` / `base_url` / `api_key`
 留空时复用 `model.providers` 当前 provider（默认 siliconflow / Qwen3.5-4B），
 与分类、翻译共用同一份凭据；需要为复核单独指定模型或 Key 时再通过
 `AUDIT_LLM_REVIEW__MODEL` / `__BASE_URL` / `__API_KEY` 覆盖；全部为空时任务
 自动跳过。请求体复用 `src/ai/llm.build_chat_payload`，仅额外开启
 `response_format=json_object`。
+
+#### 3.3.1 日志字段
+
+复核日志统一由 `src/security/audit_review/log.py` 输出，前缀为
+`[AuditLLMReview] run=<run_id>`；底层 logger 名为
+`src.jobs.audit_llm_review.<scheduler|review|llm|queue|persistence|metrics>`，
+既可按前缀整体过滤，也可按子模块定位。`run_id` 在每轮 `run_once` 开始时生成
+（`YYYYmmdd-HHMMSS`），同一轮的所有日志可用 `grep "run=<run_id>"` 串联。
+
+| 阶段 | 日志字段 | 级别 |
+|------|----------|------|
+| 启动 | `scheduler started (window=01:00-08:00 Asia/Shanghai, model=..., concurrency=..., max_findings_per_audit=..., context_mode=..., rpm/tpm, min_confidence, min_false_positive_confidence(_high), max_attempts, repo_cache_root, remote_fetch, result_dir)` | INFO |
+| 轮次开始 | `run started: id=<run_id> window=<start>-<end> <tz> model=... concurrency=... max_findings_per_audit=... context_mode=...` | INFO |
+| 单条开始 | `[i] reviewing audit=<id> skill=<skill_id> name=<name> level=<risk_level>` | INFO |
+| 单条结束 | `audit=<id> outcome=<reviewed\|partial\|failed\|skipped> skill=... name=... issues=<n> reviewed=<n> confirmed=<n> false_positive=<n> low_confidence=<n> score=<before>-><after> level=<before>-><after> duration=<s> context=<cache\|remote\|snippet> llm_calls=<n> retries=<n> tokens~<n>` | INFO |
+| 轮次进度 | `progress: reviewed=... partial=... failed=... skipped=... rate_limit_wait=<s> elapsed=<s>`，每处理一页输出一次 | INFO |
+| 限流 | `rate limit waited <s> (rpm=..., tpm=...)` | 单次等待 ≥ `rate_limit_slow_wait_seconds` 为 WARNING，否则 DEBUG |
+| LLM 慢调用 | `slow LLM call: <s> (threshold=<s>, tokens~<n>)` | WARNING |
+| LLM 重试 | `LLM retry <i>/<n> after <error>; backoff=<s>` | WARNING |
+| LLM 失败 | `LLM request failed after <n> attempts: <error>`，上层再输出 `audit <id> review failed: ...`（含堆栈） | WARNING |
+| 上下文降级 | `audit=<id> file=<path> context degraded to snippet reason=<reason>`；本地缓存与远端均失败时为组合原因（如 `cache_file_missing+remote_disabled`），便于区分缓存缺失与远端关闭 | INFO |
+| 结果丢弃 | `audit <id> was re-scanned during review; result discarded` / `audit <id> disappeared before persistence` | INFO |
+| 轮次汇总 | `run finished: id=... reviewed=... partial=... failed=... skipped=... total=... duration=... avg=.../audit stopped=<no_work\|deadline\|error> slowest: audit=<id>(<n> issues)=<s>` | INFO |
+| 统计汇总 | `llm stats: calls=... retries=... tokens~... llm_seconds=... slow_calls=... rate_limit_wait=... rate_limit_events=...`；`context stats: sources={...} degraded={...}`；`false positives by rule (top 10): ...`；`skip reasons: {...}` | INFO |
+| 明细 | `failed audit: audit=... skill=... error_type=... error=...`（WARNING）、`skipped audit: ... reason=...`（INFO）；各最多 20 条，超出打印 `truncated` 提示 | WARNING / INFO |
+| 结果文件 | `result saved to <path>` | INFO |
+
+日志落点与 API 其他日志一致：stdout + `<storage.local_path>/logs/api.log`。
+`api.log` 使用 `RotatingFileHandler`，由 `logging.max_bytes`（默认 100MB）与
+`logging.backup_count`（默认 5）控制轮转；`max_bytes=0` 关闭轮转。日志中
+不打印 prompt 与模型响应原文，只记录批大小、token 估算、耗时和错误类型，
+避免把 skill 源码与审计报告写入日志。
+
+#### 3.3.2 每轮结果 JSON
+
+每轮 `run_once` 结束后（`no_work` / `deadline` / `error` 均会落盘）异步写入：
+
+```
+<audit_llm_review.result_dir>/audit-review-<YYYYmmdd-HHMMSS>.json
+```
+
+`result_dir` 留空时写到 `<storage.local_path>/logs`（与 api.log 同目录），
+**不跟随** `discover_scheduler.result_dir`。保留策略由 `result_keep_days`
+（默认 30 天）和 `result_max_files`（默认 200 份）控制，按 mtime 倒序清理，
+`0` 表示关闭对应维度。进程取消（shutdown）时不落盘；落盘失败只记录 warning，
+不影响已经完成的数据回写。
+
+文档结构：
+
+| 字段 | 说明 |
+|------|------|
+| `run_id` | 轮次标识，与日志中的 `run=<id>` 一致 |
+| `started_at` / `finished_at` / `duration_seconds` | 轮次起止时间与耗时 |
+| `stopped` | 结束原因：`no_work` / `deadline` / `error` |
+| `window` | `start_time` / `end_time` / `timezone` |
+| `model` | 模型名、base_url、context_mode、并发、rpm/tpm、单批/单条命中上限、max_attempts、置信度门槛 |
+| `counters` | `reviewed` / `partial` / `failed` / `skipped` / `total`，每个字段旁附 `<key>_note` 说明 |
+| `avg_seconds_per_audit` / `slowest_audits` | 平均单条耗时与最慢 3 条（audit_id、命中数、耗时） |
+| `llm` | 调用次数、重试次数、token 估算、LLM 耗时、慢调用数、限流等待时长/次数（均带 note） |
+| `context` | `sources`（cache/remote/snippet 分布）、`reasons`（降级原因分布，如 `cache_file_missing+remote_disabled`） |
+| `false_positive_rules` | 按规则 ID 统计的误报删除条数，降序 |
+| `skip_reasons` | 跳过原因分布 |
+| `failed_audits` / `skipped_audits` | 明细，最多 50 条；超出时对应 `*_truncated=true` |
+| `audits` | 本轮全部处理记录（不分页），字段见下表 |
+
+`audits[]` 单条记录：
+
+| 字段 | 说明 |
+|------|------|
+| `audit_id` / `skill_id` / `name` / `risk_level` | 审计与 skill 标识 |
+| `issues_count` | 报告命中总数 |
+| `outcome` | `reviewed` / `partial` / `failed` / `skipped` |
+| `reviewed` / `confirmed` / `false_positive` / `low_confidence` | 已复核 / 确认为真 / 误报删除 / 低置信度丢弃条数 |
+| `score_before` / `score_after` / `level_before` / `level_after` | 分数与等级变化；partial 不修改分数，字段为 `null` / `unknown` |
+| `duration_seconds` | 单条审计耗时 |
+| `context_source` / `context_degraded` / `context_degrade_reason` | 最终上下文来源与降级原因 |
+| `llm_calls` / `llm_retries` / `slow_llm_calls` / `estimated_tokens` / `llm_seconds` | 本条审计的 LLM 调用统计 |
+| `error` / `error_type` | 失败详情与异常类型 |
+| `skip_reason` | `no_issues` / `already_completed` / `already_skipped` / `persist_discarded` |
+| `false_positive_rules` | 本条审计按规则 ID 的误报条数 |
+
+统计口径：`total` 是本轮**处理结果数**，不是唯一审计数——同一条审计在
+`partial` 之后于同一轮下一个 pass 继续推进时，会在 `audits` 中出现两条记录。
+`deadline` 导致的主动中断不计入 `counters` 和 `audits`。
 
 ---
 
