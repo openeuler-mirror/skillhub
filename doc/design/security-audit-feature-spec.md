@@ -164,7 +164,8 @@ collector 不属于 `python skillcrawler/main.py discover` 进程。discover 退
 ### 3.3 后台定时 LLM 复核（误报剔除）
 
 已入库的 SkillSpector 报告可能仍包含大量静态误报。新增的后台任务在每天
-`audit_llm_review.start_time` ~ `end_time`（默认 01:00-08:00，本地时区）窗口内，
+`audit_llm_review.start_time` ~ `end_time`（默认 01:00-08:00，按
+`audit_llm_review.timezone` 解释，默认 `Asia/Shanghai`，与容器 TZ 解耦）窗口内，
 分批对**尚未复核**的审计做 LLM 二次判定：
 
 ```
@@ -250,7 +251,8 @@ AuditLLMReviewScheduler（src/jobs/audit_llm_review.py）
   `context_version` / `context_mode` / `context_blocks_*` / `context_sources_*`。
   partial 记录在 context_version 升级后从头复核，避免旧游标错位。
 
-配置见 `config.yaml` 的 `audit_llm_review` 段：`model` / `base_url` / `api_key`
+配置见 `config.yaml` 的 `audit_llm_review` 段：`start_time` / `end_time` /
+`timezone` 控制窗口，`model` / `base_url` / `api_key`
 留空时复用 `model.providers` 当前 provider（默认 siliconflow / Qwen3.5-4B），
 与分类、翻译共用同一份凭据；需要为复核单独指定模型或 Key 时再通过
 `AUDIT_LLM_REVIEW__MODEL` / `__BASE_URL` / `__API_KEY` 覆盖；全部为空时任务
@@ -267,7 +269,7 @@ AuditLLMReviewScheduler（src/jobs/audit_llm_review.py）
 
 | 阶段 | 日志字段 | 级别 |
 |------|----------|------|
-| 启动 | `scheduler started (window=01:00-08:00 CST, model=..., concurrency=..., max_findings_per_audit=..., context_mode=..., rpm/tpm, min_confidence, min_false_positive_confidence(_high), max_attempts, repo_cache_root, remote_fetch, result_dir)` | INFO |
+| 启动 | `scheduler started (window=01:00-08:00 Asia/Shanghai, model=..., concurrency=..., max_findings_per_audit=..., context_mode=..., rpm/tpm, min_confidence, min_false_positive_confidence(_high), max_attempts, repo_cache_root, remote_fetch, result_dir)` | INFO |
 | 轮次开始 | `run started: id=<run_id> window=<start>-<end> <tz> model=... concurrency=... max_findings_per_audit=... context_mode=...` | INFO |
 | 单条开始 | `[i] reviewing audit=<id> skill=<skill_id> name=<name> level=<risk_level>` | INFO |
 | 单条结束 | `audit=<id> outcome=<reviewed\|partial\|failed\|skipped> skill=... name=... issues=<n> reviewed=<n> confirmed=<n> false_positive=<n> low_confidence=<n> score=<before>-><after> level=<before>-><after> duration=<s> context=<cache\|remote\|snippet> llm_calls=<n> retries=<n> tokens~<n>` | INFO |

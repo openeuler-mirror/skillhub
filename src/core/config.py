@@ -151,14 +151,17 @@ class DiscoverSchedulerConfig(BaseSettings):
 class AuditLLMReviewConfig(BaseSettings):
     """后台定时 LLM 复核配置。
 
-    每天在 ``start_time`` ~ ``end_time``（本地时区 HH:MM，容器 TZ 为
-    Asia/Shanghai）窗口内，分批对已入库但尚未复核的 SkillSpector 风险项
-    做误报判定；复核结果回写 security_audits 与 skills/skill_versions。
+    每天在 ``start_time`` ~ ``end_time``（按 ``timezone`` 解释，默认北京时间）
+    窗口内，分批对已入库但尚未复核的 SkillSpector 风险项做误报判定；复核
+    结果回写 security_audits 与 skills/skill_versions。
     """
 
     enabled: bool = False
     start_time: str = "01:00"
     end_time: str = "08:00"
+    # 窗口时区：与容器 TZ 解耦，默认按北京时间解释 start_time/end_time；
+    # 可用 AUDIT_LLM_REVIEW__TIMEZONE 覆盖
+    timezone: str = "Asia/Shanghai"
     # OpenAI 兼容接口。model/base_url/api_key 留空时复用 model.providers
     # 当前 provider（默认 siliconflow / Qwen3.5-4B），避免与主模型配置重复；
     # 需要为复核单独指定模型时再用 AUDIT_LLM_REVIEW__* 覆盖。

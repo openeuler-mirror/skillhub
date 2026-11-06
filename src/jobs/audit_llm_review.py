@@ -29,6 +29,7 @@ import itertools
 import time
 from datetime import datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import httpx
 from sqlalchemy import Integer, and_, case, cast, func, literal, or_, select
@@ -57,7 +58,9 @@ from src.security.audit_review.prompt import SYSTEM_PROMPT
 from src.security.audit_review.queue import (
     _RateLimiter,
     next_window_start,
+    now_in,
     parse_hhmm,
+    resolve_timezone,
     resolve_window,
 )
 from src.security.audit_review.remote_raw import RemoteTokens
@@ -70,17 +73,9 @@ from src.security.audit_review.review import (
 logger = get_logger("scheduler")
 
 
-def _tz_name() -> str:
-    """当前进程生效的本地时区名（由容器 TZ 决定），失败时返回 local。"""
-    try:
-        return datetime.now().astimezone().tzname() or "local"
-    except Exception:  # pragma: no cover - 极端环境缺少 tzinfo
-        return "local"
-
-
-def _format_target(target: datetime) -> str:
-    """把 naive 本地时间格式化为「本地 + UTC」双基准，便于跨时区排查。"""
-    local = target.astimezone()
+def _format_target(target: datetime, tz: ZoneInfo) -> str:
+    """把带配置时区的时刻格式化为「窗口时区 + UTC」双基准，便于跨时区排查。"""
+    local = target.astimezone(tz)
     utc = target.astimezone(timezone.utc)
     return (
         f"{local:%Y-%m-%d %H:%M} {local.tzname() or 'local'} "
@@ -99,6 +94,8 @@ class AuditLLMReviewScheduler:
         config = _resolve_review_config(config, get_settings())
         self._config = config
         self._api_key = config.api_key
+        # 窗口时区独立配置，避免容器 TZ（线上通常为 UTC）影响复核窗口
+        self._tz = resolve_timezone(config.timezone)
         self._context_config = ContextConfig(
             mode=config.context_mode,
             window_lines=config.window_lines,
@@ -129,6 +126,10 @@ class AuditLLMReviewScheduler:
     # 生命周期
     # ------------------------------------------------------------------
 
+    def _now(self) -> datetime:
+        """当前时刻（带窗口时区）；窗口与 deadline 判断统一走这里。"""
+        return now_in(self._tz)
+
     def _check_window_args(self) -> tuple[tuple[int, int], tuple[int, int]]:
         start = parse_hhmm(self._config.start_time)
         end = parse_hhmm(self._config.end_time)
@@ -153,7 +154,7 @@ class AuditLLMReviewScheduler:
             "remote_fetch=%s, result_dir=%s)",
             self._config.start_time,
             self._config.end_time,
-            _tz_name(),
+            self._config.timezone,
             self._config.model,
             self._config.concurrency,
             self._config.max_findings_per_audit,
@@ -184,13 +185,13 @@ class AuditLLMReviewScheduler:
     async def _loop(self) -> None:
         start, end = self._check_window_args()
         while self._running:
-            now = datetime.now()
+            now = self._now()
             window = resolve_window(now, start, end)
             if window is None:
                 target = next_window_start(now, start)
                 logger.info(
                     "Next review window starts at %s (in %.0fs)",
-                    _format_target(target),
+                    _format_target(target, self._tz),
                     max(0.0, (target - now).total_seconds()),
                 )
                 await self._sleep_until(target)
@@ -209,20 +210,26 @@ class AuditLLMReviewScheduler:
 
             if stats.get("stopped") == "no_credentials":
                 # 配置缺失时不空转：直接睡到下一个窗口（配置在进程启动时读取）
-                target = next_window_start(datetime.now(), start)
-                logger.info("Next review window starts at %s", _format_target(target))
+                target = next_window_start(self._now(), start)
+                logger.info(
+                    "Next review window starts at %s",
+                    _format_target(target, self._tz),
+                )
                 await self._sleep_until(target)
                 continue
             if stats.get("stopped") in {"deadline", "no_work", "error"}:
-                target = next_window_start(datetime.now(), start)
-                logger.info("Next review window starts at %s", _format_target(target))
+                target = next_window_start(self._now(), start)
+                logger.info(
+                    "Next review window starts at %s",
+                    _format_target(target, self._tz),
+                )
                 await self._sleep_until(target)
                 continue
             await asyncio.sleep(60)
 
     async def _sleep_until(self, target: datetime) -> None:
         while self._running:
-            remaining = (target - datetime.now()).total_seconds()
+            remaining = (target - self._now()).total_seconds()
             if remaining <= 0:
                 return
             await asyncio.sleep(min(remaining, 3600.0))
@@ -244,7 +251,8 @@ class AuditLLMReviewScheduler:
                 "stopped": "no_credentials",
             }
 
-        run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
+        # run_id 与窗口同一时区，日志里看到的批次时间即北京时间
+        run_id = self._now().strftime("%Y%m%d-%H%M%S")
         run_token = set_run_id(run_id)
         stats = RunStats(run_id=run_id, config=config)
         run_started = time.monotonic()
@@ -274,7 +282,7 @@ class AuditLLMReviewScheduler:
             run_id,
             config.start_time,
             config.end_time,
-            _tz_name(),
+            config.timezone,
             config.model,
             config.concurrency,
             config.max_findings_per_audit,
@@ -285,7 +293,7 @@ class AuditLLMReviewScheduler:
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
                 while True:
-                    if deadline is not None and datetime.now() >= deadline:
+                    if deadline is not None and self._now() >= deadline:
                         stopped = "deadline"
                         break
                     rows = await self._fetch_pending(page_size, after=after)
@@ -321,7 +329,7 @@ class AuditLLMReviewScheduler:
                         nonlocal consecutive_failures
                         position = next(sequence)
                         async with _semaphore:
-                            if deadline is not None and datetime.now() >= deadline:
+                            if deadline is not None and self._now() >= deadline:
                                 return "deadline"
                             record = AuditRecord(
                                 audit_id=str(row.get("id")),
@@ -696,10 +704,11 @@ class AuditLLMReviewScheduler:
             context_mode=self._config.context_mode,
             context_stats=context_stats,
             reviewed_count=reviewed_count,
+            timezone=self._config.timezone,
         )
 
     async def _mark_skipped(self, audit_id: Any, reason: str) -> None:
-        await mark_skipped(audit_id, reason)
+        await mark_skipped(audit_id, reason, timezone=self._config.timezone)
 
 
 def _resolve_review_config(

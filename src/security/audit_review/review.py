@@ -49,7 +49,11 @@ from src.security.audit_review.prompt import (
     _match_verdicts,
     build_user_prompt,
 )
-from src.security.audit_review.queue import _RateLimiter
+from src.security.audit_review.queue import (
+    _RateLimiter,
+    now_in,
+    resolve_timezone,
+)
 
 logger = get_logger("review")
 
@@ -71,7 +75,8 @@ def build_partial_meta(
     started_at: str | None,
     context_stats: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    now = datetime.now().isoformat(timespec="seconds")
+    # 元数据时间与窗口同一时区，带 +08:00 偏移
+    now = now_in(resolve_timezone(config.timezone)).isoformat(timespec="seconds")
     meta: dict[str, Any] = {
         "status": "partial",
         "model": config.model,
@@ -359,7 +364,7 @@ async def review_one(
 
     async def process_chunk(chunk: list[int], file_name: str) -> None:
         nonlocal reviewed_count
-        if deadline is not None and datetime.now() >= deadline:
+        if deadline is not None and scheduler._now() >= deadline:
             raise ReviewDeadlineError
         resolved = await resolve_file(
             client,
@@ -497,7 +502,7 @@ async def review_one(
         )
         return "failed"
 
-    reviewed_at = datetime.now().isoformat(timespec="seconds")
+    reviewed_at = scheduler._now().isoformat(timespec="seconds")
     if reviewed_count < len(issues):
         # 本轮达到单条审计上限：保存游标，下一轮窗口从 reviewed_count 继续
         await scheduler._persist_partial(

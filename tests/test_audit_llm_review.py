@@ -81,7 +81,7 @@ class TestMultiPass:
         monkeypatch.setattr(scheduler, "_fetch_pending", fake_fetch)
         monkeypatch.setattr(scheduler, "_review_one", fake_review)
 
-        stats = await scheduler.run_once(deadline=datetime.now() + timedelta(seconds=60))
+        stats = await scheduler.run_once(deadline=scheduler._now() + timedelta(seconds=60))
 
         # 队列空闲时同一审计连续推进了两轮，而不是等下一个晚上
         assert stats["partial"] == 2
@@ -150,7 +150,7 @@ class TestDeadline:
                 None,
                 _RateLimiter(rpm=0, tpm=0),
                 row,
-                deadline=datetime(2020, 1, 1),
+                deadline=scheduler._now() - timedelta(days=1),
             )
 
 
@@ -219,6 +219,7 @@ class TestConfig:
         assert config.enabled is False
         assert config.start_time == "01:00"
         assert config.end_time == "08:00"
+        assert config.timezone == "Asia/Shanghai"
         assert config.model == ""
         assert config.base_url == ""
         assert config.max_findings_per_audit == 200
@@ -230,6 +231,7 @@ class TestConfig:
         assert settings.audit_llm_review.enabled is True
         assert settings.audit_llm_review.start_time == "01:00"
         assert settings.audit_llm_review.end_time == "08:00"
+        assert settings.audit_llm_review.timezone == "Asia/Shanghai"
         # 留空表示复用 model.providers 当前 provider
         assert settings.audit_llm_review.model == ""
         assert settings.audit_llm_review.base_url == ""
@@ -252,3 +254,17 @@ class TestSchedulerWindowValidation:
         )
         with pytest.raises(ValueError):
             scheduler._check_window_args()
+
+
+class TestWindowTimezone:
+    def test_window_clock_ignores_container_tz(self, monkeypatch):
+        # 容器 TZ 为 UTC 时，窗口仍按配置时区（默认北京时间）解释
+        monkeypatch.setenv("TZ", "UTC")
+        scheduler = AuditLLMReviewScheduler(AuditLLMReviewConfig(api_key="test"))
+        assert scheduler._now().utcoffset() == timedelta(hours=8)
+
+    def test_window_clock_follows_configured_timezone(self):
+        scheduler = AuditLLMReviewScheduler(
+            AuditLLMReviewConfig(api_key="test", timezone="UTC")
+        )
+        assert scheduler._now().utcoffset() == timedelta(0)

@@ -103,18 +103,21 @@ discover_scheduler:
   weekday: "sun"      # 仅 weekly 生效：mon/tue/wed/thu/fri/sat/sun
   result_dir: ""      # 每轮结果 JSON 保存目录；留空则用 storage.local_path/logs
 
-# 后台定时 LLM 复核：每天 01:00-08:00（本地时区，容器 TZ=Asia/Shanghai）
+# 后台定时 LLM 复核：每天 01:00-08:00（按 timezone 解释，默认北京时间，
+# 与容器 TZ 解耦）
 # 在窗口内分批复核未复核过的 SkillSpector 风险项，剔除误报后回写
 # security_audits 与 skills/skill_versions。model/base_url/api_key 留空时
 # 复用 model.providers 当前 provider（默认 siliconflow / Qwen3.5-4B）；
 # 需要单独指定复核模型时再用 AUDIT_LLM_REVIEW__MODEL / __BASE_URL / __API_KEY
 # 覆盖。全部为空时任务自动跳过（仅告警）。
 # 环境变量覆盖示例：AUDIT_LLM_REVIEW__START_TIME=01:00、
+# AUDIT_LLM_REVIEW__TIMEZONE=Asia/Shanghai、
 # AUDIT_LLM_REVIEW__CONCURRENCY=3、AUDIT_LLM_REVIEW__MAX_FINDINGS_PER_AUDIT=200
 audit_llm_review:
   enabled: true
   start_time: "01:00"
   end_time: "08:00"
+  timezone: "Asia/Shanghai"             # 窗口时区（与容器 TZ 无关）
   model: ""                             # 留空复用 model.providers 的模型名
   base_url: ""                          # 留空复用 model.providers 的 base_url
   api_key: ""                           # 留空复用 model.providers 的 key

@@ -6,6 +6,7 @@ import asyncio
 import time
 from collections import deque
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from src.security.audit_review.log import get_logger
 
@@ -73,6 +74,19 @@ class _RateLimiter:
 # ═══════════════════════════════════════════════════════════════════════════
 # 时间窗口
 # ═══════════════════════════════════════════════════════════════════════════
+
+# 未显式配置时按北京时间解释复核窗口，避免依赖容器 TZ（线上容器通常为 UTC）
+DEFAULT_WINDOW_TIMEZONE = "Asia/Shanghai"
+
+
+def resolve_timezone(name: str | None) -> ZoneInfo:
+    """解析复核窗口时区；留空时回退默认时区。"""
+    return ZoneInfo((name or DEFAULT_WINDOW_TIMEZONE).strip())
+
+
+def now_in(tz: ZoneInfo) -> datetime:
+    """当前时刻（带配置时区），窗口与截止判断统一用它。"""
+    return datetime.now(tz)
 
 
 def parse_hhmm(value: str) -> tuple[int, int]:
