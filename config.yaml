@@ -95,13 +95,13 @@ app:
     - "http://127.0.0.1:8080"
 
 # 后台定时 discover：按 openEuler-skills catalog 全量扫描仓库
-# 环境变量覆盖示例：DISCOVER_SCHEDULER__ENABLED=true、DISCOVER_SCHEDULER__INTERVAL=weekly
+# 环境变量覆盖示例：DISCOVER_SCHEDULER__ENABLED=true、DISCOVER_SCHEDULER__START_TIME=16:00、
+# DISCOVER_SCHEDULER__TIMEZONE=Asia/Shanghai
 discover_scheduler:
   enabled: true
-  interval: "daily"   # 二选一： daily：每天 | weekly：每周
-  time: "16:00"       # 触发时刻（UTC HH:MM；UTC+8 下即北京时间 00:00）
-  weekday: "sun"      # 仅 weekly 生效：mon/tue/wed/thu/fri/sat/sun
-  result_dir: ""      # 每轮结果 JSON 保存目录；留空则用 storage.local_path/logs
+  start_time: "00:00"        # 触发时刻（HH:MM，按 timezone 解释）
+  timezone: "Asia/Shanghai"  # 触发时刻时区（与容器 TZ 无关）
+  result_dir: ""             # 每轮结果 JSON 保存目录；留空则用 storage.local_path/logs
 
 # 后台定时 LLM 复核：每天 01:00-08:00（按 timezone 解释，默认北京时间，
 # 与容器 TZ 解耦）

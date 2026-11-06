@@ -14,7 +14,7 @@ from src.security.audit_review.apply import ReviewApplication, _merge_context_me
 from src.security.audit_review.constants import PROMPT_VERSION
 from src.security.audit_review.context import CONTEXT_VERSION
 from src.security.audit_review.log import get_logger
-from src.security.audit_review.queue import now_in, resolve_timezone
+from src.core.scheduling import now_in, resolve_timezone
 
 logger = get_logger("persistence")
 

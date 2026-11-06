@@ -25,6 +25,7 @@ from typing import Any
 
 import httpx
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 
 from src.ai.embedding import generate_embeddings, prepare_skill_text
 from src.core.config import get_settings
@@ -332,6 +333,9 @@ async def embed_missing(batch_size: int = BATCH_SIZE) -> ReindexStats:
         )
         if not locked.scalar():
             raise LockBusyError("embedding reindex lock is held by another task")
+        # 会话级 advisory lock 非事务性，提交即结束事务；否则该连接会在整个
+        # 长耗时 backfill 期间保持 idle-in-transaction，被服务端超时杀死。
+        await lock_session.commit()
         try:
             stats = ReindexStats()
             await _run_batches(
@@ -351,9 +355,18 @@ async def embed_missing(batch_size: int = BATCH_SIZE) -> ReindexStats:
             )
             return stats
         finally:
-            await lock_session.execute(
-                text("SELECT pg_advisory_unlock(:key)"), {"key": _REINDEX_LOCK_KEY}
-            )
+            # 断开会话会自动释放 advisory lock；若连接在长任务期间已被服务端
+            # 关闭，主动解锁会抛 InterfaceError，吞掉以免掩盖真实统计结果。
+            try:
+                await lock_session.execute(
+                    text("SELECT pg_advisory_unlock(:key)"), {"key": _REINDEX_LOCK_KEY}
+                )
+                await lock_session.commit()
+            except SQLAlchemyError:
+                logger.warning(
+                    "%s advisory unlock skipped (connection already closed)",
+                    LOG_PREFIX,
+                )
 
 
 async def reindex_skill(skill_id: str) -> ReindexStats:
@@ -364,6 +377,7 @@ async def reindex_skill(skill_id: str) -> ReindexStats:
         )
         if not locked.scalar():
             raise LockBusyError("embedding reindex lock is held by another task")
+        await lock_session.commit()
         try:
             target = await _fetch_target(skill_id)
             if target is None:
@@ -391,9 +405,18 @@ async def reindex_skill(skill_id: str) -> ReindexStats:
                 )
             return stats
         finally:
-            await lock_session.execute(
-                text("SELECT pg_advisory_unlock(:key)"), {"key": _REINDEX_LOCK_KEY}
-            )
+            # 断开会话会自动释放 advisory lock；若连接在长任务期间已被服务端
+            # 关闭，主动解锁会抛 InterfaceError，吞掉以免掩盖真实统计结果。
+            try:
+                await lock_session.execute(
+                    text("SELECT pg_advisory_unlock(:key)"), {"key": _REINDEX_LOCK_KEY}
+                )
+                await lock_session.commit()
+            except SQLAlchemyError:
+                logger.warning(
+                    "%s advisory unlock skipped (connection already closed)",
+                    LOG_PREFIX,
+                )
 
 
 async def reindex_all(batch_size: int = BATCH_SIZE, progress_cb=None) -> ReindexStats:
@@ -407,6 +430,7 @@ async def reindex_all(batch_size: int = BATCH_SIZE, progress_cb=None) -> Reindex
         )
         if not locked.scalar():
             raise LockBusyError("embedding reindex lock is held by another task")
+        await lock_session.commit()
         try:
             stats = ReindexStats()
             await _run_batches(
@@ -428,6 +452,15 @@ async def reindex_all(batch_size: int = BATCH_SIZE, progress_cb=None) -> Reindex
             stats.stale_skipped += tail.stale_skipped
             return stats
         finally:
-            await lock_session.execute(
-                text("SELECT pg_advisory_unlock(:key)"), {"key": _REINDEX_LOCK_KEY}
-            )
+            # 断开会话会自动释放 advisory lock；若连接在长任务期间已被服务端
+            # 关闭，主动解锁会抛 InterfaceError，吞掉以免掩盖真实统计结果。
+            try:
+                await lock_session.execute(
+                    text("SELECT pg_advisory_unlock(:key)"), {"key": _REINDEX_LOCK_KEY}
+                )
+                await lock_session.commit()
+            except SQLAlchemyError:
+                logger.warning(
+                    "%s advisory unlock skipped (connection already closed)",
+                    LOG_PREFIX,
+                )

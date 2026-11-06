@@ -10,7 +10,8 @@ from src.jobs.audit_llm_review import (
     AuditLLMReviewScheduler,
     ReviewDeadlineError,
 )
-from src.security.audit_review.queue import _RateLimiter, parse_hhmm
+from src.core.scheduling import parse_hhmm
+from src.security.audit_review.queue import _RateLimiter
 
 
 def make_details() -> dict:

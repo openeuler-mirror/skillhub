@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from src.security.audit_review.log import get_logger
-from src.security.audit_review.queue import now_in, resolve_timezone
+from src.core.scheduling import now_in, resolve_timezone
 
 if TYPE_CHECKING:  # pragma: no cover - 仅用于类型提示
     from src.core.config import AuditLLMReviewConfig

@@ -1,7 +1,8 @@
 """后台定时 discover 调度器。
 
 服务启动时立即执行一轮 discover，并按 DiscoverSchedulerConfig
-（config.yaml 的 discover_scheduler 段）在每天或每周的固定时刻再触发：
+（config.yaml 的 discover_scheduler 段）在每天固定时刻（start_time 按
+timezone 解释）再触发：
 读取 openEuler-skills catalog 中的仓库配置，逐仓库执行
 SkillManager.discover_configured_skill_repository。
 
@@ -14,10 +15,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from src.core.scheduling import next_daily, now_in, parse_hhmm, resolve_timezone
 from src.skills.skill_manager import SkillManager
 from src.skills.discover_requests import build_configured_discover_requests
 from src.skills.discover_result import (
@@ -34,59 +36,10 @@ from src.models.repository import ContributorRepository, SkillRepoRepository, Sk
 logger = logging.getLogger(__name__)
 LOG_PREFIX = "[Discover]"
 
-WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
-# 北京时间（UTC+8）：调度配置与计算统一按 UTC，日志换算成北京时间展示
-BEIJING_TZ = timezone(timedelta(hours=8))
-
-
 # security_audits 中「异步检测仍在进行」的判定条件等共享定义见
 # skillcrawler/main.py（collect_skill_stats）；结果 JSON 的 counters /
 # skill_stats / remediation_run 构建与 <key>_note 说明同样由该模块提供，
 # CLI 与自动调度共用同一实现，口径完全一致。
-
-
-def _beijing_hhmm(time_str: str) -> str:
-    """把配置里的 UTC HH:MM 换算成北京时间 HH:MM；解析失败时原样返回。"""
-    try:
-        hour, minute = _parse_hhmm(time_str)
-    except ValueError:
-        return time_str
-    return f"{(hour + 8) % 24:02d}:{minute:02d}"
-
-
-def _parse_hhmm(value: str) -> tuple[int, int]:
-    parts = value.strip().split(":")
-    if len(parts) != 2:
-        raise ValueError(f"Invalid time (expected HH:MM): {value!r}")
-    hour, minute = int(parts[0]), int(parts[1])
-    if not (0 <= hour <= 23 and 0 <= minute <= 59):
-        raise ValueError(f"Invalid time (expected HH:MM): {value!r}")
-    return hour, minute
-
-
-def compute_next_run(
-    now: datetime,
-    interval: str,
-    hour: int,
-    minute: int,
-    weekday: str,
-) -> datetime:
-    """计算下一次触发时刻（UTC）。
-
-    daily：今天已过触发点则取明天同一时刻；
-    weekly：取下一个指定 weekday 的触发时刻（今天已过则顺延一周）。
-    """
-    candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    if interval == "weekly":
-        target = WEEKDAYS.index(weekday)
-        days_ahead = (target - now.weekday()) % 7
-        candidate += timedelta(days=days_ahead)
-        if candidate <= now:
-            candidate += timedelta(days=7)
-        return candidate
-    if candidate <= now:
-        candidate += timedelta(days=1)
-    return candidate
 
 
 class DiscoverScheduler:
@@ -100,31 +53,30 @@ class DiscoverScheduler:
         self._config = config
         self._running = False
         self._task: asyncio.Task[None] | None = None
+        # 触发时刻时区：与容器 TZ 解耦，start_time 按它解释
+        self._tz = resolve_timezone(config.timezone)
         # 首轮扫描结束信号：供依赖 discover 首轮完成的后台任务（如 LLM 审核）等待。
         self.first_round_done = asyncio.Event()
 
-    def _check_interval_args(self) -> str:
-        """校验 interval / weekday 配置，返回规范化后的 interval。"""
-        interval = self._config.interval.strip().lower()
-        if interval not in ("daily", "weekly"):
-            raise ValueError(f"discover_scheduler.interval must be daily or weekly, got {interval!r}")
-        if interval == "weekly" and self._config.weekday.strip().lower() not in WEEKDAYS:
-            raise ValueError(f"discover_scheduler.weekday must be one of {WEEKDAYS}, got {self._config.weekday!r}")
-        return interval
+    def _now(self) -> datetime:
+        """当前时刻（带配置时区），触发点计算统一走这里。"""
+        return now_in(self._tz)
+
+    def _check_start_args(self) -> tuple[int, int]:
+        """校验并解析 start_time，返回 (hour, minute)。"""
+        return parse_hhmm(self._config.start_time)
 
     async def start(self) -> None:
         if self._running:
             return
-        interval = self._check_interval_args()
+        self._check_start_args()
         self._running = True
         self._task = asyncio.create_task(self._loop())
         logger.info(
-            "%s scheduler started (interval=%s, trigger=(UTC:%s == 北京时间:%s), weekday=%s)",
+            "%s scheduler started (start_time=%s, timezone=%s)",
             LOG_PREFIX,
-            interval,
-            self._config.time,
-            _beijing_hhmm(self._config.time),
-            self._config.weekday,
+            self._config.start_time,
+            self._config.timezone,
         )
 
     async def stop(self) -> None:
@@ -139,9 +91,7 @@ class DiscoverScheduler:
         logger.info("%s scheduler stopped", LOG_PREFIX)
 
     async def _loop(self) -> None:
-        interval = self._config.interval.strip().lower()
-        hour, minute = _parse_hhmm(self._config.time)
-        weekday = self._config.weekday.strip().lower()
+        start = self._check_start_args()
 
         while self._running:
             # 启动即跑一轮：重启后立即自愈，不必等下个调度点
@@ -160,17 +110,16 @@ class DiscoverScheduler:
             if not self._running:
                 return
 
-            # 触发时刻按 UTC 计算（config.yaml 的 time 为 UTC HH:MM）；
-            # 每轮执行完毕后才计算下一个触发点，克隆扫描耗时较长时下一轮自动顺延
-            next_run = compute_next_run(
-                datetime.now(timezone.utc), interval, hour, minute, weekday,
-            )
-            wait_seconds = (next_run - datetime.now(timezone.utc)).total_seconds()
+            # 触发时刻按 timezone 解释；每轮执行完毕后才计算下一个触发点，
+            # 克隆扫描耗时较长时下一轮自动顺延
+            now = self._now()
+            next_run = next_daily(now, start)
+            wait_seconds = (next_run - now).total_seconds()
             logger.info(
-                "%s next round at %s 北京时间 (UTC %s, in %.0fs)",
+                "%s next round at %s %s (in %.0fs)",
                 LOG_PREFIX,
-                next_run.astimezone(BEIJING_TZ).strftime("%Y-%m-%d %H:%M"),
                 next_run.strftime("%Y-%m-%d %H:%M"),
+                self._tz.key,
                 wait_seconds,
             )
             try:

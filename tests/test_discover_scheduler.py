@@ -7,48 +7,26 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from src.jobs.discover_scheduler import (
-    DiscoverScheduler,
-    compute_next_run,
-)
+from src.jobs.discover_scheduler import DiscoverScheduler
 from src.core.config import DiscoverSchedulerConfig
+from src.core.scheduling import next_daily
 
 
-class TestComputeNextRun:
-    def test_daily_before_trigger_time_today(self):
-        now = datetime(2026, 8, 28, 1, 30)  # 周五
-        nxt = compute_next_run(now, "daily", 3, 0, "sun")
+class TestNextDaily:
+    def test_before_trigger_time_today(self):
+        now = datetime(2026, 8, 28, 1, 30)
+        nxt = next_daily(now, (3, 0))
         assert nxt == datetime(2026, 8, 28, 3, 0)
 
-    def test_daily_after_trigger_time_rolls_to_tomorrow(self):
+    def test_after_trigger_time_rolls_to_tomorrow(self):
         now = datetime(2026, 8, 28, 4, 0)
-        nxt = compute_next_run(now, "daily", 3, 0, "sun")
+        nxt = next_daily(now, (3, 0))
         assert nxt == datetime(2026, 8, 29, 3, 0)
 
-    def test_daily_at_exact_trigger_time_rolls_to_tomorrow(self):
+    def test_at_exact_trigger_time_rolls_to_tomorrow(self):
         now = datetime(2026, 8, 28, 3, 0, 0, 1)
-        nxt = compute_next_run(now, "daily", 3, 0, "sun")
+        nxt = next_daily(now, (3, 0))
         assert nxt == datetime(2026, 8, 29, 3, 0)
-
-    def test_weekly_same_day_before_time(self):
-        now = datetime(2026, 8, 28, 1, 0)  # 周五
-        nxt = compute_next_run(now, "weekly", 3, 0, "fri")
-        assert nxt == datetime(2026, 8, 28, 3, 0)
-
-    def test_weekly_same_day_after_time_rolls_to_next_week(self):
-        now = datetime(2026, 8, 28, 4, 0)  # 周五
-        nxt = compute_next_run(now, "weekly", 3, 0, "fri")
-        assert nxt == datetime(2026, 9, 4, 3, 0)  # 下周五
-
-    def test_weekly_later_weekday_in_same_week(self):
-        now = datetime(2026, 8, 28, 4, 0)  # 周五
-        nxt = compute_next_run(now, "weekly", 3, 0, "sat")
-        assert nxt == datetime(2026, 8, 29, 3, 0)  # 周六
-
-    def test_weekly_earlier_weekday_in_next_week(self):
-        now = datetime(2026, 8, 28, 4, 0)  # 周五
-        nxt = compute_next_run(now, "weekly", 3, 0, "mon")
-        assert nxt == datetime(2026, 8, 31, 3, 0)  # 下周一
 
 
 class TestConfigIntegration:
@@ -57,9 +35,8 @@ class TestConfigIntegration:
 
         settings = Settings()
         assert settings.discover_scheduler.enabled is False
-        assert settings.discover_scheduler.interval == "daily"
-        assert settings.discover_scheduler.time == "03:00"
-        assert settings.discover_scheduler.weekday == "sun"
+        assert settings.discover_scheduler.start_time == "03:00"
+        assert settings.discover_scheduler.timezone == "Asia/Shanghai"
 
     def test_config_yaml_section_parsed(self):
         # 验证 from_yaml 的解析路径；不绑定 config.yaml 的具体取值
@@ -70,24 +47,13 @@ class TestConfigIntegration:
 
         settings = Settings.from_yaml("config.yaml")
         assert isinstance(settings.discover_scheduler.enabled, bool)
-        assert settings.discover_scheduler.interval in ("daily", "weekly")
-        assert re.fullmatch(r"\d{2}:\d{2}", settings.discover_scheduler.time)
-        assert settings.discover_scheduler.weekday in (
-            "mon", "tue", "wed", "thu", "fri", "sat", "sun",
-        )
+        assert re.fullmatch(r"\d{2}:\d{2}", settings.discover_scheduler.start_time)
+        assert settings.discover_scheduler.timezone
 
-    def test_invalid_interval_rejected_on_start(self):
-        config = DiscoverSchedulerConfig(enabled=True, interval="hourly")
+    def test_invalid_start_time_rejected_on_start(self):
+        config = DiscoverSchedulerConfig(enabled=True, start_time="25:00")
         scheduler = DiscoverScheduler(config)
-        with pytest.raises(ValueError, match="daily or weekly"):
-            import asyncio
-
-            asyncio.run(scheduler.start())
-
-    def test_invalid_weekday_rejected_on_start(self):
-        config = DiscoverSchedulerConfig(enabled=True, interval="weekly", weekday="funday")
-        scheduler = DiscoverScheduler(config)
-        with pytest.raises(ValueError, match="weekday"):
+        with pytest.raises(ValueError, match="HH:MM"):
             import asyncio
 
             asyncio.run(scheduler.start())
@@ -374,7 +340,7 @@ class TestRunDiscoverOnce:
 class TestSchedulerLoop:
     async def test_loop_runs_immediately_then_at_scheduled_time(self):
         """启动即跑一轮，之后睡眠到调度点再跑；run 完才计算下一个触发点。"""
-        config = DiscoverSchedulerConfig(enabled=True, interval="daily", time="03:00")
+        config = DiscoverSchedulerConfig(enabled=True, start_time="03:00")
         scheduler = DiscoverScheduler(config)
 
         calls = []
@@ -391,11 +357,9 @@ class TestSchedulerLoop:
         fixed_now = datetime(2026, 8, 28, 1, 0)
         with (
             patch("src.jobs.discover_scheduler.asyncio.sleep", fake_sleep),
-            patch("src.jobs.discover_scheduler.datetime") as dt_mock,
+            patch.object(DiscoverScheduler, "_now", new=lambda self: fixed_now),
             patch.object(DiscoverScheduler, "run_discover_once", fake_run),
         ):
-            dt_mock.now.return_value = fixed_now
-            dt_mock.side_effect = lambda *a, **k: datetime(*a, **k)
             scheduler._running = True  # 直接驱动 _loop（不经 start() 创建 task）
             await scheduler._loop()
 

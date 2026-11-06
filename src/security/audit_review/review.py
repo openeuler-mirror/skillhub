@@ -49,11 +49,8 @@ from src.security.audit_review.prompt import (
     _match_verdicts,
     build_user_prompt,
 )
-from src.security.audit_review.queue import (
-    _RateLimiter,
-    now_in,
-    resolve_timezone,
-)
+from src.core.scheduling import now_in, resolve_timezone
+from src.security.audit_review.queue import _RateLimiter
 
 logger = get_logger("review")
 
