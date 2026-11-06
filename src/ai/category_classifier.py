@@ -6,13 +6,31 @@ import time
 from pathlib import Path
 
 import httpx
+import yaml
 
-from skillcrawler.config import load_skill_categories
 from src.ai.llm import chat_completion_sync
 from src.core.config import get_settings
 
 _logger = logging.getLogger(__name__)
 settings = get_settings()
+
+
+def load_skill_categories(repository_path: Path | None = None) -> list[str]:
+    """Read category names from ``templates/skill-spec.yaml`` in the catalog."""
+    if repository_path is None:
+        # catalog 未给定时惰性同步 openEuler-skills 仓库
+        # （正常路径由扫描器传入 repository_path）
+        from src.skills.config import sync_openEuler_skills_repo
+
+        repository_path = sync_openEuler_skills_repo()
+    spec_path = repository_path.expanduser() / "templates" / "skill-spec.yaml"
+    if not spec_path.exists():
+        raise FileNotFoundError(f"Skill spec not found: {spec_path}")
+    with spec_path.open("r", encoding="utf-8") as fh:
+        data = yaml.safe_load(fh) or {}
+    categories = data.get("categories", []) if isinstance(data, dict) else []
+    return [str(item).strip() for item in categories if str(item).strip()] if isinstance(categories, list) else []
+
 
 # 网络抖动（读超时/连接重置/5xx/429）的重试次数与间隔；重试耗尽后降级
 # 沿用 frontmatter category 而不是把整仓扫描打挂
@@ -59,7 +77,19 @@ class DeepSeekCategoryClassifier:
         for attempt in range(1, CATEGORY_RETRY_ATTEMPTS + 1):
             try:
                 response_text = self._call_deepseek(prompt)
-                return self._normalize_category(response_text)
+                category = self._normalize_category(response_text)
+                if category is not None:
+                    _logger.info(
+                        "DeepSeek category classification success for %s: %s",
+                        skill_file, category,
+                    )
+                else:
+                    _logger.warning(
+                        "DeepSeek category classification returned unrecognized "
+                        "value for %s: %r",
+                        skill_file, response_text,
+                    )
+                return category
             except Exception as exc:
                 if not self._is_transient_error(exc):
                     message = f"DeepSeek category classification failed for {skill_file}: {exc}"

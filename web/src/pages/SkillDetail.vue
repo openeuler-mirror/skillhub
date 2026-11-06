@@ -165,13 +165,13 @@ async function copyMarkdownCode(e: MouseEvent) {
   }
 }
 
-// riskClass/arcColor 仅用于右侧风险评估卡片；class 沿用全局 tag-*（顶部信息卡片）
-function getSecurityLevel(score: number | null): { label: string; class: string; riskClass: string; arcColor: string; desc: string } {
-  if (score === null) return { label: '未检测', class: 'tag-gray', riskClass: 'risk-gray', arcColor: '', desc: '暂无风险评估数据' }
-  if (score <= 20) return { label: '安全', class: 'tag-green', riskClass: 'risk-green', arcColor: 'var(--o-color-success1)', desc: '无显著风险，可以放心使用' }
-  if (score <= 50) return { label: '低风险', class: 'tag-blue', riskClass: 'risk-blue', arcColor: '#497AF8', desc: '风险较低，可以正常使用' }
-  if (score <= 80) return { label: '中风险', class: 'tag-orange', riskClass: 'risk-orange', arcColor: 'var(--o-color-warning1)', desc: '存在一定风险，建议谨慎使用' }
-  return { label: '高风险', class: 'tag-red', riskClass: 'risk-red', arcColor: 'var(--o-color-danger1)', desc: '存在较严重问题，不建议直接安装' }
+// riskClass/arcColor 用于右侧风险评估卡片
+function getSecurityLevel(score: number | null): { label: string; riskClass: string; arcColor: string; desc: string } {
+  if (score === null) return { label: '未检测', riskClass: 'risk-gray', arcColor: '', desc: '暂无扫描结果' }
+  if (score <= 20) return { label: '安全', riskClass: 'risk-green', arcColor: 'var(--o-color-success1)', desc: 'SkillSpector 得分 0–20，处于安全区间' }
+  if (score <= 50) return { label: '低风险', riskClass: 'risk-blue', arcColor: '#497AF8', desc: 'SkillSpector 得分 21–50，处于低风险区间' }
+  if (score <= 80) return { label: '中风险', riskClass: 'risk-orange', arcColor: 'var(--o-color-warning1)', desc: 'SkillSpector 得分 51–80，处于中风险区间' }
+  return { label: '高风险', riskClass: 'risk-red', arcColor: 'var(--o-color-danger1)', desc: 'SkillSpector 得分 81–100，处于高风险区间' }
 }
 
 const securityLevel = computed(() => getSecurityLevel(skill.value?.risk_score ?? null))
@@ -205,7 +205,7 @@ const riskScoreText = computed(() => {
 // 历史数据可能仍为旧格式 {source_type}/{owner}/{repo}/<path...>，
 // 优先用 source_url 的 SKILL.md 路径确定目录名，确保提示词恒为新格式。
 function toNewSkillId(skillId: string, sourceUrl?: string | null): string {
-  const sourceTypes = ['github', 'gitcode', 'gitlab', 'gitee']
+  const sourceTypes = ['github', 'atomgit', 'gitlab', 'gitee']
   const id = (skillId || '').trim()
   const colon = id.indexOf(':')
   if (colon > 0 && sourceTypes.includes(id.slice(0, colon).toLowerCase())) {
@@ -404,7 +404,6 @@ onMounted(async () => {
           <div class="info-card-hero">
             <div class="skill-title-row">
               <h1 class="skill-name">{{ skill.name }}</h1>
-              <span :class="['tag', securityLevel.class]">{{ securityLevel.label }}</span>
             </div>
             <p class="skill-desc" v-if="skill.description">{{ skill.description }}</p>
 
@@ -595,7 +594,7 @@ onMounted(async () => {
                 >
                   <div class="risk-popover-body">
                     <p class="risk-popover-title">风险评估说明</p>
-                    <p class="risk-popover-desc">综合得分基于 17 个安全维度，加权统计后给出总体安全等级。</p>
+                    <p class="risk-popover-desc">得分基于 NVIDIA SkillSpector 多维扫描加权统计，单项等级不等同总体等级。</p>
                     <div class="risk-popover-row">
                       <span class="risk-popover-label">0-20 分：</span>
                       <span class="risk-tag risk-tag-fixed risk-green">安全</span>

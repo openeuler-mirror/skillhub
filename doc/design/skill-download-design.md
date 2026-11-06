@@ -90,22 +90,22 @@ flowchart TD
 
 ```text
 skill.skill_id:
-gitcode:openeuler/opendesign-components/clean-code
+atomgit:openeuler/opendesign-components/clean-code
 
 skill.source_url:
-https://gitcode.com/openeuler/opendesign-components/blob/master/packages/skills/clean-code/SKILL.md
+https://atomgit.com/openeuler/opendesign-components/blob/master/packages/skills/clean-code/SKILL.md
 
 skill_repo.source:
-gitcode
+atomgit
 
 skill_repo.url:
-https://gitcode.com/openeuler/opendesign-components
+https://atomgit.com/openeuler/opendesign-components
 ```
 
 解析步骤（[downloader.py `resolve_skill_relative_path`](file:///home/wjh/polymind/wittyhub/src/storage/downloader.py#L85-L118)）：
 
 1. 从 `skill_repo.url` 提取 `owner/repo`（如 `openeuler/opendesign-components`）
-2. 拼出前缀 `gitcode:openeuler/opendesign-components/`，校验 `skill_id` 以此前缀开头
+2. 拼出前缀 `atomgit:openeuler/opendesign-components/`，校验 `skill_id` 以此前缀开头
 3. 遍历 ref 候选列表 `[commit_id, version, branch, 'HEAD', 'master', 'main']`，在 `source_url` 中查找 `/blob/{ref}/` 标记
 4. 截取标记之后的文件路径，去掉末尾 `SKILL.md`，得到相对目录
 
@@ -145,7 +145,7 @@ git -C <skill_repo.local_path> cat-file -e <commit_id>:<skill_relative_path>/SKI
 示例：
 
 ```bash
-git -C /opt/wittyhub/skill-repositories/gitcode.com_openeuler_opendesign-components \
+git -C /opt/wittyhub/skill-repositories/atomgit.com_openeuler_opendesign-components \
   cat-file -e \
   130b99b0145a4c357c9ac760b1834375716fdb01:packages/skills/clean-code/SKILL.md
 ```
@@ -168,7 +168,7 @@ git -C <skill_repo.local_path> \
 本次示例等价为：
 
 ```bash
-git -C /opt/wittyhub/skill-repositories/gitcode.com_openeuler_opendesign-components \
+git -C /opt/wittyhub/skill-repositories/atomgit.com_openeuler_opendesign-components \
   archive \
   --format=zip \
   --prefix=clean-code/ \
@@ -420,7 +420,7 @@ flowchart TD
 | 收益 | 说明 |
 |------|------|
 | 下载内容稳定 | 使用 `commit_id` 锁定索引时的 Git tree |
-| 不依赖远端下载 URL | 不受 GitCode/Gitee/GitHub 归档地址差异影响 |
+| 不依赖远端下载 URL | 不受 AtomGit/Gitee/GitHub 归档地址差异影响 |
 | 只下载单个 Skill | 不把整个仓库传给前端 |
 | 不修改本地工作区 | `git archive` 不需要 checkout |
 | 可复用缓存 | 同一 Skill 同一 commit 后续下载直接返回缓存 ZIP |

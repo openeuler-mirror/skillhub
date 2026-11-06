@@ -29,7 +29,7 @@
 ## 2. 目录结构
 
 ```
-/root/new/wittyhub/
+skillhub/
 ├── .agent/
 │   └── skills/
 │       ├── opendesign-components/   # OpenDesign 46+ 组件使用指南 Skill
@@ -47,11 +47,6 @@
 │   │   ├── api/                     # API 客户端
 │   │   └── styles/                  # 样式
 │   └── ...
-├── tmp/
-│   ├── openEuler-portal/            # openEuler 官网（前端风格参考源）
-│   │   └── app/.vitepress/src-new/  # 新版源码（前端开发参考）
-│   ├── agent-spec/                  # Universal Agent Specification
-│   └── opendesign-skills/           # OpenDesign Skills 完整上游
 ├── deploy/                          # Docker 部署配置
 ├── scripts/                         # 工具脚本
 └── AGENTS.md                        # 本文件（长期记忆）
@@ -61,7 +56,6 @@
 
 | 路径 | 用途 |
 |------|------|
-| `tmp/openEuler-portal/app/.vitepress/src-new/` | **前端风格核心参考源**，包含完整页面、组件、样式实现 |
 | `.agent/skills/opendesign-components/` | OpenDesign 组件库使用指南（46+ 组件详细文档） |
 | `.agent/skills/opendesign-tokens/` | OpenDesign 设计令牌指南（6 套主题 Token） |
 
@@ -70,8 +64,6 @@
 ## 3. 前端开发核心记忆
 
 ### 3.1 风格参考源
-
-前端开发**必须**参考 `tmp/openEuler-portal/app/.vitepress/src-new/` 的风格，包括：
 
 | 维度 | 参考方式 |
 |------|---------|
@@ -85,7 +77,7 @@
 
 ### 3.2 组件编写规范
 
-从 `src-new/` 提取的组件编写规则：
+组件编写规则：
 
 ```
 - 使用 <script setup lang="ts"> + TypeScript interface 定义 Props
@@ -96,7 +88,7 @@
 
 ### 3.3 响应式断点体系
 
-参考 `src-new/assets/style/mixin/screen.scss` 的断点定义：
+断点定义：
 
 | 断点 | 范围 | CSS 写法 |
 |------|------|---------|
@@ -109,7 +101,7 @@ JS 端通过 `useScreen()` composable 获取 `isPhone`、`isPad`、`isLaptop` �
 
 ### 3.4 字体排版系统
 
-参考 `src-new/assets/style/mixin/font.scss` 的 mixin：
+字体排版 mixin：
 
 | Mixin | 用途 | PC 字号/行高 | Pad 字号/行高 |
 |-------|------|-------------|---------------|
@@ -202,7 +194,6 @@ import { OButton, OInput, OIcon, OLink, OCard, OTag, OSelect, ODataTable, ODialo
 |------|-------------|
 | 写/改 Vue 组件 | `opendesign-components`（查询组件 API 和示例） |
 | 查颜色/间距/圆角 token | `opendesign-tokens`（查找 CSS 变量名） |
-| 需要前端风格参考 | 直接查阅 `tmp/openEuler-portal/app/.vitepress/src-new/` |
 | 确认组件 Props/Events | `opendesign-components/references/{组件名}.md` |
 
 ### 5.3 Skills 文件结构
@@ -230,15 +221,13 @@ import { OButton, OInput, OIcon, OLink, OCard, OTag, OSelect, ODataTable, ODialo
 
 1. **理解需求**：检查 `AGENTS.md` 获取项目记忆上下文
 2. **查阅 Skill**：根据场景选择对应的 Skill（opendesign-components / opendesign-tokens）
-3. **参考风格**：查阅 `tmp/openEuler-portal/app/.vitepress/src-new/` 下的对应实现
-4. **编写代码**：遵循 OpenDesign 组件规范和前端风格约定
-5. **自检**：检查是否使用 CSS 变量、是否正确导入组件、是否覆盖了 light/dark 模式
+3. **编写代码**：遵循 OpenDesign 组件规范和前端风格约定
+4. **自检**：检查是否使用 CSS 变量、是否正确导入组件、是否覆盖了 light/dark 模式
 
 ---
 
 ## 7. 红线
 
-- **CRITICAL**: 前端开发必须参考 `tmp/openEuler-portal/app/.vitepress/src-new/` 的风格，包括组件写法、样式体系、布局模式
 - **HIGH**: 有 OpenDesign 组件时禁止使用原生 HTML 替代
 - **HIGH**: 禁止硬编码颜色/间距/字号值，必须使用 CSS 变量
 - **HIGH**: 新增 Vue 组件时必须同时提供 light/dark 模式样式

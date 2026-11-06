@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import subprocess
 import zipfile
 from pathlib import Path
@@ -52,21 +53,21 @@ def _skill(
     source_url: str | None = None,
 ):
     return SimpleNamespace(
-        skill_id=skill_id or "gitcode:openeuler/opendesign-components/clean-code",
+        skill_id=skill_id or "atomgit:openeuler/opendesign-components/clean-code",
         name="clean-code",
         version="1.1.0",
         commit_id=commit_id,
         source_url=(
             source_url
-            or "https://gitcode.com/openeuler/opendesign-components/blob/master/packages/skills/clean-code/SKILL.md"
+            or "https://atomgit.com/openeuler/opendesign-components/blob/master/packages/skills/clean-code/SKILL.md"
         ),
     )
 
 
 def _repository(repository: Path):
     return SimpleNamespace(
-        source="gitcode",
-        url="https://gitcode.com/openeuler/opendesign-components.git",
+        source="atomgit",
+        url="https://atomgit.com/openeuler/opendesign-components.git",
         local_path=str(repository),
         branch="master",
     )
@@ -74,10 +75,10 @@ def _repository(repository: Path):
 
 def test_resolve_skill_relative_path_keeps_nested_directories():
     relative_path = DownloadManager.resolve_skill_relative_path(
-        skill_id="gitcode:openeuler/opendesign-components/clean-code",
-        source="gitcode",
-        repository_url="https://gitcode.com/openeuler/opendesign-components",
-        source_url="https://gitcode.com/openeuler/opendesign-components/blob/master/packages/skills/clean-code/SKILL.md",
+        skill_id="atomgit:openeuler/opendesign-components/clean-code",
+        source="atomgit",
+        repository_url="https://atomgit.com/openeuler/opendesign-components",
+        source_url="https://atomgit.com/openeuler/opendesign-components/blob/master/packages/skills/clean-code/SKILL.md",
         refs=["master"],
     )
 
@@ -87,10 +88,10 @@ def test_resolve_skill_relative_path_keeps_nested_directories():
 def test_resolve_skill_relative_path_rejects_repository_mismatch():
     with pytest.raises(SkillArchiveConflictError):
         DownloadManager.resolve_skill_relative_path(
-            skill_id="gitcode:another/repository/clean-code",
-            source="gitcode",
-            repository_url="https://gitcode.com/openeuler/opendesign-components",
-            source_url="https://gitcode.com/openeuler/opendesign-components/blob/master/packages/skills/clean-code/SKILL.md",
+            skill_id="atomgit:another/repository/clean-code",
+            source="atomgit",
+            repository_url="https://atomgit.com/openeuler/opendesign-components",
+            source_url="https://atomgit.com/openeuler/opendesign-components/blob/master/packages/skills/clean-code/SKILL.md",
             refs=["master"],
         )
 
@@ -98,10 +99,10 @@ def test_resolve_skill_relative_path_rejects_repository_mismatch():
 def test_resolve_skill_relative_path_rejects_parent_traversal():
     with pytest.raises(SkillArchiveConflictError):
         DownloadManager.resolve_skill_relative_path(
-            skill_id="gitcode:openeuler/opendesign-components/clean-code",
-            source="gitcode",
-            repository_url="https://gitcode.com/openeuler/opendesign-components",
-            source_url="https://gitcode.com/openeuler/opendesign-components/blob/master/../secrets/SKILL.md",
+            skill_id="atomgit:openeuler/opendesign-components/clean-code",
+            source="atomgit",
+            repository_url="https://atomgit.com/openeuler/opendesign-components",
+            source_url="https://atomgit.com/openeuler/opendesign-components/blob/master/../secrets/SKILL.md",
             refs=["master"],
         )
 
@@ -119,12 +120,35 @@ def test_create_skill_archive_exports_only_target_skill(tmp_path):
 
     assert archive.filename == "clean-code-1.1.0.zip"
     assert archive.media_type == "application/zip"
+    assert archive.sha256 == hashlib.sha256(archive.path.read_bytes()).hexdigest()
     with zipfile.ZipFile(archive.path) as packaged_skill:
         files = set(packaged_skill.namelist())
     assert "clean-code/SKILL.md" in files
     assert "clean-code/references/guard-clause.md" in files
     assert not any("other-skill" in name for name in files)
     assert not any(".git" in name for name in files)
+
+
+def test_create_skill_archive_hash_is_stable_across_cache_hits(tmp_path):
+    repository, commit_id = _create_git_repository(tmp_path)
+    manager = DownloadManager(storage_path=tmp_path / "storage")
+
+    first = asyncio.run(
+        manager.create_skill_archive(
+            skill=_skill(commit_id),
+            repository=_repository(repository),
+        )
+    )
+    second = asyncio.run(
+        manager.create_skill_archive(
+            skill=_skill(commit_id),
+            repository=_repository(repository),
+        )
+    )
+
+    assert first.sha256 is not None
+    assert second.sha256 == first.sha256
+    assert second.sha256 == hashlib.sha256(second.path.read_bytes()).hexdigest()
 
 
 def test_create_skill_archive_reuses_commit_cache(tmp_path):
@@ -178,8 +202,8 @@ def test_create_skill_archive_reports_missing_skill_at_commit(tmp_path):
             manager.create_skill_archive(
                 skill=_skill(
                     commit_id,
-                    skill_id="gitcode:openeuler/opendesign-components/missing",
-                    source_url="https://gitcode.com/openeuler/opendesign-components/blob/master/packages/skills/missing/SKILL.md",
+                    skill_id="atomgit:openeuler/opendesign-components/missing",
+                    source_url="https://atomgit.com/openeuler/opendesign-components/blob/master/packages/skills/missing/SKILL.md",
                 ),
                 repository=_repository(repository),
             )

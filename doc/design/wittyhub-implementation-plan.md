@@ -14,7 +14,7 @@
 
 ### 1.1 系统定位
 
-WittyHub 是一个去中心化的 Agent/Skill 检索与下载平台。平台本地只存储索引元数据，Skill 内容托管在 GitHub / GitCode / Gitee 等外部仓库，通过 REST API、Web UI 和 CLI 三种方式对外提供服务。
+WittyHub 是一个去中心化的 Agent/Skill 检索与下载平台。平台本地只存储索引元数据，Skill 内容托管在 GitHub / AtomGit / Gitee 等外部仓库，通过 REST API、Web UI 和 CLI 三种方式对外提供服务。
 
 ### 1.2 核心设计原则
 
@@ -55,7 +55,7 @@ graph LR
     end
 
     subgraph 外部系统
-        GH[GitHub / GitCode / Gitee]
+        GH[GitHub / AtomGit / Gitee]
         EMB[Embedding 服务]
         SOC[SkillSpector]
     end
@@ -72,7 +72,7 @@ graph LR
 | 参与者 | 说明 | 典型操作 |
 |--------|------|----------|
 | Web User | 浏览器访问平台 | 搜索、浏览详情、查看安全报告、获取安装命令 |
-| CLI User | 使用 `wittyhub` 命令行 | search / install / download / audit |
+| CLI User | 使用 `skillhub-cli` 命令行 | search / install / download / audit |
 | System Admin | 运维人员 | 触发重索引、查看统计、Docker 部署 |
 | Skill Developer | 本地管理 Skill | install 到 `~/.agents/skills/` |
 
@@ -127,7 +127,7 @@ graph TB
 
     subgraph 基础设施 Infrastructure
         PG[(PostgreSQL<br/>tsvector + pgvector)]
-        EXT[外部仓库<br/>GitHub/GitCode/Gitee]
+        EXT[外部仓库<br/>GitHub/AtomGit/Gitee]
         EMBSVC[Embedding 微服务]
     end
 
@@ -167,7 +167,7 @@ src/api/routes/skills.py ──► src/storage/downloader.py
                            ──► src/api/services/security.py
 src/indexer/search.py ──► PostgreSQL (tsvector + pgvector)
 src/ai/embedding.py ──► Embedding 微服务 (HTTP)
-src/storage/downloader.py ──► GitHub/GitCode/Gitee (HTTP)
+src/storage/downloader.py ──► GitHub/AtomGit/Gitee (HTTP)
 ```
 
 ### 3.4 数据模型（逻辑）
@@ -454,7 +454,7 @@ CLI 下载 ZIP 后在客户端完成解压安装：
 
 #### 4.2.6 多源与中国区优化
 
-多源支持统一收敛在 skillcrawler 爬取阶段：GitHub / GitCode / Gitee 仓库均以
+多源支持统一收敛在 skillcrawler 爬取阶段：GitHub / AtomGit / Gitee 仓库均以
 `git clone` 方式落地到本地 `skill-repositories/`，下载侧无需感知平台差异。
 GitHub 爬取可配置 `github_token` 提高 rate limit。
 
@@ -479,7 +479,7 @@ graph TB
         U[用户浏览器 / CLI]
     end
 
-    subgraph Docker Compose : wittyhub-network
+    subgraph Docker Compose : skillhub-network
         NG[web<br/>nginx:alpine<br/>:8080→8080]
         API[api<br/>FastAPI uvicorn<br/>:8081→8081]
         EMB[embedding<br/>BGE 模型服务<br/>:8082→8082]
@@ -492,7 +492,7 @@ graph TB
     NG -->|/* static| NG
     API --> DB
     API --> EMB
-    API -->|下载链接| EXT[GitHub/GitCode/Gitee]
+    API -->|下载链接| EXT[GitHub/AtomGit/Gitee]
 
     subgraph 持久化卷
         V1[(postgres-data)]
@@ -625,7 +625,7 @@ sequenceDiagram
     participant PG as PostgreSQL
     participant REPO as 本地仓库克隆
 
-    User->>CLI: wittyhub add <skill_id>
+    User->>CLI: skillhub-cli add <skill_id>
 
     CLI->>API: GET /skills/{skill_id}/download
     API->>PG: 查询 skill 记录
@@ -761,8 +761,8 @@ GET /api/v1/index/search?q={query}&mode=hybrid&category=&tags=&skip=0&limit=20
 **命令**：
 
 ```bash
-wittyhub add vercel-labs/agent-skills
-wittyhub add anthropics/skills
+skillhub-cli add vercel-labs/agent-skills
+skillhub-cli add anthropics/skills
 ```
 
 ---
@@ -798,7 +798,7 @@ curl -X POST http://localhost:8081/api/v1/index/reindex
 │  Host Machine                                                            │
 │                                                                          │
 │  ┌────────────────────────────────────────────────────────────────────┐  │
-│  │  Docker Network: wittyhub-network                                  │  │
+│  │  Docker Network: skillhub-network                                  │  │
 │  │                                                                    │  │
 │  │  ┌─────────────┐   proxy /api/   ┌─────────────┐                   │  │
 │  │  │  web:8080   │  ──────────────►│  api:8081   │                   │  │
@@ -817,7 +817,7 @@ curl -X POST http://localhost:8081/api/v1/index/reindex
 │  │                              /opt/wittyhub                         │  │
 │  └────────────────────────────────────────────────────────────────────┘  │
 │                                                                          │
-│  External: GitHub / GitCode / Gitee / SkillSpector                       │
+│  External: GitHub / AtomGit / Gitee / SkillSpector                       │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -846,7 +846,7 @@ curl -X POST http://localhost:8081/api/v1/index/reindex
 - [ ] `GET /api/v1/index/search?q=测试&mode=hybrid` 返回结果
 - [ ] Web 首页 `http://localhost:8080` 可访问
 - [ ] PostgreSQL 扩展：`vector`, `pg_trgm`, `unaccent`, `zhcfg`
-- [ ] `wittyhub add vercel-labs/agent-skills --list` 正常列出 Skills
+- [ ] `skillhub-cli add vercel-labs/agent-skills --list` 正常列出 Skills
 
 ---
 
@@ -863,7 +863,7 @@ curl -X POST http://localhost:8081/api/v1/index/reindex
 | GET | `/api/v1/skills/versions/{skill_id}` | 版本历史列表 |
 | GET | `/api/v1/health` | 健康检查 |
 
-### 8.2 CLI 命令（`wittyhub` npm 包）
+### 8.2 CLI 命令（`skillhub-cli` npm 包）
 
 | 命令 | 说明 |
 |------|------|
@@ -892,7 +892,7 @@ curl -X POST http://localhost:8081/api/v1/index/reindex
 
 | 优先级 | 功能 | 说明 | 状态 |
 |--------|------|------|------|
-| P1 | 爬虫自动发现 | skillcrawler discover 扫描 GitHub/GitCode/Gitee，自动入库 | 已实现 |
+| P1 | 爬虫自动发现 | skillcrawler discover 扫描 GitHub/AtomGit/Gitee，自动入库 | 已实现 |
 
 ### 9.2 待实现
 

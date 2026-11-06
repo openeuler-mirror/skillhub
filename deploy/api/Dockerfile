@@ -5,8 +5,11 @@ ARG APP_GID=1000
 
 WORKDIR /app
 
-RUN sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list 2>/dev/null; \
-    sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list.d/*.sources 2>/dev/null; \
+# Debian 源按构建环境切换：境内默认华为云（实测 Packages.gz 下载 0.6s，
+# 阿里云 3.1s、官方 20s+），境外构建加 --build-arg APT_MIRROR=deb.debian.org
+ARG APT_MIRROR=repo.huaweicloud.com
+RUN sed -i "s/deb.debian.org/${APT_MIRROR}/g" /etc/apt/sources.list 2>/dev/null; \
+    sed -i "s/deb.debian.org/${APT_MIRROR}/g" /etc/apt/sources.list.d/*.sources 2>/dev/null; \
     apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     git \

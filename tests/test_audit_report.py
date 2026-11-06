@@ -21,8 +21,8 @@ def _skill(**overrides):
     skill.id = "skill-uuid"
     skill.skill_id = "github:openeuler/find-skills/find-skills"
     skill.name = "find-skills"
-    skill.source_url = "https://gitcode.com/openeuler/find-skills/blob/main/SKILL.md"
-    skill.repo_url = "https://gitcode.com/openeuler/find-skills"
+    skill.source_url = "https://atomgit.com/openeuler/find-skills/blob/main/SKILL.md"
+    skill.repo_url = "https://atomgit.com/openeuler/find-skills"
     skill.version = "1.0.0"
     skill.risk_score = 12
     for key, value in overrides.items():

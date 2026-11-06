@@ -1,13 +1,60 @@
 import asyncio
+import logging
 import os
 import subprocess
+import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
+import httpx
 import pytest
+from pydantic import ValidationError
+from sqlalchemy import select
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.exc import InterfaceError
+from sqlalchemy.sql.dml import Update
+
+from src.skills.config import (
+    load_catalog_skill_url_entries,
+    load_crawler_config,
+    load_single_catalog_entry,
+)
+from src.skills import skill_manager
+from src.skills.openeuler_sig import _load_sig_mapping
+from src.skills.skill_manager import SkillManager, SkillRepositoryRequest
+from src.skills.skill_scanner import SkillScanner
+from src.skills.discover_requests import (
+    PLATFORM_CHOICES,
+    _build_requests_from_config,
+    build_requests_from_skill_yaml,
+    _normalize_platform,
+    build_configured_discover_requests,
+)
+from src.ai import security_backfill
+from src.ai.category_classifier import (
+    CATEGORY_RETRY_ATTEMPTS,
+    CategoryClassificationError,
+    DeepSeekCategoryClassifier,
+)
+from src.api.routes.health import router
+from src.api.routes.skills import list_skills
+from src.api.schemas.skill import SkillCreate, SkillListResponse, SkillResponse
+from src.core.config import Settings, get_settings
+from src.indexer.search import HYBRID_CANDIDATE_LIMIT, SearchService
+from src.models.orm import Skill
+from src.models.repository import SkillRepoRepository, SkillRepository
+from src.utils.git_operations import MATERIALIZE_ATTEMPTS, GitCommandError, GitOperations
+from src.skills.skill_id import build_skill_id, extract_owner_repo, resolve_relative_skill_path
+from src.skills.skill_parser import (
+    extract_declared_tags,
+    extract_declared_version,
+    parse_skill_frontmatter_text,
+    parse_skill_md_url,
+)
 
 
 def _git(repository: Path, *args: str, env: dict[str, str] | None = None) -> str:
@@ -40,9 +87,6 @@ class TestSkillRepositoryUnit:
 
     @pytest.mark.asyncio
     async def test_increment_download_does_not_update_skill_updated_at(self):
-        from sqlalchemy.dialects import postgresql
-
-        from src.models.repository import SkillRepository
 
         skill = SimpleNamespace(id=uuid.uuid4())
         session = AsyncMock()
@@ -59,9 +103,6 @@ class TestSkillRepositoryUnit:
 
     @pytest.mark.asyncio
     async def test_update_only_changes_updated_at_when_explicitly_requested(self):
-        from sqlalchemy.dialects import postgresql
-
-        from src.models.repository import SkillRepository
 
         skill = SimpleNamespace(id=uuid.uuid4())
         session = AsyncMock()
@@ -85,9 +126,6 @@ class TestSkillRepositoryUnit:
 
     @pytest.mark.asyncio
     async def test_store_skills_updates_existing_skill_and_updated_at(self):
-        from sqlalchemy.dialects import postgresql
-
-        from src.models.repository import SkillRepository
 
         repo_id = uuid.uuid4()
         skill_id = "github:acme/example/example-skill"
@@ -145,8 +183,6 @@ class TestSkillRepositoryUnit:
 
     @pytest.mark.asyncio
     async def test_store_skills_skips_unchanged_existing_skill(self):
-        from src.models.repository import SkillRepository
-
         repo_id = uuid.uuid4()
         skill_id = "github:acme/example/example-skill"
         existing = SimpleNamespace(
@@ -183,9 +219,6 @@ class TestSkillRepositoryUnit:
     @pytest.mark.asyncio
     async def test_store_skills_retries_once_on_dead_connection(self):
         """InterfaceError（连接被服务端断开）时换连接整体重放一次后成功。"""
-        from sqlalchemy.exc import InterfaceError
-
-        from src.models.repository import SkillRepository
 
         dead = InterfaceError(
             "SELECT skills.id, ...",
@@ -221,9 +254,6 @@ class TestSkillRepositoryUnit:
     @pytest.mark.asyncio
     async def test_store_skills_retry_respects_commit_flag(self):
         """重放与首跑同样遵循 commit 开关（true 时一次 commit）。"""
-        from sqlalchemy.exc import InterfaceError
-
-        from src.models.repository import SkillRepository
 
         dead = InterfaceError("SELECT", (), Exception("connection closed"))
         empty_skills = MagicMock()
@@ -246,9 +276,6 @@ class TestSkillRepositoryUnit:
     @pytest.mark.asyncio
     async def test_store_skills_raises_when_retry_also_fails(self):
         """仅重试一次：重放再次遇到 InterfaceError 时照常上抛。"""
-        from sqlalchemy.exc import InterfaceError
-
-        from src.models.repository import SkillRepository
 
         session = AsyncMock()
         # side_effect 直接设为异常实例：每次调用都抛出
@@ -268,11 +295,6 @@ class TestSkillRepositoryUnit:
         session.close.assert_awaited_once()
 
     def test_list_with_skill_id_prefix_filters_by_repo(self):
-        from sqlalchemy import select
-        from sqlalchemy.dialects import postgresql
-
-        from src.models.orm import Skill
-        from src.models.repository import SkillRepository
 
         session = AsyncMock()
         repo = SkillRepository(session)
@@ -291,9 +313,6 @@ class TestSkillRepositoryUnit:
 
     @pytest.mark.asyncio
     async def test_list_skills_route_forwards_repo_filter(self):
-        from src.api.routes.skills import list_skills
-        from src.api.schemas.skill import SkillListResponse
-
         now = datetime.now(timezone.utc)
         skill = SimpleNamespace(
             id=str(uuid.uuid4()),
@@ -345,8 +364,6 @@ class TestSkillRepositoryUnit:
         assert kwargs["limit"] == 20
 
     def test_build_skill_id_uses_relative_skill_path(self):
-        from src.utils.skill_id import build_skill_id, extract_owner_repo
-
         source = "github"
         repo_url = "https://github.com/wix/react-native-navigation.git"
         owner_repo = extract_owner_repo(repo_url)
@@ -358,8 +375,6 @@ class TestSkillRepositoryUnit:
         assert skill_id == "github:wix/react-native-navigation/rnn-codebase"
 
     def test_build_skill_id_uses_repo_slug_for_root_skill(self):
-        from src.utils.skill_id import build_skill_id, extract_owner_repo
-
         source = "github"
         repo_url = "https://github.com/acme/agent-skills.git"
         owner_repo = extract_owner_repo(repo_url)
@@ -369,8 +384,6 @@ class TestSkillRepositoryUnit:
         assert skill_id == "github:acme/agent-skills/agent-skills"
 
     def test_list_skill_paths_ignores_excluded_directories(self, tmp_path):
-        from skillcrawler.core.skill_manager import SkillManager
-
         for directory in ("docs", "examples", "tests", "templates"):
             skill_file = tmp_path / directory / "example" / "SKILL.md"
             skill_file.parent.mkdir(parents=True)
@@ -387,8 +400,6 @@ class TestSkillRepositoryUnit:
         assert manager._list_skill_paths(tmp_path) == []
 
     def test_list_skill_paths_accepts_scannable_skill(self, tmp_path):
-        from skillcrawler.core.skill_manager import SkillManager
-
         excluded_skill = tmp_path / "docs" / "SKILL.md"
         excluded_skill.parent.mkdir()
         excluded_skill.write_text("# Documentation", encoding="utf-8")
@@ -409,7 +420,6 @@ class TestSkillRepositoryUnit:
     def test_list_skill_paths_rejects_lookalike_skill_filenames(self, tmp_path):
         """文件名不是恰好 SKILL.md 的（如 _cannbot_SKILL.md）不算 skill，
         否则后续 build_skill_id 校验会抛错导致整仓扫描失败。"""
-        from skillcrawler.core.skill_manager import SkillManager
 
         lookalike = (
             tmp_path
@@ -435,8 +445,6 @@ class TestSkillRepositoryUnit:
         assert manager._list_skill_paths(tmp_path) == ["skills/cannbot/SKILL.md"]
 
     def test_skill_manager_workspace_defaults_to_storage_local_path(self, tmp_path):
-        from skillcrawler.core import skill_manager
-
         storage_path = str(tmp_path)
         with patch.object(skill_manager.settings.storage, "local_path", storage_path):
             manager = skill_manager.SkillManager(MagicMock(), MagicMock())
@@ -444,15 +452,12 @@ class TestSkillRepositoryUnit:
         assert manager.workspace_base == tmp_path.resolve()
 
     def test_skillcrawler_platform_choices_use_catalog_groups(self):
-        from skillcrawler.main import PLATFORM_CHOICES, _normalize_platform
-
         assert PLATFORM_CHOICES == ("community", "enterprise", "personal")
         with pytest.raises(ValueError, match="expected community"):
             _normalize_platform("openeuler")
 
     def test_single_skill_yaml_builds_repo_and_skill_requests(self, tmp_path):
         """--url 单文件模式：读取指定 skill.yaml 的 skill_repos 与 skills[] 条目。"""
-        from skillcrawler.main import _build_requests_from_skill_yaml
 
         skill_file = tmp_path / "community" / "sig-demo" / "skill.yaml"
         skill_file.parent.mkdir(parents=True)
@@ -465,7 +470,7 @@ class TestSkillRepositoryUnit:
             encoding="utf-8",
         )
 
-        requests = _build_requests_from_skill_yaml(str(skill_file))
+        requests = build_requests_from_skill_yaml(str(skill_file))
 
         assert len(requests) == 2
         repo_request = next(r for r in requests if r.skill_paths is None)
@@ -480,34 +485,31 @@ class TestSkillRepositoryUnit:
 
     def test_single_skill_yaml_resolves_catalog_relative_path(self, tmp_path, monkeypatch):
         """本地不存在的路径按 catalog 根解析（-r / 自动同步的 openEuler-skills）。"""
-        from skillcrawler.main import _build_requests_from_skill_yaml
 
         skill_file = tmp_path / "personal" / "leon-wang2021" / "skill.yaml"
         skill_file.parent.mkdir(parents=True)
         skill_file.write_text(
-            "skill_repos:\n- url: https://gitcode.com/leon-wang2021/aet\n",
+            "skill_repos:\n- url: https://atomgit.com/leon-wang2021/aet\n",
             encoding="utf-8",
         )
         monkeypatch.setattr(
             "skillcrawler.main.sync_openEuler_skills_repo", lambda: tmp_path
         )
 
-        requests = _build_requests_from_skill_yaml("personal/leon-wang2021/skill.yaml")
+        requests = build_requests_from_skill_yaml("personal/leon-wang2021/skill.yaml")
 
         assert len(requests) == 1
-        assert requests[0].url == "https://gitcode.com/leon-wang2021/aet"
+        assert requests[0].url == "https://atomgit.com/leon-wang2021/aet"
         assert requests[0].platform == "personal"
 
     def test_single_skill_yaml_rejects_invalid_target(self, tmp_path, monkeypatch):
         """文件不存在 / 文件名不对 / 目录结构不符都抛 ValueError。"""
-        from skillcrawler.config import load_single_catalog_entry
-        from skillcrawler.main import _build_requests_from_skill_yaml
 
         monkeypatch.setattr(
             "skillcrawler.main.sync_openEuler_skills_repo", lambda: tmp_path
         )
         with pytest.raises(ValueError, match="skill.yaml not found"):
-            _build_requests_from_skill_yaml("personal/x/skill.yaml")
+            build_requests_from_skill_yaml("personal/x/skill.yaml")
 
         wrong_name = tmp_path / "personal" / "x" / "other.yaml"
         wrong_name.parent.mkdir(parents=True)
@@ -521,8 +523,6 @@ class TestSkillRepositoryUnit:
             load_single_catalog_entry(bad_layout)
 
     def test_settings_env_overrides_yaml(self, tmp_path, monkeypatch):
-        from src.core.config import Settings
-
         config_path = tmp_path / "config.yaml"
         config_path.write_text(
             """
@@ -550,8 +550,6 @@ model:
         assert settings.model.api_key == ""
 
     def test_openeuler_sig_mapping_uses_only_openeuler_repos(self, tmp_path):
-        from skillcrawler.core.openeuler_sig import _load_sig_mapping
-
         sig_dir = tmp_path / "sig" / "sig-ops"
         sig_dir.mkdir(parents=True)
         (sig_dir / "sig-info.yaml").write_text(
@@ -568,17 +566,15 @@ repositories:
 
         mapping = _load_sig_mapping(tmp_path)
 
-        assert mapping["gitcode.com_openeuler_PilotGo-plugin-llmops"] == "sig-ops"
-        assert mapping["gitcode.com_openeuler_intel-openvino"] == "sig-ops"
-        assert "gitcode.com_src-openeuler_ignored-package" not in mapping
+        assert mapping["atomgit.com_openeuler_PilotGo-plugin-llmops"] == "sig-ops"
+        assert mapping["atomgit.com_openeuler_intel-openvino"] == "sig-ops"
+        assert "atomgit.com_src-openeuler_ignored-package" not in mapping
 
     def test_build_requests_from_catalog_includes_community_sig_name(self, tmp_path):
-        from skillcrawler.main import _build_requests_from_config
-
         repos_dict = {
             "community": [
                 {
-                    "url": "https://gitcode.com/openeuler/PilotGo-plugin-llmops",
+                    "url": "https://atomgit.com/openeuler/PilotGo-plugin-llmops",
                     "sig_name": "sig-ops",
                 }
             ]
@@ -593,34 +589,29 @@ repositories:
         assert requests[0].sig_name == "sig-ops"
 
     def test_load_crawler_config_reads_catalog_directory_names(self, tmp_path):
-        from skillcrawler.config import load_crawler_config
-
         skill_file = tmp_path / "community" / "sig-security-facility" / "skill.yaml"
         skill_file.parent.mkdir(parents=True)
         skill_file.write_text(
-            "name: security\nskill_repos:\n  - url: https://gitcode.com/openeuler/security\n",
+            "name: security\nskill_repos:\n  - url: https://atomgit.com/openeuler/security\n",
             encoding="utf-8",
         )
         config = load_crawler_config(tmp_path)
-        assert config["community"][0]["url"] == "https://gitcode.com/openeuler/security"
+        assert config["community"][0]["url"] == "https://atomgit.com/openeuler/security"
         assert config["community"][0]["sig_name"] == "sig-security-facility"
 
     def test_skill_manager_resolves_openeuler_sig_lazily(self):
-        from skillcrawler.core.skill_manager import SkillManager
-
         manager = SkillManager(MagicMock(), MagicMock())
         manager._openeuler_sig_by_repo_name = {
-            "gitcode.com_openeuler_PilotGo-plugin-llmops": "sig-ops"
+            "atomgit.com_openeuler_PilotGo-plugin-llmops": "sig-ops"
         }
 
         sig_name = manager._get_openeuler_sig_name(
-            "gitcode.com_openeuler_PilotGo-plugin-llmops"
+            "atomgit.com_openeuler_PilotGo-plugin-llmops"
         )
 
         assert sig_name == "sig-ops"
 
     def test_full_repository_update_uses_regular_fetch(self, tmp_path):
-        from skillcrawler.core.git_operations import GitOperations
 
         git_ops = GitOperations()
         git_ops._run_git_command_with_retries = MagicMock()
@@ -639,7 +630,6 @@ repositories:
         ]
 
     def test_shallow_repository_update_keeps_depth_one_fetch(self, tmp_path):
-        from skillcrawler.core.git_operations import GitOperations
 
         git_ops = GitOperations()
         git_ops._run_git_command_with_retries = MagicMock()
@@ -658,7 +648,6 @@ repositories:
         ]
 
     def test_git_timeout_sanitization_accepts_byte_output(self):
-        from skillcrawler.core.git_operations import GitOperations
 
         git_ops = GitOperations(github_token="secret-token")
         timeout = subprocess.TimeoutExpired(
@@ -678,7 +667,6 @@ repositories:
 
     def test_called_process_error_str_includes_git_stderr(self):
         """净化后的 git 错误 str() 带 stderr 失败原因，traceback 可直接排查。"""
-        from skillcrawler.core.git_operations import GitCommandError, GitOperations
 
         git_ops = GitOperations(github_token=None)
         exc = git_ops._sanitize_called_process_error(
@@ -694,7 +682,6 @@ repositories:
 
     def test_called_process_error_str_masks_github_token(self):
         """str() 里的 stderr 同样做 token 打码，不泄露凭据。"""
-        from skillcrawler.core.git_operations import GitOperations
 
         git_ops = GitOperations(github_token="secret-token-123")
         exc = git_ops._sanitize_called_process_error(
@@ -710,8 +697,6 @@ repositories:
         assert "***" in str(exc)
 
     async def test_skill_scanner_stores_skill_directory_tree_hash_not_repo_head(self, tmp_path):
-        from skillcrawler.core.git_operations import GitOperations
-        from skillcrawler.core.skill_scanner import SkillScanner
 
         repository = tmp_path / "repository"
         repository.mkdir()
@@ -768,8 +753,6 @@ repositories:
         tags only contain skill/SKILL.md used to yield zero SkillVersion records
         because the tag scan reused HEAD's path list.
         """
-        from skillcrawler.core.git_operations import GitOperations
-        from skillcrawler.core.skill_scanner import SkillScanner
 
         repository = tmp_path / "repository"
         repository.mkdir()
@@ -811,8 +794,8 @@ repositories:
         )
         repo = SimpleNamespace(
             id=uuid.uuid4(),
-            source="gitcode",
-            url="https://gitcode.com/acme/widgets",
+            source="atomgit",
+            url="https://atomgit.com/acme/widgets",
             branch="master",
             platform=None,
         )
@@ -831,13 +814,13 @@ repositories:
         )
 
         assert {skill.skill_id for skill in skills} == {
-            "gitcode:acme/widgets/skill",
-            "gitcode:acme/widgets/skill-1",
+            "atomgit:acme/widgets/skill",
+            "atomgit:acme/widgets/skill-1",
         }
         assert {(v.version, v.commit_id) for v in tagged_skills} == {
             ("v2", v2_commit),
         }
-        assert {v.skill_id for v in tagged_skills} == {"gitcode:acme/widgets/skill"}
+        assert {v.skill_id for v in tagged_skills} == {"atomgit:acme/widgets/skill"}
 
     async def test_skill_scanner_pre_dedups_same_commit_tags(self, tmp_path):
         """Tags pointing at the same commit must not re-run record assembly.
@@ -846,8 +829,6 @@ repositories:
         skipped before _build_skill_record, so security resolution (and its
         Jenkins submission) is not invoked again for the duplicate.
         """
-        from skillcrawler.core.git_operations import GitOperations
-        from skillcrawler.core.skill_scanner import SkillScanner
 
         repository = tmp_path / "repository"
         repository.mkdir()
@@ -875,8 +856,8 @@ repositories:
         )
         repo = SimpleNamespace(
             id=uuid.uuid4(),
-            source="gitcode",
-            url="https://gitcode.com/acme/widgets",
+            source="atomgit",
+            url="https://atomgit.com/acme/widgets",
             branch="master",
             platform=None,
         )
@@ -909,8 +890,6 @@ repositories:
         only the newest tag may stay in skill_versions; older tags are skipped
         before record assembly.
         """
-        from skillcrawler.core.git_operations import GitOperations
-        from skillcrawler.core.skill_scanner import SkillScanner
 
         repository = tmp_path / "repository"
         repository.mkdir()
@@ -988,8 +967,6 @@ repositories:
         uses '1.2.3' (version_source=metadata); tag v2 has no frontmatter
         version → falls back to the tag name 'v2' (version_source=tag).
         """
-        from skillcrawler.core.git_operations import GitOperations
-        from skillcrawler.core.skill_scanner import SkillScanner
 
         repository = tmp_path / "repository"
         repository.mkdir()
@@ -1061,8 +1038,6 @@ repositories:
         一条 metadata 版本行（1.0.1），不再产出任何 tag 版本行；
         未声明 version 的 skill-1 仍正常按 tag 名收集版本。
         """
-        from skillcrawler.core.git_operations import GitOperations
-        from skillcrawler.core.skill_scanner import SkillScanner
 
         repository = tmp_path / "repository"
         repository.mkdir()
@@ -1112,8 +1087,8 @@ repositories:
         )
         repo = SimpleNamespace(
             id=uuid.uuid4(),
-            source="gitcode",
-            url="https://gitcode.com/weijihui/test",
+            source="atomgit",
+            url="https://atomgit.com/weijihui/test",
             branch="main",
             platform=None,
         )
@@ -1157,8 +1132,6 @@ repositories:
     async def test_skill_scanner_uses_declared_category_when_valid(self, tmp_path):
         """frontmatter 声明了合法 category（在 CANONICAL_CATEGORIES 中）→ 直接使用，
         跳过分类器。"""
-        from skillcrawler.core.git_operations import GitOperations
-        from skillcrawler.core.skill_scanner import SkillScanner
 
         repository = tmp_path / "repository"
         repository.mkdir()
@@ -1214,8 +1187,6 @@ repositories:
     ):
         """frontmatter 声明了非法 category（不在 CANONICAL_CATEGORIES 中）→
         回退到分类器。"""
-        from skillcrawler.core.git_operations import GitOperations
-        from skillcrawler.core.skill_scanner import SkillScanner
 
         repository = tmp_path / "repository"
         repository.mkdir()
@@ -1267,9 +1238,6 @@ repositories:
         assert skills[0].category == "Research and Design"
 
     def test_skill_scanner_reuses_security_result_for_unchanged_skill_tree(self, tmp_path):
-        from skillcrawler.core.git_operations import GitOperations
-        from skillcrawler.core.skill_scanner import SkillScanner
-        from src.utils.skill_id import build_skill_id, extract_owner_repo
 
         repository = tmp_path / "repository"
         repository.mkdir()
@@ -1339,8 +1307,6 @@ repositories:
 
     async def test_skill_scanner_requires_name_and_description(self, tmp_path):
         """可扫描 Skill 门禁：frontmatter 必须同时有 name 与 description。"""
-        from skillcrawler.core.git_operations import GitOperations
-        from skillcrawler.core.skill_scanner import SkillScanner
 
         repository = tmp_path / "repository"
         repository.mkdir()
@@ -1375,8 +1341,8 @@ repositories:
         )
         repo = SimpleNamespace(
             id=uuid.uuid4(),
-            source="gitcode",
-            url="https://gitcode.com/acme/widgets",
+            source="atomgit",
+            url="https://atomgit.com/acme/widgets",
             branch="master",
             platform=None,
         )
@@ -1387,11 +1353,9 @@ repositories:
             repository_git_metadata={"commit_id": head_commit},
         )
 
-        assert {skill.skill_id for skill in skills} == {"gitcode:acme/widgets/with-both"}
+        assert {skill.skill_id for skill in skills} == {"atomgit:acme/widgets/with-both"}
 
     async def test_configured_discover_force_does_not_skip_commit_unchanged_check(self):
-        from skillcrawler.core.skill_manager import SkillManager, SkillRepositoryRequest
-
         skill_repository = MagicMock()
         skill_repository.list_unscored_by_skill_repo = AsyncMock(return_value=([], []))
         manager = SkillManager(skill_repository, MagicMock())
@@ -1424,11 +1388,10 @@ repositories:
         assert getattr(result, "_unchanged") is True
         discover_mock.assert_not_called()
 
-    async def test_commit_unchanged_retries_unscored_security_audits(self):
-        from skillcrawler.core.skill_manager import SkillManager, SkillRepositoryRequest
+    async def test_commit_unchanged_skips_rescan_without_inline_security_retry(self):
+        """commit 未变只标记 _unchanged：安全补审计由 remediation 全局兜底。"""
 
         manager = SkillManager(MagicMock(), MagicMock())
-        retry_mock = AsyncMock(return_value=(3, 2))
         discover_mock = AsyncMock()
         repository = SimpleNamespace(
             id=uuid.uuid4(),
@@ -1445,28 +1408,19 @@ repositories:
                 "_get_or_create_skill_repository",
                 AsyncMock(return_value=(repository, False)),
             ),
-            patch.object(
-                SkillManager,
-                "_retry_unscored_security_audits",
-                retry_mock,
-            ),
             patch.object(SkillManager, "_discover_and_store_skills", discover_mock),
         ):
             result = await manager.discover_configured_skill_repository(
                 SkillRepositoryRequest(url="https://github.com/acme/agent-skills")
             )
 
-        assert getattr(result, "_security_retry_candidates") == 3
-        assert getattr(result, "_security_retriggered") == 2
-        retry_mock.assert_awaited_once_with(repository)
+        assert getattr(result, "_unchanged") is True
+        assert not hasattr(result, "_security_retry_candidates")
         discover_mock.assert_not_called()
 
     async def test_sync_catalog_source_migrates_platform_for_existing_repo(self):
         """Issue #9: a directly-collected repo (platform empty) registered in the
         anchor catalog must migrate skill_repos / skills platform to community."""
-        from sqlalchemy.sql.dml import Update
-
-        from skillcrawler.core.skill_manager import SkillManager, SkillRepositoryRequest
 
         session = MagicMock()
         session.execute = AsyncMock()
@@ -1485,14 +1439,14 @@ repositories:
         repository = SimpleNamespace(
             id=1,
             repo_name="openeuler_demo-skills",
-            source="gitcode",
+            source="atomgit",
             platform="",
         )
 
         returned = await manager._sync_catalog_source(
             repository,
             SkillRepositoryRequest(
-                url="https://gitcode.com/openeuler/demo-skills",
+                url="https://atomgit.com/openeuler/demo-skills",
                 platform="community",
             ),
         )
@@ -1508,14 +1462,110 @@ repositories:
         for stmt in executed:
             assert isinstance(stmt, Update)
         assert session.commit.await_count == 1
-        from sqlalchemy.dialects import postgresql
 
         migrated = executed[0].compile(dialect=postgresql.dialect()).params
         assert migrated["platform"] == "community"
 
+    async def test_delete_removed_catalog_repos_deletes_moved_community_author(self):
+        """community 仓库从旧 SIG 挪到新 SIG：数据库记录的 (platform, author,
+        repo_name) 组合在 catalog 期望集合中已不存在，按交集删除旧归属，
+        供后续扫描重建到新归属。"""
+
+        session = MagicMock()
+        skill_repository = MagicMock()
+        skill_repository.session = session
+        repo_repository = MagicMock()
+        repo_repository.delete_skill_repositories = AsyncMock()
+        repo_repository.reconcile_skill_nums = AsyncMock(return_value=0)
+        contributor_repository = MagicMock()
+        contributor_repository.reconcile_skill_counts = AsyncMock(return_value=0)
+        contributor_repository.delete_contributors_without_skills = AsyncMock(return_value=0)
+        manager = SkillManager(skill_repository, repo_repository, contributor_repository)
+
+        moved_request = SkillRepositoryRequest(
+            url="https://atomgit.com/openeuler/agent-skills",
+            platform="community",
+            sig_name="Infrastructure",
+        )
+        stayed_request = SkillRepositoryRequest(
+            url="https://atomgit.com/openeuler/other-skills",
+            platform="community",
+            sig_name="Infrastructure",
+        )
+        moved_repo_name = manager._derive_repo_name(
+            manager._normalize_repository_request(moved_request)
+        )
+        stayed_repo_name = manager._derive_repo_name(
+            manager._normalize_repository_request(stayed_request)
+        )
+
+        repo_repository.list_skill_repositories = AsyncMock(
+            return_value=[
+                SimpleNamespace(
+                    id=1,
+                    repo_name=moved_repo_name,
+                    platform="community",
+                    author="unassigned-sig",
+                ),
+                SimpleNamespace(
+                    id=2,
+                    repo_name=stayed_repo_name,
+                    platform="community",
+                    author="Infrastructure",
+                ),
+            ]
+        )
+
+        deleted = await manager.delete_removed_catalog_repos(
+            [moved_request, stayed_request]
+        )
+
+        assert deleted == 1
+        repo_repository.delete_skill_repositories.assert_awaited_once()
+        removed_ids = repo_repository.delete_skill_repositories.await_args.args[0]
+        assert removed_ids == [1]
+
+    async def test_delete_removed_catalog_repos_uses_url_owner_for_non_community(self):
+        """非 community 仓库的 (author, repo_name) 中 author 取 URL owner，
+        URL 未变则归属未变，不会被误删。"""
+
+        session = MagicMock()
+        skill_repository = MagicMock()
+        skill_repository.session = session
+        repo_repository = MagicMock()
+        repo_repository.delete_skill_repositories = AsyncMock()
+        repo_repository.reconcile_skill_nums = AsyncMock(return_value=0)
+        contributor_repository = MagicMock()
+        contributor_repository.reconcile_skill_counts = AsyncMock(return_value=0)
+        contributor_repository.delete_contributors_without_skills = AsyncMock(return_value=0)
+        manager = SkillManager(skill_repository, repo_repository, contributor_repository)
+
+        request = SkillRepositoryRequest(
+            url="https://github.com/acme/agent-skills",
+            platform="enterprise",
+        )
+        normalized = manager._normalize_repository_request(request)
+        repo_name = manager._derive_repo_name(normalized)
+        assert manager._derive_catalog_author(normalized) == "acme"
+
+        repo_repository.list_skill_repositories = AsyncMock(
+            return_value=[
+                SimpleNamespace(
+                    id=1,
+                    repo_name=repo_name,
+                    platform="enterprise",
+                    author="acme",
+                ),
+            ]
+        )
+
+        deleted = await manager.delete_removed_catalog_repos([request])
+
+        assert deleted == 0
+        repo_repository.delete_skill_repositories.assert_not_called()
+
     async def test_sync_catalog_source_skips_when_platform_unchanged(self):
         """Issue #9: no migration (and no writes) when the catalog view matches."""
-        from skillcrawler.core.skill_manager import SkillManager, SkillRepositoryRequest
 
         session = MagicMock()
         session.execute = AsyncMock()
@@ -1527,14 +1577,14 @@ repositories:
         repository = SimpleNamespace(
             id=1,
             repo_name="openeuler_demo-skills",
-            source="gitcode",
+            source="atomgit",
             platform="community",
         )
 
         returned = await manager._sync_catalog_source(
             repository,
             SkillRepositoryRequest(
-                url="https://gitcode.com/openeuler/demo-skills",
+                url="https://atomgit.com/openeuler/demo-skills",
                 platform="community",
             ),
         )
@@ -1544,73 +1594,89 @@ repositories:
         session.execute.assert_not_called()
         session.commit.assert_not_called()
 
-    async def test_retry_unscored_security_audits_updates_pending_audit(self):
-        from skillcrawler.core.skill_manager import SkillManager, settings
+    async def test_remediation_trigger_chunk_builds_audit_details(self):
+        """补审计触发：命中 Jenkins 后返回 (行, details)；无 build number 计 failed。"""
 
-        session = MagicMock()
-        session.commit = AsyncMock()
-        skill_repository = MagicMock()
-        skill_repository.session = session
-        record = SimpleNamespace(
+        row = security_backfill._UnscoredRow(
+            table="skills",
             id=uuid.uuid4(),
             skill_id="github/acme/agent-skills/skills/example",
-            version="latest",
-            commit_id="a" * 40,
             source_url=(
                 "https://github.com/acme/agent-skills/"
                 "blob/main/skills/example/SKILL.md"
             ),
-            extra_metadata={},
+            version="latest",
+            commit_id="a" * 40,
+            repo_url="https://github.com/acme/agent-skills",
+            repo_branch="main",
+            repo_source="github",
+            repo_local_path=None,
         )
-        skill_repository.list_unscored_by_skill_repo = AsyncMock(
-            return_value=([record], []),
-        )
-        manager = SkillManager(skill_repository, MagicMock())
-        manager._scanner.security_detector = SimpleNamespace(has_skillspector=True)
-        manager._scanner.audit_existing_skill = AsyncMock(
-            return_value=SimpleNamespace(
-                details={
-                    "skillspector_async": True,
-                    "skillspector_build_number": 123,
-                    "source": "skillspector",
-                }
-            )
-        )
-        repository = SimpleNamespace(
-            id=uuid.uuid4(),
-            repo_name="github.com_acme_agent-skills",
-            source="github",
-            url="https://github.com/acme/agent-skills",
-            branch="main",
-        )
-        audit_repository = MagicMock()
-        audit_repository.upsert_by_resource = AsyncMock()
+        stats = security_backfill.SecurityBackfillStats(total=1)
 
-        with (
-            patch.object(settings.security, "enable_audit", True),
-            patch(
-                "skillcrawler.core.skill_manager.SecurityAuditRepository",
-                return_value=audit_repository,
+        with patch(
+            "src.ai.security_backfill.trigger_existing_skill_audit",
+            AsyncMock(
+                return_value=SimpleNamespace(
+                    details={
+                        "skillspector_async": True,
+                        "skillspector_build_number": 123,
+                        "source": "skillspector",
+                    }
+                )
+            ),
+        ) as trigger_mock:
+            triggered = await security_backfill._trigger_chunk(
+                [row], MagicMock(), MagicMock(), stats
+            )
+
+        assert [(r.id, d["skillspector_build_number"]) for r, d in triggered] == [
+            (row.id, 123)
+        ]
+        assert stats.failed == 0
+        # 触发参数：相对路径由 source_url 解析，与扫描路径同口径
+        call = trigger_mock.await_args.kwargs
+        assert call["relative_path"] == "skills/example/SKILL.md"
+        assert call["skill_id"] == row.skill_id
+        assert call["security_async_mode"] is True
+
+    async def test_remediation_trigger_chunk_counts_failed_trigger(self):
+        """触发失败（无 build number）不写库，只计 failed 留待下轮重试。"""
+
+        row = security_backfill._UnscoredRow(
+            table="skill_versions",
+            id=uuid.uuid4(),
+            skill_id="github/acme/agent-skills/example",
+            source_url="https://github.com/acme/agent-skills/blob/main/SKILL.md",
+            version=None,
+            commit_id=None,
+            repo_url="https://github.com/acme/agent-skills",
+            repo_branch=None,
+            repo_source="github",
+            repo_local_path=None,
+        )
+        stats = security_backfill.SecurityBackfillStats(total=1)
+
+        with patch(
+            "src.ai.security_backfill.trigger_existing_skill_audit",
+            AsyncMock(
+                return_value=SimpleNamespace(
+                    details={
+                        "skillspector_async": True,
+                        "skillspector_build_number": None,
+                        "source": "skillspector",
+                    }
+                )
             ),
         ):
-            candidates, triggered = await manager._retry_unscored_security_audits(
-                repository,
+            triggered = await security_backfill._trigger_chunk(
+                [row], MagicMock(), MagicMock(), stats
             )
 
-        assert (candidates, triggered) == (1, 1)
-        manager._scanner.audit_existing_skill.assert_awaited_once_with(
-            repo=repository,
-            relative_path="skills/example/SKILL.md",
-            commit_id="a" * 40,
-            skill_id=record.skill_id,
-        )
-        assert record.extra_metadata["security_audit"]["skillspector_build_number"] == 123
-        audit_repository.upsert_by_resource.assert_awaited_once()
-        session.commit.assert_awaited_once()
+        assert triggered == []
+        assert stats.failed == 1
 
     async def test_discover_store_uses_one_final_repository_commit(self, tmp_path):
-        from skillcrawler.core.skill_manager import SkillManager
-
         skill_repository = MagicMock()
         skill_repository.store_skills_and_versions = AsyncMock()
         repo_repository = MagicMock()
@@ -1659,7 +1725,6 @@ repositories:
     async def test_discover_store_upserts_contributor_with_catalog_profile(self, tmp_path):
         """enterprise/personal 仓库 author 未显式传入时用扫描结果兜底，
         且 upsert contributors 时注入 catalog 的 name/description/git_profile。"""
-        from skillcrawler.core.skill_manager import SkillManager
 
         skill_repository = MagicMock()
         skill_repository.store_skills_and_versions = AsyncMock()
@@ -1683,7 +1748,12 @@ repositories:
             source="github",
             url="https://github.com/wordpress/agent-skills",
         )
-        scanned_skill = SimpleNamespace(skill_id="github/wordpress/agent-skills/x", author="wordpress")
+        scanned_skill = SimpleNamespace(
+            skill_id="github/wordpress/agent-skills/x",
+            author="wordpress",
+            source="github",
+            platform="enterprise",
+        )
 
         with (
             patch.object(
@@ -1727,9 +1797,110 @@ repositories:
             author="wordpress",
         )
 
-    async def test_security_audit_store_uses_runtime_trigger_flag(self):
-        from skillcrawler.core.skill_manager import SkillManager
+    async def test_discover_store_upserts_contributors_per_skill_platform(self, tmp_path):
+        """local_skills 自扫描（仓库级 platform=None）下，仓库内多个 skill 分属
+        community/enterprise/personal 不同渠道，应逐 skill 用各自 platform 聚合
+        contributor，而非统一使用仓库级空 platform。"""
+        skill_repository = MagicMock()
+        skill_repository.store_skills_and_versions = AsyncMock()
+        repo_repository = MagicMock()
+        updated_repo = SimpleNamespace(id=uuid.uuid4())
+        repo_repository.update_skill_repository = AsyncMock(return_value=updated_repo)
+        contributor_repository = MagicMock()
+        contributor_repository.upsert = AsyncMock()
+        contributor_repository.count_skills = AsyncMock(return_value=1)
+        manager = SkillManager(
+            skill_repository,
+            repo_repository,
+            contributor_repository=contributor_repository,
+            catalog_path=Path("/nonexistent-catalog"),
+        )
+        repo = SimpleNamespace(
+            id=updated_repo.id,
+            platform=None,  # local_skills 自扫描：仓库级 platform 为空
+            repo_name="atomgit.com_openeuler_openEuler-skills",
+            source="atomgit",
+            url="https://atomgit.com/openeuler/openEuler-skills",
+        )
+        scanned_skills = [
+            SimpleNamespace(
+                skill_id="atomgit:openeuler/openEuler-skills/openeuler-mr",
+                author="alice",
+                source="atomgit",
+                platform="personal",
+            ),
+            SimpleNamespace(
+                skill_id="atomgit:openeuler/openEuler-skills/sig-foo",
+                author="foo",
+                source="atomgit",
+                platform="community",
+            ),
+            SimpleNamespace(
+                skill_id="atomgit:openeuler/openEuler-skills/ent-bar",
+                author="bar",
+                source="atomgit",
+                platform="enterprise",
+            ),
+        ]
 
+        with (
+            patch.object(
+                SkillManager,
+                "_discover_skills",
+                AsyncMock(return_value=(scanned_skills, [], "c" * 40)),
+            ),
+            patch.object(SkillManager, "_store_to_security_audits", AsyncMock()),
+        ):
+            await manager._discover_and_store_skills(
+                repo,
+                clone_dir=tmp_path,
+                repo_name="atomgit.com_openeuler_openEuler-skills",
+            )
+
+        contributor_repository.upsert.assert_has_calls(
+            [
+                call(
+                    source="atomgit",
+                    author="alice",
+                    platform="personal",
+                    repo_url=repo.url,
+                    skill_count=1,
+                    name=None,
+                    description=None,
+                    git_profile=None,
+                    website=None,
+                    commit=False,
+                ),
+                call(
+                    source="atomgit",
+                    author="foo",
+                    platform="community",
+                    repo_url=repo.url,
+                    skill_count=1,
+                    name=None,
+                    description=None,
+                    git_profile=None,
+                    website=None,
+                    commit=False,
+                ),
+                call(
+                    source="atomgit",
+                    author="bar",
+                    platform="enterprise",
+                    repo_url=repo.url,
+                    skill_count=1,
+                    name=None,
+                    description=None,
+                    git_profile=None,
+                    website=None,
+                    commit=False,
+                ),
+            ],
+            any_order=True,
+        )
+        assert contributor_repository.upsert.call_count == 3
+
+    async def test_security_audit_store_uses_runtime_trigger_flag(self):
         skill_repository = MagicMock()
         skill_repository.session = MagicMock()
         manager = SkillManager(skill_repository, MagicMock())
@@ -1759,7 +1930,7 @@ repositories:
         )
 
         with patch(
-            "skillcrawler.core.skill_manager.SecurityAuditRepository",
+            "src.skills.skill_manager.SecurityAuditRepository",
             return_value=audit_repository,
         ):
             await manager._store_to_security_audits(
@@ -1779,7 +1950,6 @@ repositories:
 
     async def test_security_audit_store_persists_failed_trigger_as_unknown(self):
         """触发失败（build_number=None）时也落 risk_level=unknown 审计记录。"""
-        from skillcrawler.core.skill_manager import SkillManager
 
         skill_repository = MagicMock()
         skill_repository.session = MagicMock()
@@ -1811,7 +1981,7 @@ repositories:
         )
 
         with patch(
-            "skillcrawler.core.skill_manager.SecurityAuditRepository",
+            "src.skills.skill_manager.SecurityAuditRepository",
             return_value=audit_repository,
         ):
             await manager._store_to_security_audits(
@@ -1831,8 +2001,6 @@ repositories:
         assert audit_data["details"]["skillspector_build_number"] is None
 
     def test_security_retry_resolves_path_from_commit_source_url(self):
-        from skillcrawler.core.skill_manager import SkillManager
-
         commit_id = "bdf484685eb2a3e13eb223cbf52adf957a98ffb6"
         repository = SimpleNamespace(
             source="github",
@@ -1848,13 +2016,57 @@ repositories:
             skill_id="github/github/gh-aw/agentic-workflows",
         )
 
-        assert SkillManager._relative_skill_path(repository, record) == (
+        assert resolve_relative_skill_path(repository, record) == (
             ".github/skills/agentic-workflows/SKILL.md"
         )
 
-    def test_skill_manager_commit_unchanged_uses_skill_repo_commit_field(self, tmp_path):
-        from skillcrawler.core.skill_manager import SkillManager
+    def test_resolve_relative_skill_path_version_tag_with_v_prefix(self):
+        """URL 里的 tag 名带 v 前缀（v0.0.3）而 version 字段不带（0.0.3）时仍能解析。
 
+        复现 aspire-orchestration 的 Jenkins exit 3：ref 候选全不匹配后落入
+        skill_id 反推兜底，丢掉 skills/ 前缀得到错误路径。
+        """
+        repository = SimpleNamespace(
+            source="github",
+            url="https://github.com/microsoft/aspire-skills",
+            branch="main",
+        )
+        record = SimpleNamespace(
+            commit_id="a83ca78b9d35b8238f9c4fdba72cb779defe2a90",
+            version="0.0.3",
+            source_url=(
+                "https://github.com/microsoft/aspire-skills/blob/v0.0.3/"
+                "skills/aspire-orchestration/SKILL.md"
+            ),
+            skill_id="github:microsoft/aspire-skills/aspire-orchestration",
+        )
+
+        assert resolve_relative_skill_path(repository, record) == (
+            "skills/aspire-orchestration/SKILL.md"
+        )
+
+    def test_resolve_relative_skill_path_unknown_ref_falls_back_to_url_regex(self):
+        """URL 的 ref 不在已知候选里（如版本 tag 名）→ 通用正则提取，保留完整路径。"""
+        repository = SimpleNamespace(
+            source="github",
+            url="https://github.com/microsoft/aspire-skills",
+            branch="main",
+        )
+        record = SimpleNamespace(
+            commit_id=None,
+            version=None,
+            source_url=(
+                "https://github.com/microsoft/aspire-skills/blob/v1.0.0-pre-migration/"
+                "skills/aspire-orchestration/SKILL.md"
+            ),
+            skill_id="github:microsoft/aspire-skills/aspire-orchestration",
+        )
+
+        assert resolve_relative_skill_path(repository, record) == (
+            "skills/aspire-orchestration/SKILL.md"
+        )
+
+    def test_skill_manager_commit_unchanged_uses_skill_repo_commit_field(self, tmp_path):
         manager = SkillManager(MagicMock(), MagicMock())
         manager._git_ops = MagicMock()
         manager._git_ops.get_repository_head_commit_id.return_value = "repo-head"
@@ -1867,8 +2079,6 @@ repositories:
         assert manager._is_commit_unchanged(repository, tmp_path) is False
 
     def test_select_skill_by_version_returns_only_match(self):
-        from src.models.repository import SkillRepository
-
         repo = SkillRepository(MagicMock())
         skills = [SimpleNamespace(version="v1.0.0")]
 
@@ -1877,8 +2087,6 @@ repositories:
         assert selected is skills[0]
 
     def test_select_skill_by_version_prefers_requested_version(self):
-        from src.models.repository import SkillRepository
-
         repo = SkillRepository(MagicMock())
         latest = SimpleNamespace(version="latest")
         requested = SimpleNamespace(version="v1.2.3")
@@ -1889,8 +2097,6 @@ repositories:
         assert selected is requested
 
     def test_select_skill_by_version_defaults_to_latest(self):
-        from src.models.repository import SkillRepository
-
         repo = SkillRepository(MagicMock())
         latest = SimpleNamespace(version="latest")
         older = SimpleNamespace(version="v1.2.3")
@@ -1901,8 +2107,6 @@ repositories:
         assert selected is latest
 
     def test_select_skill_by_version_falls_back_to_original_logic_when_missing(self):
-        from src.models.repository import SkillRepository
-
         repo = SkillRepository(MagicMock())
         latest = SimpleNamespace(version="latest")
         older = SimpleNamespace(version="v1.2.3")
@@ -1913,8 +2117,6 @@ repositories:
         assert selected is latest
 
     async def test_create_skill_data_validation(self):
-        from src.api.schemas.skill import SkillCreate
-
         skill_data = {
             "skill_id": "test/skill:v1.0.0",
             "name": "test-skill",
@@ -1933,9 +2135,6 @@ repositories:
         assert skill.name == "test-skill"
 
     async def test_skill_create_missing_required_fields(self):
-        from pydantic import ValidationError
-
-        from src.api.schemas.skill import SkillCreate
 
         with pytest.raises(ValidationError):
             SkillCreate(
@@ -1945,8 +2144,6 @@ repositories:
             )
 
     async def test_skill_response_model(self):
-        from src.api.schemas.skill import SkillResponse
-
         skill_dict = {
             "id": str(uuid.uuid4()),
             "skill_id": "test/skill:v1.0.0",
@@ -1976,8 +2173,6 @@ class TestReconcileSkillStatistics:
     """扫描落库后的统计自愈：contributors.skill_count / skill_repos.skill_num。"""
 
     def _make_manager(self, repo_repository, contributor_repository):
-        from skillcrawler.core.skill_manager import SkillManager
-
         return SkillManager(MagicMock(), repo_repository, contributor_repository)
 
     async def test_reconcile_calls_both_repositories(self):
@@ -2013,11 +2208,6 @@ class TestExtractDeclaredVersion:
     """frontmatter version 声明位置兼容：顶层 version 与 metadata.version 嵌套。"""
 
     def test_top_level_version(self):
-        from skillcrawler.core.skill_parser import (
-            extract_declared_version,
-            parse_skill_frontmatter_text,
-        )
-
         meta, _ = parse_skill_frontmatter_text(
             "---\nname: s\nversion: 1.0.0\n---\nbody\n"
         )
@@ -2025,10 +2215,6 @@ class TestExtractDeclaredVersion:
 
     def test_nested_metadata_version_azure_skills_style(self):
         """azure-skills 真实格式：version 嵌套在 metadata: 块下。"""
-        from skillcrawler.core.skill_parser import (
-            extract_declared_version,
-            parse_skill_frontmatter_text,
-        )
 
         text = (
             "---\n"
@@ -2046,20 +2232,15 @@ class TestExtractDeclaredVersion:
 
     def test_nested_metadata_version_as_dict(self):
         """metadata 解析为 dict 时（保留嵌套结构的解析器）也能取到。"""
-        from skillcrawler.core.skill_parser import extract_declared_version
 
         meta = {"name": "s", "metadata": {"author": "Microsoft", "version": "2.0.0"}}
         assert extract_declared_version(meta) == "2.0.0"
 
     def test_top_level_wins_over_nested(self):
-        from skillcrawler.core.skill_parser import extract_declared_version
-
         meta = {"version": "1.0.0", "metadata": {"version": "9.9.9"}}
         assert extract_declared_version(meta) == "1.0.0"
 
     def test_missing_version_returns_none(self):
-        from skillcrawler.core.skill_parser import extract_declared_version
-
         assert extract_declared_version({"name": "s"}) is None
         assert extract_declared_version({"metadata": {"author": "x"}}) is None
 
@@ -2068,14 +2249,11 @@ class TestExtractDeclaredTags:
     """frontmatter tags 归一化：逗号分隔字符串 / YAML 列表 / 嵌套 metadata 块。"""
 
     def _parse(self, text: str) -> dict:
-        from skillcrawler.core.skill_parser import parse_skill_frontmatter_text
-
         meta, _ = parse_skill_frontmatter_text(text)
         return meta
 
     def test_comma_separated_string_split(self):
         """datadog-labs 风格：metadata 块下逗号分隔字符串，拆成多个 tag。"""
-        from skillcrawler.core.skill_parser import extract_declared_tags
 
         meta = self._parse(
             "---\n"
@@ -2089,8 +2267,6 @@ class TestExtractDeclaredTags:
         assert extract_declared_tags(meta) == ["browser-sdk", "sourcemaps", "rum"]
 
     def test_inline_list_tags(self):
-        from skillcrawler.core.skill_parser import extract_declared_tags
-
         meta = self._parse(
             "---\nname: s\ndescription: d\ntags: [python, \"fast api\"]\n---\nbody\n"
         )
@@ -2098,7 +2274,6 @@ class TestExtractDeclaredTags:
 
     def test_space_separated_string_split(self):
         """NVIDIA blueprint 风格：metadata 块下空格分隔字符串，拆成多个 tag。"""
-        from skillcrawler.core.skill_parser import extract_declared_tags
 
         meta = self._parse(
             "---\n"
@@ -2115,7 +2290,6 @@ class TestExtractDeclaredTags:
 
     def test_block_list_preserves_multi_word_tags(self):
         """YAML 列表项是结构化声明，项内空格属于 tag 名，不拆分。"""
-        from skillcrawler.core.skill_parser import extract_declared_tags
 
         meta = self._parse(
             "---\n"
@@ -2130,36 +2304,26 @@ class TestExtractDeclaredTags:
         assert extract_declared_tags(meta) == ["Extended Context", "NeMo Curator"]
 
     def test_block_list_tags(self):
-        from skillcrawler.core.skill_parser import extract_declared_tags
-
         meta = self._parse(
             "---\nname: s\ndescription: d\ntags:\n  - python\n  - asyncio\n---\nbody\n"
         )
         assert extract_declared_tags(meta) == ["python", "asyncio"]
 
     def test_single_string_and_dedupe(self):
-        from skillcrawler.core.skill_parser import extract_declared_tags
-
         meta = self._parse(
             "---\nname: s\ndescription: d\ntags: \"python, python , , asyncio\"\n---\nbody\n"
         )
         assert extract_declared_tags(meta) == ["python", "asyncio"]
 
     def test_top_level_wins_over_nested_dict(self):
-        from skillcrawler.core.skill_parser import extract_declared_tags
-
         meta = {"tags": "a, b", "metadata": {"tags": "x, y"}}
         assert extract_declared_tags(meta) == ["a", "b"]
 
     def test_nested_dict_tags_fallback(self):
-        from skillcrawler.core.skill_parser import extract_declared_tags
-
         meta = {"name": "s", "metadata": {"tags": "x, y"}}
         assert extract_declared_tags(meta) == ["x", "y"]
 
     def test_missing_tags_returns_none(self):
-        from skillcrawler.core.skill_parser import extract_declared_tags
-
         assert extract_declared_tags({"name": "s"}) is None
         assert extract_declared_tags({"tags": " , "}) is None
 
@@ -2172,15 +2336,154 @@ class TestGitOperationsTags:
         _git(path, "config", "user.name", "WittyHub Tests")
 
     def test_tag_sort_key_orders_versions_naturally(self):
-        from skillcrawler.core.git_operations import GitOperations
 
         key = GitOperations._tag_sort_key
         assert key("v10.0.0") > key("v9.0.0")
         assert key("v2.1.10") > key("v2.1.9")
         assert key("2.0") > key("1.9")
 
+    def test_sync_catalog_repository_clones_when_absent(self, tmp_path):
+        origin = tmp_path / "origin.git"
+        self._init_repository(origin)
+        (origin / "skill.yaml").write_text("name: t\n", encoding="utf-8")
+        _git(origin, "add", ".")
+        _git(origin, "commit", "-m", "init")
+
+        target = tmp_path / "catalog"
+        GitOperations(github_token=None).sync_catalog_repository(target, str(origin))
+
+        assert (target / ".git").exists()
+        assert (target / "skill.yaml").exists()
+
+    def test_sync_catalog_repository_pulls_when_present(self, tmp_path):
+        origin = tmp_path / "origin.git"
+        self._init_repository(origin)
+        (origin / "skill.yaml").write_text("name: t\n", encoding="utf-8")
+        _git(origin, "add", ".")
+        _git(origin, "commit", "-m", "init")
+
+        target = tmp_path / "catalog"
+        GitOperations(github_token=None).sync_catalog_repository(target, str(origin))
+
+        # 仓库端新增提交后再次同步走 pull --ff-only
+        (origin / "skill.yaml").write_text("name: t2\n", encoding="utf-8")
+        _git(origin, "add", ".")
+        _git(origin, "commit", "-m", "update")
+        GitOperations(github_token=None).sync_catalog_repository(target, str(origin))
+
+        assert (target / "skill.yaml").read_text(encoding="utf-8") == "name: t2\n"
+
+    def test_sync_catalog_repository_replaces_stale_non_git_dir(self, tmp_path):
+        """目标目录已存在但非 git 仓库（clone 中断残留）→ 清掉后重新 clone。"""
+        origin = tmp_path / "origin.git"
+        self._init_repository(origin)
+        (origin / "skill.yaml").write_text("name: t\n", encoding="utf-8")
+        _git(origin, "add", ".")
+        _git(origin, "commit", "-m", "init")
+
+        target = tmp_path / "catalog"
+        target.mkdir()
+        (target / "garbage.txt").write_text("stale", encoding="utf-8")
+
+        GitOperations(github_token=None).sync_catalog_repository(target, str(origin))
+
+        assert (target / ".git").exists()
+        assert not (target / "garbage.txt").exists()
+
+    def test_sync_catalog_repository_empty_dir_clones(self, tmp_path):
+        """目标目录存在但为空（clone 中断残留）→ 直接 clone 不报 File exists。"""
+        origin = tmp_path / "origin.git"
+        self._init_repository(origin)
+        (origin / "skill.yaml").write_text("name: t\n", encoding="utf-8")
+        _git(origin, "add", ".")
+        _git(origin, "commit", "-m", "init")
+
+        target = tmp_path / "catalog"
+        target.mkdir()
+
+        GitOperations(github_token=None).sync_catalog_repository(target, str(origin))
+
+        assert (target / ".git").exists()
+
+    def test_sync_catalog_repository_concurrent_calls_no_file_exists(self, tmp_path):
+        """并发调用不报 File exists（进程内互斥锁保护 check-then-act）。
+
+        复现：API 启动时 discover 调度与分类补齐同时调用
+        sync_openEuler_skills_repo → 两个线程同时 clone 同一目录，
+        第二个撞上 "File exists"。
+        """
+        origin = tmp_path / "origin.git"
+        self._init_repository(origin)
+        (origin / "skill.yaml").write_text("name: t\n", encoding="utf-8")
+        _git(origin, "add", ".")
+        _git(origin, "commit", "-m", "init")
+
+        target = tmp_path / "catalog"
+        errors: list[Exception] = []
+
+        def sync():
+            try:
+                GitOperations(github_token=None).sync_catalog_repository(
+                    target, str(origin),
+                )
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=sync) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == []
+        assert (target / ".git").exists()
+
+    def test_sync_catalog_repository_replaces_dangling_symlink(self, tmp_path):
+        """目标是断链符号链接时 unlink 后重新 clone，不报 File exists。
+
+        复现：宿主机 dev 目录被 symlink 到容器路径但未挂载进容器——
+        symlink 的 exists() 为 False（漏过 rmtree），git clone 却按链接
+        本身存在判定，报 "could not create work tree dir: File exists"。
+        """
+        origin = tmp_path / "origin.git"
+        self._init_repository(origin)
+        (origin / "skill.yaml").write_text("name: t\n", encoding="utf-8")
+        _git(origin, "add", ".")
+        _git(origin, "commit", "-m", "init")
+
+        target = tmp_path / "catalog"
+        os.symlink(tmp_path / "not-mounted-anywhere", target)
+        assert target.is_symlink() and not target.exists()  # 断链
+
+        GitOperations(github_token=None).sync_catalog_repository(target, str(origin))
+
+        assert not target.is_symlink()
+        assert (target / ".git").exists()
+        assert (target / "skill.yaml").exists()
+
+    def test_sync_catalog_repository_keeps_valid_symlink_target(self, tmp_path):
+        """symlink 指向真实 git 仓库时走 pull 分支，只更新、不删链接。"""
+        origin = tmp_path / "origin.git"
+        self._init_repository(origin)
+        (origin / "skill.yaml").write_text("name: t\n", encoding="utf-8")
+        _git(origin, "add", ".")
+        _git(origin, "commit", "-m", "init")
+
+        real_target = tmp_path / "real-catalog"
+        GitOperations(github_token=None).sync_catalog_repository(real_target, str(origin))
+
+        link = tmp_path / "catalog"
+        os.symlink(real_target, link)
+
+        (origin / "skill.yaml").write_text("name: t2\n", encoding="utf-8")
+        _git(origin, "add", ".")
+        _git(origin, "commit", "-m", "update")
+        GitOperations(github_token=None).sync_catalog_repository(link, str(origin))
+
+        assert link.is_symlink()
+        assert (real_target / "skill.yaml").read_text(encoding="utf-8") == "name: t2\n"
+
     def test_cleanup_orphaned_tmp_packs_only_removes_temporaries(self, tmp_path):
-        from skillcrawler.core.git_operations import GitOperations
 
         pack_dir = tmp_path / ".git" / "objects" / "pack"
         pack_dir.mkdir(parents=True)
@@ -2210,8 +2513,6 @@ class TestGitOperationsTags:
         _git(tmp_path, "clone", "--depth", "1", "--no-checkout", "--filter=blob:none",
              str(origin), str(clone_dir))
 
-        from skillcrawler.core.git_operations import GitOperations
-
         git_ops = GitOperations(github_token=None, max_tags_per_repo=3)
         tags = git_ops._list_remote_tags(clone_dir, str(origin), None)
 
@@ -2240,8 +2541,6 @@ class TestGitOperationsTags:
         _git(tmp_path, "clone", "--depth", "1", "--no-checkout", "--filter=blob:none",
              f"file://{origin}", str(clone_dir))
         assert _git(clone_dir, "tag").splitlines() == []
-
-        from skillcrawler.core.git_operations import GitOperations
 
         git_ops = GitOperations(github_token=None, max_tags_per_repo=2)
         tags = git_ops._get_repository_latest_tags(clone_dir, f"file://{origin}", None)
@@ -2277,8 +2576,6 @@ class TestGitOperationsTags:
             f"file://{origin}", str(clone_dir),
         )
 
-        from skillcrawler.core.git_operations import GitOperations
-
         git_ops = GitOperations(github_token=None, max_tags_per_repo=2)
         tags = git_ops._get_repository_latest_tags(clone_dir, f"file://{origin}", None)
 
@@ -2302,8 +2599,6 @@ class TestGitOperationsTags:
         orphaned = pack_dir / "tmp_pack_orphan"
         orphaned.write_bytes(b"partial transfer")
 
-        from skillcrawler.core.git_operations import GitOperations
-
         git_ops = GitOperations(github_token=None, max_tags_per_repo=1)
         with patch.object(
             GitOperations, "_run_git_command_with_auth_retry",
@@ -2323,7 +2618,6 @@ class TestGitOperationsMaterialize:
         _git(path, "config", "user.name", "WittyHub Tests")
 
     def test_materialize_skill_objects_fetches_missing_blobs(self, tmp_path):
-        from skillcrawler.core.git_operations import GitOperations
 
         origin = tmp_path / "origin.git"
         self._init_repository(origin)
@@ -2378,16 +2672,11 @@ class TestGitOperationsMaterialize:
         assert not blobs_missing(clone_dir, older_commit, ".agents/skills/demo")
 
     def test_materialize_skill_objects_without_git_dir_returns_false(self, tmp_path):
-        from skillcrawler.core.git_operations import GitOperations
-
         git_ops = GitOperations(github_token=None)
         assert git_ops.materialize_skill_objects(tmp_path, "HEAD", "skills/demo") is False
 
     def test_materialize_retries_after_transient_network_error(self, tmp_path, caplog):
         """网络抖动中断懒拉取后重试续拉（已缓存 blob 自动跳过），日志带 git stderr。"""
-        import logging
-
-        from skillcrawler.core.git_operations import MATERIALIZE_ATTEMPTS, GitOperations
 
         (tmp_path / ".git").mkdir()
         git_ops = GitOperations(github_token=None)
@@ -2402,11 +2691,12 @@ class TestGitOperationsMaterialize:
             stdout="aaa111 blob 3\nbbb222 blob 4\n", stderr="",
         )
 
-        caplog.set_level(logging.WARNING, logger="skillcrawler.core.git_operations")
+        caplog.set_level(logging.WARNING, logger="src.utils.git_operations")
         with (
-            patch.object(GitOperations, "_run_git_command", return_value=listing),
+            # 首次调用为 cat-file -e 存在性检查，其后为 ls-tree 列举
+            patch.object(GitOperations, "_run_git_command", side_effect=["", listing]),
             patch(
-                "skillcrawler.core.git_operations.subprocess.run",
+                "src.utils.git_operations.subprocess.run",
                 side_effect=[failure, success],
             ) as run_mock,
         ):
@@ -2418,9 +2708,6 @@ class TestGitOperationsMaterialize:
 
     def test_materialize_fails_after_exhausting_retries(self, tmp_path, caplog):
         """全部尝试失败返回 False，每次告警都带 git stderr 便于排查。"""
-        import logging
-
-        from skillcrawler.core.git_operations import MATERIALIZE_ATTEMPTS, GitOperations
 
         (tmp_path / ".git").mkdir()
         git_ops = GitOperations(github_token=None)
@@ -2431,11 +2718,12 @@ class TestGitOperationsMaterialize:
             output="", stderr="could not fetch from promisor remote",
         )
 
-        caplog.set_level(logging.WARNING, logger="skillcrawler.core.git_operations")
+        caplog.set_level(logging.WARNING, logger="src.utils.git_operations")
         with (
-            patch.object(GitOperations, "_run_git_command", return_value=listing),
+            # 首次调用为 cat-file -e 存在性检查，其后为 ls-tree 列举
+            patch.object(GitOperations, "_run_git_command", side_effect=["", listing]),
             patch(
-                "skillcrawler.core.git_operations.subprocess.run",
+                "src.utils.git_operations.subprocess.run",
                 side_effect=failure,
             ) as run_mock,
         ):
@@ -2445,22 +2733,39 @@ class TestGitOperationsMaterialize:
         assert "could not fetch from promisor remote" in caplog.text
         assert f"(attempt {MATERIALIZE_ATTEMPTS}/{MATERIALIZE_ATTEMPTS})" in caplog.text
 
+    def test_materialize_rejects_nonexistent_skill_path(self, tmp_path, caplog):
+        """skill_path 在 ref 下不存在时返回 False 而非静默通过。
+
+        复现：路径少了目录前缀（如 asplore-orchestration 而非
+        skills/aspire-orchestration）时，ls-tree 静默返回空列表，
+        若不校验会发往 Jenkins 在 checkout 阶段才报 exit code 3。
+        """
+        (tmp_path / ".git").mkdir()
+        git_ops = GitOperations(github_token=None)
+
+        failure = subprocess.CalledProcessError(
+            128, ["git", "cat-file", "-e"],
+            output="", stderr="Not a valid object name",
+        )
+        caplog.set_level(logging.WARNING, logger="src.utils.git_operations")
+        with patch.object(GitOperations, "_run_git_command", side_effect=failure):
+            assert git_ops.materialize_skill_objects(
+                tmp_path, "HEAD", "aspire-orchestration",
+            ) is False
+
+        assert "does not exist" in caplog.text
+
 
 class TestDeepSeekCategoryClassifier:
     @staticmethod
     def _make_classifier():
-        from skillcrawler.core.category_classifier import DeepSeekCategoryClassifier
-
         with patch(
-            "skillcrawler.core.category_classifier.load_skill_categories",
+            "src.ai.category_classifier.load_skill_categories",
             return_value=["Development and Build", "others"],
         ):
             return DeepSeekCategoryClassifier(repository_path=None)
 
     def test_classify_retries_transient_timeout_then_succeeds(self):
-        import httpx
-
-        from skillcrawler.core.category_classifier import DeepSeekCategoryClassifier
 
         classifier = self._make_classifier()
         with (
@@ -2472,7 +2777,7 @@ class TestDeepSeekCategoryClassifier:
                     "Development and Build",
                 ],
             ) as call_mock,
-            patch("skillcrawler.core.category_classifier.time.sleep") as sleep_mock,
+            patch("src.ai.category_classifier.time.sleep") as sleep_mock,
         ):
             category = classifier.classify(
                 skill_file=Path("SKILL.md"),
@@ -2487,12 +2792,6 @@ class TestDeepSeekCategoryClassifier:
 
     def test_classify_degrades_to_frontmatter_after_transient_exhausted(self):
         """网络故障重试耗尽后沿用合法的 frontmatter category（归一化后），不 fatal 中断扫描。"""
-        import httpx
-
-        from skillcrawler.core.category_classifier import (
-            CATEGORY_RETRY_ATTEMPTS,
-            DeepSeekCategoryClassifier,
-        )
 
         classifier = self._make_classifier()
         with (
@@ -2508,7 +2807,7 @@ class TestDeepSeekCategoryClassifier:
                 # 第二次调用（降级校验）归一为合法标准分类
                 side_effect=[None, "Development and Build"],
             ),
-            patch("skillcrawler.core.category_classifier.time.sleep"),
+            patch("src.ai.category_classifier.time.sleep"),
         ):
             category = classifier.classify(
                 skill_file=Path("SKILL.md"),
@@ -2523,12 +2822,6 @@ class TestDeepSeekCategoryClassifier:
 
     def test_classify_degrades_to_none_when_frontmatter_category_invalid(self):
         """frontmatter category 不在类别表内时降级返回 None，留待下轮重新分类。"""
-        import httpx
-
-        from skillcrawler.core.category_classifier import (
-            CATEGORY_RETRY_ATTEMPTS,
-            DeepSeekCategoryClassifier,
-        )
 
         classifier = self._make_classifier()
         with (
@@ -2537,7 +2830,7 @@ class TestDeepSeekCategoryClassifier:
                 "_call_deepseek",
                 side_effect=httpx.ReadTimeout("The read operation timed out"),
             ) as call_mock,
-            patch("skillcrawler.core.category_classifier.time.sleep"),
+            patch("src.ai.category_classifier.time.sleep"),
         ):
             category = classifier.classify(
                 skill_file=Path("SKILL.md"),
@@ -2551,10 +2844,6 @@ class TestDeepSeekCategoryClassifier:
 
     def test_classify_fatal_on_non_transient_error(self):
         """配置/凭据类错误保持 fatal 语义，且不做无意义重试。"""
-        from skillcrawler.core.category_classifier import (
-            CategoryClassificationError,
-            DeepSeekCategoryClassifier,
-        )
 
         classifier = self._make_classifier()
         with (
@@ -2563,7 +2852,7 @@ class TestDeepSeekCategoryClassifier:
                 "_call_deepseek",
                 side_effect=RuntimeError("invalid api key"),
             ) as call_mock,
-            patch("skillcrawler.core.category_classifier.time.sleep") as sleep_mock,
+            patch("src.ai.category_classifier.time.sleep") as sleep_mock,
         ):
             with pytest.raises(CategoryClassificationError):
                 classifier.classify(
@@ -2577,9 +2866,6 @@ class TestDeepSeekCategoryClassifier:
         sleep_mock.assert_not_called()
 
     def test_is_transient_error_classification(self):
-        import httpx
-
-        from skillcrawler.core.category_classifier import DeepSeekCategoryClassifier
 
         request = httpx.Request("POST", "https://x")
         server_error = httpx.HTTPStatusError(
@@ -2597,17 +2883,12 @@ class TestDeepSeekCategoryClassifier:
 
 class TestSearchService:
     async def test_search_service_initialization(self):
-        from src.indexer.search import SearchService
-
         mock_session = MagicMock()
         service = SearchService(mock_session)
         assert service is not None
         assert service.session == mock_session
 
     def test_semantic_search_skips_text_search(self):
-        from unittest.mock import AsyncMock
-
-        from src.indexer.search import SearchService
 
         service = SearchService(MagicMock())
         service._text_search = AsyncMock()
@@ -2628,8 +2909,6 @@ class TestSearchService:
         assert result["mode"] == "semantic"
 
     def test_text_search_fetches_only_requested_page(self):
-        from src.indexer.search import SearchService
-
         service = SearchService(MagicMock())
         service._text_search = AsyncMock(
             return_value={"results": [{"skill_id": "skill-1"}], "total": 1}
@@ -2659,8 +2938,6 @@ class TestSearchService:
         assert result["results"] == [{"skill_id": "skill-1"}]
 
     def test_hybrid_search_total_and_pagination_use_fused_candidates(self):
-        from src.indexer.search import HYBRID_CANDIDATE_LIMIT, SearchService
-
         service = SearchService(MagicMock())
         service._text_search = AsyncMock(
             return_value={
@@ -2707,10 +2984,6 @@ class TestAsyncNonBlocking:
     """扫描链路的同步阻塞调用（git/LLM）必须放线程池，不冻结事件循环。"""
 
     async def test_discover_scan_does_not_block_event_loop(self):
-        import asyncio
-        import time
-
-        from skillcrawler.core.skill_manager import SkillManager, SkillRepositoryRequest
 
         manager = SkillManager(MagicMock(), AsyncMock())
         started = time.perf_counter()
@@ -2744,8 +3017,6 @@ class TestDeleteCleanup:
     """删除仓库/技能时的软关联清理与统计自愈。"""
 
     async def test_delete_skill_repositories_cleans_skill_and_version_soft_links(self):
-        from src.models.repository import SkillRepoRepository
-
         skill_one, skill_two, version_one = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
         session = AsyncMock()
         session.execute = AsyncMock(
@@ -2771,8 +3042,6 @@ class TestDeleteCleanup:
         }
 
     async def test_skill_delete_cleans_version_soft_links(self):
-        from src.models.repository import SkillRepository
-
         skill_uuid, version_one, version_two = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
         session = AsyncMock()
         session.execute = AsyncMock(
@@ -2788,7 +3057,7 @@ class TestDeleteCleanup:
             "src.models.repository.SkillRepository.delete_skill_related_records",
             related_mock,
         ):
-            result = await SkillRepository(session).delete("gitcode:acme/widgets/one")
+            result = await SkillRepository(session).delete("atomgit:acme/widgets/one")
 
         assert result is True
         assert set(related_mock.await_args.args[0]) == {
@@ -2796,8 +3065,6 @@ class TestDeleteCleanup:
         }
 
     async def test_delete_skill_repository_reconciles_statistics(self):
-        from skillcrawler.core.skill_manager import SkillManager
-
         manager = SkillManager(MagicMock(), AsyncMock())
         stored = SimpleNamespace(id=uuid.uuid4(), local_path=None)
         reconcile_mock = AsyncMock()
@@ -2818,8 +3085,6 @@ class TestSkillUrlContribution:
     """skills[].skill_url 单 Skill 贡献：URL 解析、请求合并与收窄扫描。"""
 
     def test_parse_skill_md_url_parses_repo_ref_and_path(self):
-        from skillcrawler.core.skill_parser import parse_skill_md_url
-
         repo_url, ref, skill_path = parse_skill_md_url(
             "https://github.com/example/skills.git/blob/main/skills/demo/SKILL.md"
         )
@@ -2827,17 +3092,15 @@ class TestSkillUrlContribution:
         assert ref == "main"
         assert skill_path == "skills/demo/SKILL.md"
 
-        # atomgit 旧域名规范化为 gitcode；查询串/锚点忽略
+        # atomgit 旧域名规范化为 atomgit；查询串/锚点忽略
         repo_url, ref, skill_path = parse_skill_md_url(
             "https://atomgit.com/acme/x/blob/master/SKILL.md?plain=1"
         )
-        assert repo_url == "https://gitcode.com/acme/x"
+        assert repo_url == "https://atomgit.com/acme/x"
         assert ref == "master"
         assert skill_path == "SKILL.md"
 
     def test_parse_skill_md_url_rejects_invalid(self):
-        from skillcrawler.core.skill_parser import parse_skill_md_url
-
         for bad in (
             "",
             "https://github.com/acme/x/tree/main",
@@ -2848,8 +3111,6 @@ class TestSkillUrlContribution:
                 parse_skill_md_url(bad)
 
     def test_load_catalog_skill_url_entries_collects_skills(self, tmp_path):
-        from skillcrawler.config import load_catalog_skill_url_entries
-
         skill_file = tmp_path / "community" / "sig-demo" / "skill.yaml"
         skill_file.parent.mkdir(parents=True)
         skill_file.write_text(
@@ -2871,8 +3132,6 @@ class TestSkillUrlContribution:
         ]
 
     def test_build_requests_merges_skill_urls_per_repo(self, tmp_path):
-        from skillcrawler.main import build_configured_discover_requests
-
         skill_file = tmp_path / "community" / "sig-demo" / "skill.yaml"
         skill_file.parent.mkdir(parents=True)
         skill_file.write_text(
@@ -2896,8 +3155,6 @@ class TestSkillUrlContribution:
         assert request.skill_paths == ["skills/one/SKILL.md", "skills/two/SKILL.md"]
 
     def test_build_requests_skips_skill_urls_covered_by_skill_repos(self, tmp_path):
-        from skillcrawler.main import build_configured_discover_requests
-
         skill_file = tmp_path / "community" / "sig-demo" / "skill.yaml"
         skill_file.parent.mkdir(parents=True)
         skill_file.write_text(
@@ -2917,8 +3174,6 @@ class TestSkillUrlContribution:
         assert requests[0].skill_paths is None
 
     def test_build_requests_rejects_mixed_refs_for_same_repo(self, tmp_path):
-        from skillcrawler.main import build_configured_discover_requests
-
         skill_file = tmp_path / "community" / "sig-demo" / "skill.yaml"
         skill_file.parent.mkdir(parents=True)
         skill_file.write_text(
@@ -2934,8 +3189,6 @@ class TestSkillUrlContribution:
             build_configured_discover_requests(repository_path=tmp_path)
 
     def test_build_requests_rejects_missing_skill_name(self, tmp_path):
-        from skillcrawler.main import build_configured_discover_requests
-
         skill_file = tmp_path / "community" / "sig-demo" / "skill.yaml"
         skill_file.parent.mkdir(parents=True)
         skill_file.write_text(
@@ -2949,7 +3202,6 @@ class TestSkillUrlContribution:
 
     async def test_configured_discover_skill_paths_restricts_scan_scope(self):
         """URL 方式贡献：请求 skill_paths 非空时只扫描登记的 SKILL.md。"""
-        from skillcrawler.core.skill_manager import SkillManager, SkillRepositoryRequest
 
         skill_repository = MagicMock()
         skill_repository.list_unscored_by_skill_repo = AsyncMock(return_value=([], []))
@@ -2990,8 +3242,6 @@ class TestSkillUrlContribution:
 
     async def test_start_scan_skill_path_filter_restricts_head_and_tags(self, tmp_path):
         """收窄扫描：HEAD 与 tag 版本都只收录登记的 SKILL.md。"""
-        from skillcrawler.core.git_operations import GitOperations
-        from skillcrawler.core.skill_scanner import SkillScanner
 
         repository = tmp_path / "repository"
         repository.mkdir()
@@ -3019,8 +3269,8 @@ class TestSkillUrlContribution:
         )
         repo = SimpleNamespace(
             id=uuid.uuid4(),
-            source="gitcode",
-            url="https://gitcode.com/acme/widgets",
+            source="atomgit",
+            url="https://atomgit.com/acme/widgets",
             branch="master",
             platform=None,
         )
@@ -3037,18 +3287,16 @@ class TestSkillUrlContribution:
             skill_path_filter={"skills/one/SKILL.md"},
         )
 
-        assert [skill.skill_id for skill in skills] == ["gitcode:acme/widgets/one"]
-        assert {v.skill_id for v in tagged_skills} == {"gitcode:acme/widgets/one"}
+        assert [skill.skill_id for skill in skills] == ["atomgit:acme/widgets/one"]
+        assert {v.skill_id for v in tagged_skills} == {"atomgit:acme/widgets/one"}
 
 
 class TestConfig:
     async def test_get_settings(self):
-        from src.core.config import get_settings
-
         with patch.dict(
             "os.environ",
             {
-                "DATABASE_URL": "postgresql+asyncpg://user:pass@localhost:5432/wittyhub",
+                "DATABASE_URL": "postgresql+asyncpg://user:pass@localhost:5432/skillhub",
             },
         ):
             settings = get_settings()
@@ -3059,8 +3307,6 @@ class TestConfig:
 
 class TestAPIRoutes:
     async def test_health_endpoint(self):
-        from src.api.routes.health import router
-
         assert router is not None
         routes = [route.path for route in router.routes]
         assert "/health" in routes
@@ -3068,8 +3314,6 @@ class TestAPIRoutes:
 
 class TestSkillSchema:
     async def test_skill_id_format(self):
-        from src.api.schemas.skill import SkillResponse
-
         skill_data = {
             "id": str(uuid.uuid4()),
             "skill_id": "author/skill-name:v1.0.0",
@@ -3092,9 +3336,7 @@ class TestSkillSchema:
         assert response.skill_id.startswith("author/")
 
     async def test_source_validation(self):
-        from src.api.schemas.skill import SkillResponse
-
-        valid_sources = ["local", "github", "clawhub", "gitcode", "gitlab"]
+        valid_sources = ["local", "github", "clawhub", "atomgit", "gitlab"]
         for source in valid_sources:
             skill_data = {
                 "id": str(uuid.uuid4()),

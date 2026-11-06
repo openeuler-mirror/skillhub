@@ -62,7 +62,7 @@ def test_missing_jenkins_artifact_is_finalized_immediately():
 
 
 def test_final_result_log_contains_report():
-    with patch("src.security.detector.logger.info") as log_info:
+    with patch("src.security.detector.collector_logger.info") as log_info:
         _log_skillspector_final_result(
             audit_id="audit-1",
             build_number=123,
@@ -93,7 +93,7 @@ def test_missing_jenkins_build_is_terminal():
 
 
 def test_collector_event_log_contains_decision():
-    with patch("src.security.detector.logger.info") as log_info:
+    with patch("src.security.detector.collector_logger.info") as log_info:
         _log_collector_event(
             "item_deferred",
             audit_id="audit-1",
@@ -123,7 +123,7 @@ def test_run_scan_uses_report_even_when_build_not_success():
         patch.object(client, "fetch_report", return_value=report) as mock_fetch,
         patch.object(client, "fetch_report_md", return_value=report_md) as mock_fetch_md,
     ):
-        result, md = client.run_scan("https://gitcode.com/openeuler/foo")
+        result, md = client.run_scan("https://atomgit.com/openeuler/foo")
 
     mock_fetch.assert_called_once_with(42)
     mock_fetch_md.assert_called_once_with(42)
@@ -141,7 +141,7 @@ def test_run_scan_errors_when_report_unavailable():
         patch.object(client, "wait_for_build", return_value="SUCCESS"),
         patch.object(client, "fetch_report", return_value=None),
     ):
-        result, _ = client.run_scan("https://gitcode.com/openeuler/foo")
+        result, _ = client.run_scan("https://atomgit.com/openeuler/foo")
 
     assert "error" in result
 

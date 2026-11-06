@@ -1,0 +1,747 @@
+"""后台定时 LLM 复核调度器（Skill 安全审计误报复核）。
+
+在每天 ``audit_llm_review.start_time`` ~ ``end_time`` 窗口内，分批读取
+``security_audits`` 中尚未复核过的 SkillSpector 风险项，调用 OpenAI 兼容
+接口让模型逐条判定是否为真实风险，剔除误报后重算风险分与等级并回写：
+
+- ``security_audits.risk_signals`` / ``risk_level``
+- ``security_audits.details.skillspector_report.issues`` / ``risk_assessment``
+- ``security_audits.details.skillspector_score`` / ``recommendation``
+- ``skills.risk_score`` 或 ``skill_versions.risk_score``
+- ``security_audits.details.llm_review``（复核元数据与误报明细）
+
+设计约束（与 SkillSpector meta_analyzer 的教训保持一致）：
+
+- 只有模型显式判定 ``is_vulnerability=false`` 的命中才会被删除；未出现在
+  模型结果里的命中一律保留，避免因模型漏答造成漏报。
+- 模型返回合法但空的 findings 数组时，先追加纠正提示重试一次；仍为空则
+  视为本次复核失败，不删除任何命中，下轮再试。
+- 单条审计最多复核 ``max_findings_per_audit`` 条（按严重度优先），其余
+  命中原样保留，避免超大报告无限消耗 token。
+- 每轮只处理 ``details.llm_review`` 为空或此前失败且未超过重试上限的审计，
+  复核完成后打标，不会重复消耗模型调用。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import itertools
+import time
+from datetime import datetime, timezone
+from typing import Any
+from zoneinfo import ZoneInfo
+
+import httpx
+from sqlalchemy import Integer, and_, case, cast, func, literal, or_, select
+from sqlalchemy.dialects.postgresql import JSONPATH
+
+from src.core.config import AuditLLMReviewConfig, get_settings
+from src.core.database import AsyncSessionLocal
+from src.models.orm import SecurityAudit, Skill, SkillVersion
+from src.security.audit_review.apply import ReviewApplication
+from src.security.audit_review.context import ContextConfig, FileContentCache
+from src.security.audit_review.llm import call_llm_json, post_chat
+from src.security.audit_review.log import get_logger, reset_run_id, set_run_id
+from src.security.audit_review.metrics import (
+    AuditRecord,
+    RunStats,
+    current_audit,
+    save_run_result,
+)
+from src.security.audit_review.persistence import (
+    mark_skipped,
+    persist,
+    persist_partial,
+    record_failure,
+)
+from src.security.audit_review.prompt import SYSTEM_PROMPT
+from src.core.scheduling import (
+    next_daily,
+    now_in,
+    parse_hhmm,
+    resolve_timezone,
+    resolve_window,
+)
+from src.security.audit_review.queue import _RateLimiter
+from src.security.audit_review.remote_raw import RemoteTokens
+from src.security.audit_review.review import (
+    ReviewDeadlineError,
+    build_partial_meta,
+    review_one,
+)
+
+logger = get_logger("scheduler")
+
+
+def _format_target(target: datetime, tz: ZoneInfo) -> str:
+    """把带配置时区的时刻格式化为「窗口时区 + UTC」双基准，便于跨时区排查。"""
+    local = target.astimezone(tz)
+    utc = target.astimezone(timezone.utc)
+    return (
+        f"{local:%Y-%m-%d %H:%M} {local.tzname() or 'local'} "
+        f"(UTC {utc:%Y-%m-%d %H:%M})"
+    )
+
+
+class AuditLLMReviewScheduler:
+    """每天固定窗口内复核未复核审计的后台任务。
+
+    循环结构天然防重入：一轮 ``run_once`` 结束后才进入下一轮；窗口结束或
+    没有待复核记录时，直接睡到下一个窗口开始。
+    """
+
+    def __init__(self, config: AuditLLMReviewConfig):
+        config = _resolve_review_config(config, get_settings())
+        self._config = config
+        self._api_key = config.api_key
+        # 窗口时区独立配置，避免容器 TZ（线上通常为 UTC）影响复核窗口
+        self._tz = resolve_timezone(config.timezone)
+        self._context_config = ContextConfig(
+            mode=config.context_mode,
+            window_lines=config.window_lines,
+            window_header_lines=config.window_header_lines,
+            window_max_ranges=config.window_max_ranges,
+            window_gap=config.window_gap,
+            full_file_max_bytes=config.full_file_max_bytes,
+            max_file_bytes=config.max_file_bytes,
+            max_context_chars=config.max_context_chars,
+            repo_cache_root=config.repo_cache_root,
+            git_timeout=config.git_timeout,
+            remote_fetch_enabled=config.remote_fetch_enabled,
+            remote_fetch_timeout=config.remote_fetch_timeout,
+            remote_fetch_max_bytes=config.remote_fetch_max_bytes,
+            remote_fetch_max_files_per_audit=config.remote_fetch_max_files_per_audit,
+        )
+        self._remote_tokens = RemoteTokens(
+            github=config.github_token,
+            gitcode=config.gitcode_token,
+            gitlab=config.gitlab_token,
+            gitee=config.gitee_token,
+        )
+        self._file_cache = FileContentCache(config.context_cache_max_bytes)
+        self._running = False
+        self._task: asyncio.Task[None] | None = None
+
+    # ------------------------------------------------------------------
+    # 生命周期
+    # ------------------------------------------------------------------
+
+    def _now(self) -> datetime:
+        """当前时刻（带窗口时区）；窗口与 deadline 判断统一走这里。"""
+        return now_in(self._tz)
+
+    def _check_window_args(self) -> tuple[tuple[int, int], tuple[int, int]]:
+        start = parse_hhmm(self._config.start_time)
+        end = parse_hhmm(self._config.end_time)
+        if start >= end:
+            raise ValueError(
+                "audit_llm_review.start_time must be earlier than end_time, "
+                f"got {self._config.start_time!r} - {self._config.end_time!r}"
+            )
+        return start, end
+
+    async def start(self) -> None:
+        if self._running:
+            return
+        self._check_window_args()
+        self._running = True
+        self._task = asyncio.create_task(self._loop())
+        logger.info(
+            "scheduler started (window=%s-%s %s, model=%s, concurrency=%d, "
+            "max_findings_per_audit=%d, context_mode=%s, rpm=%d, tpm=%d, "
+            "min_confidence=%.2f, min_false_positive_confidence=%.2f/%.2f, "
+            "max_attempts=%d, slow_llm=%.0fs, repo_cache_root=%s, "
+            "remote_fetch=%s, result_dir=%s)",
+            self._config.start_time,
+            self._config.end_time,
+            self._config.timezone,
+            self._config.model,
+            self._config.concurrency,
+            self._config.max_findings_per_audit,
+            self._config.context_mode,
+            self._config.rpm,
+            self._config.tpm,
+            self._config.min_confidence,
+            self._config.min_false_positive_confidence,
+            self._config.min_false_positive_confidence_high,
+            self._config.max_attempts,
+            self._config.slow_llm_seconds,
+            self._config.repo_cache_root,
+            self._config.remote_fetch_enabled,
+            self._config.result_dir or "<storage.local_path/logs>",
+        )
+
+    async def stop(self) -> None:
+        self._running = False
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+        logger.info("scheduler stopped")
+
+    async def _loop(self) -> None:
+        start, end = self._check_window_args()
+        while self._running:
+            now = self._now()
+            window = resolve_window(now, start, end)
+            if window is None:
+                target = next_daily(now, start)
+                logger.info(
+                    "Next review window starts at %s (in %.0fs)",
+                    _format_target(target, self._tz),
+                    max(0.0, (target - now).total_seconds()),
+                )
+                await self._sleep_until(target)
+                continue
+
+            _, end_at = window
+            try:
+                stats = await self.run_once(deadline=end_at)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # 数据库等非模型侧异常：窗口内稍后重试，不直接放弃整晚
+                logger.exception("Scheduled review run failed")
+                await asyncio.sleep(60)
+                continue
+
+            if stats.get("stopped") == "no_credentials":
+                # 配置缺失时不空转：直接睡到下一个窗口（配置在进程启动时读取）
+                target = next_daily(self._now(), start)
+                logger.info(
+                    "Next review window starts at %s",
+                    _format_target(target, self._tz),
+                )
+                await self._sleep_until(target)
+                continue
+            if stats.get("stopped") in {"deadline", "no_work", "error"}:
+                target = next_daily(self._now(), start)
+                logger.info(
+                    "Next review window starts at %s",
+                    _format_target(target, self._tz),
+                )
+                await self._sleep_until(target)
+                continue
+            await asyncio.sleep(60)
+
+    async def _sleep_until(self, target: datetime) -> None:
+        while self._running:
+            remaining = (target - self._now()).total_seconds()
+            if remaining <= 0:
+                return
+            await asyncio.sleep(min(remaining, 3600.0))
+
+    # ------------------------------------------------------------------
+    # 单轮执行
+    # ------------------------------------------------------------------
+
+    async def run_once(self, deadline: datetime | None = None) -> dict[str, Any]:
+        """处理待复核审计直到窗口结束或没有待复核记录。"""
+        config = self._config
+        if not config.base_url or not self._api_key:
+            logger.warning("skipped: audit_llm_review.base_url/api_key is not configured")
+            return {
+                "reviewed": 0,
+                "partial": 0,
+                "failed": 0,
+                "skipped": 0,
+                "stopped": "no_credentials",
+            }
+
+        # run_id 与窗口同一时区，日志里看到的批次时间即北京时间
+        run_id = self._now().strftime("%Y%m%d-%H%M%S")
+        run_token = set_run_id(run_id)
+        stats = RunStats(run_id=run_id, config=config)
+        run_started = time.monotonic()
+        limiter = _RateLimiter(
+            rpm=config.rpm,
+            tpm=config.tpm,
+            slow_wait_seconds=config.rate_limit_slow_wait_seconds,
+        )
+        # 每次多取一些，减少 JSONB 全表过滤的查询次数；实际写库仍按并发度推进
+        page_size = max(10, config.concurrency * 10)
+        consecutive_failures = 0
+        # 供应商整体不可用时快速熔断，避免把整个待复核队列都消耗成失败重试
+        failure_threshold = max(3, config.concurrency * 3)
+        stopped = "no_work"
+        # 一轮 pass 内用 keyset 游标保证每条审计只处理一次，避免一条超大审计
+        # 挤占其他审计；一轮扫完后如果还有剩余且窗口未结束，立即开始下一轮，
+        # 因此队列空闲时同一条审计可以在当晚连续推进多个 200 条。
+        after: tuple[int, int, int, datetime, Any] | None = None
+        pass_index = 1
+        pass_base = 0
+        # 单轮内的处理序号，用于日志的 [i] 前缀（并发下也能看出推进顺序）
+        sequence = itertools.count(1)
+
+        logger.info(
+            "run started: id=%s window=%s-%s %s model=%s concurrency=%d "
+            "max_findings_per_audit=%d context_mode=%s",
+            run_id,
+            config.start_time,
+            config.end_time,
+            config.timezone,
+            config.model,
+            config.concurrency,
+            config.max_findings_per_audit,
+            config.context_mode,
+        )
+
+        timeout = httpx.Timeout(config.timeout, connect=10.0)
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                while True:
+                    if deadline is not None and self._now() >= deadline:
+                        stopped = "deadline"
+                        break
+                    rows = await self._fetch_pending(page_size, after=after)
+                    if not rows:
+                        if stats.counters["reviewed"] + stats.counters["partial"] > pass_base:
+                            # 本轮有实际推进，重置游标开始下一轮（round-robin）
+                            logger.info(
+                                "pass %d complete: reviewed=%d partial=%d; starting next pass",
+                                pass_index,
+                                stats.counters["reviewed"],
+                                stats.counters["partial"],
+                            )
+                            pass_index += 1
+                            pass_base = stats.counters["reviewed"] + stats.counters["partial"]
+                            after = None
+                            continue
+                        stopped = "no_work"
+                        break
+                    after = (
+                        int(rows[-1].get("community_priority") or 0),
+                        int(rows[-1].get("risk_rank") or 0),
+                        int(rows[-1].get("issue_count") or 0),
+                        rows[-1]["audited_at"],
+                        rows[-1]["id"],
+                    )
+
+                    semaphore = asyncio.Semaphore(max(1, config.concurrency))
+
+                    async def _run(
+                        row: dict[str, Any],
+                        _semaphore: asyncio.Semaphore = semaphore,
+                    ) -> str:
+                        nonlocal consecutive_failures
+                        position = next(sequence)
+                        async with _semaphore:
+                            if deadline is not None and self._now() >= deadline:
+                                return "deadline"
+                            record = AuditRecord(
+                                audit_id=str(row.get("id")),
+                                skill_id=str(
+                                    row.get("skill_skill_id")
+                                    or row.get("version_skill_id")
+                                    or ""
+                                ),
+                                name=str(
+                                    row.get("skill_name")
+                                    or row.get("version_name")
+                                    or ""
+                                ),
+                                risk_level=str(row.get("risk_level") or ""),
+                            )
+                            audit_token = current_audit.set(record)
+                            item_started = time.monotonic()
+                            logger.info(
+                                "[%d] reviewing audit=%s skill=%s name=%s level=%s",
+                                position,
+                                record.audit_id,
+                                record.skill_id or "n/a",
+                                record.name or "n/a",
+                                record.risk_level or "unknown",
+                            )
+                            try:
+                                outcome = await self._review_one(
+                                    client, limiter, row, deadline=deadline
+                                )
+                            except ReviewDeadlineError:
+                                outcome = "deadline"
+                                record.skip_reason = "deadline"
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception as exc:
+                                logger.exception(
+                                    "Unexpected review error for audit %s", record.audit_id
+                                )
+                                outcome = "failed"
+                                record.error = f"{type(exc).__name__}: {exc}"
+                                record.error_type = type(exc).__name__
+                            finally:
+                                record.duration_seconds = time.monotonic() - item_started
+                                current_audit.reset(audit_token)
+                            if outcome in {"reviewed", "partial"}:
+                                consecutive_failures = 0
+                            elif outcome == "failed":
+                                consecutive_failures += 1
+                            if outcome == "skipped" and not record.skip_reason:
+                                record.skip_reason = "persist_discarded"
+                            if outcome == "deadline":
+                                # 窗口关闭导致的主动中断不算处理结果，不进入轮次统计
+                                logger.info(
+                                    "audit=%s outcome=deadline (window closed)",
+                                    record.audit_id,
+                                )
+                                return outcome
+                            record.outcome = outcome
+                            stats.record(record)
+                            logger.info(
+                                "audit=%s outcome=%s skill=%s name=%s issues=%d "
+                                "reviewed=%d confirmed=%d false_positive=%d "
+                                "low_confidence=%d score=%s->%s level=%s->%s "
+                                "duration=%.1fs context=%s llm_calls=%d retries=%d "
+                                "tokens~%d",
+                                record.audit_id,
+                                outcome,
+                                record.skill_id or "n/a",
+                                record.name or "n/a",
+                                record.issues_count,
+                                record.reviewed,
+                                record.confirmed,
+                                record.false_positive,
+                                record.low_confidence,
+                                record.score_before,
+                                record.score_after,
+                                record.level_before or "unknown",
+                                record.level_after or "unknown",
+                                record.duration_seconds,
+                                record.context_source or "n/a",
+                                record.llm_calls,
+                                record.llm_retries,
+                                record.estimated_tokens,
+                            )
+                            return outcome
+
+                    outcomes = await asyncio.gather(*(_run(row) for row in rows))
+                    if outcomes and all(outcome == "deadline" for outcome in outcomes):
+                        stopped = "deadline"
+                        break
+                    if consecutive_failures >= failure_threshold:
+                        logger.error(
+                            "circuit breaker tripped after %d consecutive failures; "
+                            "stopping this run",
+                            consecutive_failures,
+                        )
+                        stopped = "error"
+                        break
+                    stats.apply_limiter_stats(limiter)
+                    logger.info(
+                        "progress: reviewed=%d partial=%d failed=%d skipped=%d "
+                        "rate_limit_wait=%.0fs elapsed=%.0fs",
+                        stats.counters["reviewed"],
+                        stats.counters["partial"],
+                        stats.counters["failed"],
+                        stats.counters["skipped"],
+                        stats.rate_limit_wait_seconds,
+                        time.monotonic() - run_started,
+                    )
+        except asyncio.CancelledError:
+            stats.stopped = "cancelled"
+            reset_run_id(run_token)
+            raise
+        except Exception:
+            stats.stopped = "error"
+            await self._finalize_run(stats, limiter, run_started)
+            reset_run_id(run_token)
+            raise
+
+        stats.stopped = stopped
+        await self._finalize_run(stats, limiter, run_started)
+        reset_run_id(run_token)
+        return stats.summary()
+
+    async def _finalize_run(
+        self,
+        stats: RunStats,
+        limiter: _RateLimiter,
+        run_started: float,
+    ) -> None:
+        """一轮结束：合并限流统计、落盘结果文件并输出汇总日志。"""
+        stats.apply_limiter_stats(limiter)
+        duration = time.monotonic() - run_started
+        result_path = None
+        try:
+            document = stats.document()
+            result_path = await asyncio.to_thread(save_run_result, document, self._config)
+        except Exception:
+            # 结果文件失败只记录，不影响本轮已完成的数据回写
+            logger.exception("failed to save run result")
+        stats.log_summary(duration, result_path)
+
+    # ------------------------------------------------------------------
+    # 待复核查询
+    # ------------------------------------------------------------------
+
+    async def _fetch_pending(
+        self,
+        limit: int,
+        after: tuple[int, int, int, datetime, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        review = SecurityAudit.details["llm_review"]
+        # 排序优先级：社区 SIG 绝对优先 -> 风险等级高的优先 -> 命中数少的优先
+        # -> 入库时间早的优先。keyset 游标必须是五元组，否则翻页会重复或漏记录。
+        issue_count = func.jsonb_array_length(
+            SecurityAudit.details["skillspector_report"]["issues"]
+        )
+        community_priority = case(
+            (
+                func.coalesce(Skill.platform, SkillVersion.platform) == "community",
+                1,
+            ),
+            else_=0,
+        )
+        risk_rank = case(
+            (SecurityAudit.risk_level == "critical", 4),
+            (SecurityAudit.risk_level == "high", 3),
+            (SecurityAudit.risk_level == "medium", 2),
+            (SecurityAudit.risk_level == "low", 1),
+            else_=0,
+        )
+        conditions = [
+            SecurityAudit.audit_type.like("%skillspector%"),
+            func.jsonb_path_exists(
+                SecurityAudit.details,
+                cast(
+                    literal("$.skillspector_report.issues[*]"),
+                    JSONPATH,
+                ),
+            ),
+            or_(
+                review.is_(None),
+                review["status"].as_string() == "partial",
+                and_(
+                    review["status"].as_string() == "failed",
+                    cast(review["attempts"].as_string(), Integer) < self._config.max_attempts,
+                ),
+            ),
+            or_(Skill.id.is_not(None), SkillVersion.id.is_not(None)),
+        ]
+        if after is not None:
+            after_priority, after_risk, after_count, after_at, after_id = after
+            conditions.append(
+                or_(
+                    community_priority < after_priority,
+                    and_(
+                        community_priority == after_priority,
+                        or_(
+                            risk_rank < after_risk,
+                            and_(
+                                risk_rank == after_risk,
+                                or_(
+                                    issue_count > after_count,
+                                    and_(
+                                        issue_count == after_count,
+                                        or_(
+                                            SecurityAudit.audited_at > after_at,
+                                            and_(
+                                                SecurityAudit.audited_at == after_at,
+                                                SecurityAudit.id > after_id,
+                                            ),
+                                        ),
+                                    ),
+                                ),
+                            ),
+                        ),
+                    ),
+                )
+            )
+        stmt = (
+            select(
+                SecurityAudit.id,
+                SecurityAudit.audited_at,
+                SecurityAudit.resource_id,
+                SecurityAudit.risk_level,
+                SecurityAudit.risk_signals,
+                SecurityAudit.details,
+                SecurityAudit.commit_id.label("audit_commit_id"),
+                community_priority.label("community_priority"),
+                risk_rank.label("risk_rank"),
+                issue_count.label("issue_count"),
+                Skill.name.label("skill_name"),
+                Skill.description.label("skill_description"),
+                Skill.content.label("skill_content"),
+                Skill.skill_id.label("skill_skill_id"),
+                Skill.source.label("skill_source"),
+                Skill.source_url.label("skill_source_url"),
+                Skill.repo_url.label("skill_repo_url"),
+                Skill.commit_id.label("skill_commit_id"),
+                SkillVersion.name.label("version_name"),
+                SkillVersion.description.label("version_description"),
+                SkillVersion.content.label("version_content"),
+                SkillVersion.skill_id.label("version_skill_id"),
+                SkillVersion.source.label("version_source"),
+                SkillVersion.source_url.label("version_source_url"),
+                SkillVersion.repo_url.label("version_repo_url"),
+                SkillVersion.commit_id.label("version_commit_id"),
+            )
+            .outerjoin(Skill, Skill.id == SecurityAudit.resource_id)
+            .outerjoin(SkillVersion, SkillVersion.id == SecurityAudit.resource_id)
+            .where(*conditions)
+            .order_by(
+                community_priority.desc(),
+                risk_rank.desc(),
+                issue_count.asc(),
+                SecurityAudit.audited_at.asc(),
+                SecurityAudit.id.asc(),
+            )
+            .limit(limit)
+        )
+        query_started = time.monotonic()
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(stmt)
+            rows = [dict(row._mapping) for row in result]
+        elapsed = time.monotonic() - query_started
+        if elapsed >= 1.0:
+            logger.info(
+                "fetch_pending slow: %.2fs limit=%d rows=%d cursor=%s",
+                elapsed,
+                limit,
+                len(rows),
+                "keyset" if after is not None else "first",
+            )
+        return rows
+
+    # ------------------------------------------------------------------
+    # 单条审计
+
+    async def _review_one(
+        self,
+        client: httpx.AsyncClient,
+        limiter: _RateLimiter,
+        row: dict[str, Any],
+        deadline: datetime | None = None,
+    ) -> str:
+        return await review_one(self, client, limiter, row, deadline=deadline)
+
+    def _build_partial_meta(
+        self,
+        *,
+        issues_count: int,
+        reviewed_count: int,
+        false_positive_indices: set[int],
+        false_positive_reasons: list[dict[str, Any]],
+        false_positive_confidences: dict[int, float | None] | None = None,
+        low_confidence_indices: set[int],
+        low_confidence_reasons: list[dict[str, Any]],
+        started_at: str | None,
+        context_stats: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return build_partial_meta(
+            self._config,
+            issues_count=issues_count,
+            reviewed_count=reviewed_count,
+            false_positive_indices=false_positive_indices,
+            false_positive_reasons=false_positive_reasons,
+            false_positive_confidences=false_positive_confidences,
+            low_confidence_indices=low_confidence_indices,
+            low_confidence_reasons=low_confidence_reasons,
+            started_at=started_at,
+            context_stats=context_stats,
+        )
+
+    async def _call_llm_json(
+        self,
+        client: httpx.AsyncClient,
+        limiter: _RateLimiter,
+        prompt: str,
+        expected: int,
+        system_prompt: str = SYSTEM_PROMPT,
+    ) -> list[dict[str, Any]]:
+        return await call_llm_json(
+            client,
+            limiter,
+            prompt,
+            expected,
+            post=self._post_chat,
+            system_prompt=system_prompt,
+        )
+
+    async def _post_chat(
+        self,
+        client: httpx.AsyncClient,
+        limiter: _RateLimiter,
+        messages: list[dict[str, str]],
+    ) -> str:
+        return await post_chat(
+            client,
+            limiter,
+            config=self._config,
+            api_key=self._api_key,
+            messages=messages,
+        )
+
+    async def _persist(
+        self,
+        row: dict[str, Any],
+        reviewed_report: dict[str, Any],
+        application: ReviewApplication,
+    ) -> str:
+        return await persist(row, reviewed_report, application)
+
+    async def _persist_partial(
+        self,
+        audit_id: Any,
+        reviewed_report: dict[str, Any],
+        partial_meta: dict[str, Any],
+    ) -> str:
+        return await persist_partial(audit_id, reviewed_report, partial_meta)
+
+    async def _record_failure(
+        self,
+        audit_id: Any,
+        error: str,
+        context_stats: dict[str, Any] | None = None,
+        reviewed_count: int | None = None,
+    ) -> None:
+        await record_failure(
+            audit_id,
+            error,
+            model=self._config.model,
+            context_mode=self._config.context_mode,
+            context_stats=context_stats,
+            reviewed_count=reviewed_count,
+            timezone=self._config.timezone,
+        )
+
+    async def _mark_skipped(self, audit_id: Any, reason: str) -> None:
+        await mark_skipped(audit_id, reason, timezone=self._config.timezone)
+
+
+def _resolve_review_config(
+    config: AuditLLMReviewConfig,
+    settings: Any,
+) -> AuditLLMReviewConfig:
+    """Fill model/base_url/api_key from the active model provider when unset.
+
+    复核任务默认跟随 ``model.providers`` 当前 provider（默认 siliconflow /
+    Qwen3.5-4B），避免与主模型配置重复；审计专用值仍可通过
+    ``AUDIT_LLM_REVIEW__MODEL / __BASE_URL / __API_KEY`` 覆盖。
+    """
+    model = getattr(settings, "model", None)
+    if model is None:
+        return config
+    # Settings.from_yaml 已经通过 ModelConfig.resolve() 把当前 provider 的
+    # name/base_url/api_key 填到平铺字段，这里直接复用，无需再查 providers。
+    return config.model_copy(
+        update={
+            "model": config.model or str(getattr(model, "name", "") or ""),
+            "base_url": config.base_url or str(getattr(model, "base_url", "") or ""),
+            "api_key": config.api_key or str(getattr(model, "api_key", "") or ""),
+        }
+    )
+
+
+async def start_audit_llm_review_scheduler() -> AuditLLMReviewScheduler | None:
+    """按配置创建并启动 LLM 复核调度器；未启用时返回 None。"""
+    settings = get_settings()
+    config = settings.audit_llm_review
+    if not config.enabled:
+        logger.info("disabled (audit_llm_review.enabled=false)")
+        return None
+    scheduler = AuditLLMReviewScheduler(config)
+    await scheduler.start()
+    return scheduler

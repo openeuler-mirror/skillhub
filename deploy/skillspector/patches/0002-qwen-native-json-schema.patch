@@ -1,0 +1,728 @@
+diff -ruN a/src/skillspector/llm_analyzer_base.py b/src/skillspector/llm_analyzer_base.py
+--- a/src/skillspector/llm_analyzer_base.py	2026-10-28 15:56:45
++++ b/src/skillspector/llm_analyzer_base.py	2026-10-29 17:20:11
+@@ -29,8 +29,10 @@
+ 
+ import asyncio
+ import json
++import os
+ import re
+ import threading
++import time
+ from collections import defaultdict
+ from dataclasses import dataclass, field
+ from typing import Any, Literal
+@@ -40,8 +42,9 @@
+ 
+ from skillspector.llm_utils import get_chat_model
+ from skillspector.logging_config import get_logger
+-from skillspector.model_info import get_max_input_tokens
++from skillspector.model_info import get_max_input_tokens, get_max_output_tokens
+ from skillspector.models import Finding
++from skillspector.rate_limit import get_limiter
+ 
+ logger = get_logger(__name__)
+ 
+@@ -142,6 +145,26 @@
+         pass
+ 
+ 
++def _unwrap_structured(result: object) -> object:
++    """Unwrap ``with_structured_output(include_raw=True)`` output.
++
++    Native ``json_schema`` providers return ``{"raw", "parsed", "parsing_error"}``;
++    we log the raw message's token usage and turn a schema violation into
++    :class:`LLMBadResponseError` so the batch-level isolation (and the JSON
++    retry) keep working exactly as they do for the prompt-driven path.
++    """
++    if isinstance(result, dict) and "parsed" in result:
++        _log_usage(result.get("raw"))
++        error = result.get("parsing_error")
++        if error is not None:
++            raise LLMBadResponseError(f"Structured output parse error: {error}")
++        parsed = result.get("parsed")
++        if parsed is None:
++            raise LLMBadResponseError("Structured output returned no parsed payload")
++        return parsed
++    return result
++
++
+ def _is_deepseek_model(llm: object) -> bool:
+     """True when *llm* was constructed against DeepSeek's OpenAI endpoint.
+ 
+@@ -172,6 +195,88 @@
+             )
+     return "api.deepseek.com" in base_url_hint.lower()
+ 
++def _is_prompt_json_model(llm: object) -> bool:
++    """True when *llm* must use prompt-driven JSON (no ``json_schema`` support).
++
++    SiliconFlow (and some other OpenAI-compatible gateways) set the
++    ``_skillspector_prompt_json`` tag from ``providers.chat_models`` because they
++    reject ``response_format={"type":"json_schema"}`` just like DeepSeek.
++    """
++    if getattr(llm, "_skillspector_prompt_json", False):
++        return True
++    return _is_deepseek_model(llm)
++
++
++_TRANSIENT_HINTS = (
++    "429",
++    "500",
++    "502",
++    "503",
++    "504",
++    "too busy",
++    "overloaded",
++    "rate limit",
++    "timeout",
++    "timed out",
++    "connection",
++    "temporarily",
++)
++
++#: How many extra attempts a transient provider error is worth.  Kept at one:
++#: each attempt can burn the full LLM timeout, and three retries plus backoff
++#: (3s+6s+12s) exceeded the 300s batch timeout, so the extra attempts were
++#: cancelled by the caller anyway.  One retry stays well inside that budget.
++_MAX_TRANSIENT_RETRIES = 1
++
++#: Total attempts for one batch (first try + one payload-correction retry).  A
++#: malformed reply is rare (~1% of calls) and the corrected prompt fixes it
++#: immediately, so two attempts is enough; going higher just multiplies the
++#: worst-case latency of a batch that will be marked unjudged anyway.  Applies
++#: to both the prompt-driven JSON path and native ``json_schema`` payloads that
++#: fail validation.
++_MAX_JSON_ATTEMPTS = 2
++
++
++def _is_transient_error(exc: BaseException) -> bool:
++    """Heuristic: provider capacity / network errors worth retrying."""
++    status = getattr(exc, "status_code", None) or getattr(
++        getattr(exc, "response", None), "status_code", None
++    )
++    if isinstance(status, int) and status in {408, 409, 425, 429, 500, 502, 503, 504}:
++        return True
++    text = f"{type(exc).__name__} {exc}".lower()
++    return any(hint in text for hint in _TRANSIENT_HINTS)
++
++
++def _env_int(name: str, default: int) -> int:
++    raw = os.environ.get(name)
++    if raw is None or not raw.strip():
++        return default
++    try:
++        return int(float(raw.strip()))
++    except ValueError:
++        logger.warning("Invalid %s=%r; using %d", name, raw, default)
++        return default
++
++
++_SCHEMA_STRIP_KEYS = {"description", "title", "examples", "default", "$schema"}
++
++
++def _compact_json_schema(schema: object) -> object:
++    """Drop prose fields from a JSON schema to shrink the prompt footprint.
++
++    The full Pydantic schema for the meta-analyzer is ~1k tokens, most of it
++    descriptions the model does not need when the field names are explicit.
++    """
++    if isinstance(schema, dict):
++        return {
++            k: _compact_json_schema(v) for k, v in schema.items() if k not in _SCHEMA_STRIP_KEYS
++        }
++    if isinstance(schema, list):
++        return [_compact_json_schema(v) for v in schema]
++    return schema
++
++
+ # OpenAI suggests ~4 chars per token for English text with BPE tokenizers.
+ CHARS_PER_TOKEN = 4
+ CHUNK_OVERLAP_LINES = 50
+@@ -480,7 +585,9 @@
+         self.base_prompt = base_prompt
+         self.model = model
+         self._input_budget = get_max_input_tokens(model)
++        self._max_output_tokens = get_max_output_tokens(model)
+         self._llm = get_chat_model(model=model)
++        self._limiter = get_limiter()
+         # DeepSeek does not implement OpenAI's ``response_format=json_schema``;
+         # using Pydantic-driven ``with_structured_output`` would inject
+         # json_schema and DeepSeek would reject it (400 ``response_format
+@@ -490,8 +597,23 @@
+         # ``providers.chat_models`` plus a prompt instruction that contains
+         # the substring ``json`` (DeepSeek's hard requirement).
+         self._is_deepseek = bool(self._llm) and _is_deepseek_model(self._llm)
+-        if self._is_deepseek or not self.response_schema:
++        self._prompt_json = bool(self._llm) and _is_prompt_json_model(self._llm)
++        # Providers that enforce response_format=json_schema (verified: SiliconFlow
++        # Qwen3.5) let LangChain drive structured output natively.  The gateway
++        # then rejects/repairs non-conforming payloads, which removes the
++        # "empty verdict" failure mode of the prompt-driven path.
++        self._native_json_schema = bool(self._llm) and bool(
++            getattr(self._llm, "_skillspector_json_schema", False)
++        )
++        if self._prompt_json or not self.response_schema:
+             self._structured_llm = None
++        elif self._native_json_schema:
++            self._structured_llm = self._llm.with_structured_output(
++                self.response_schema,
++                method="json_schema",
++                strict=True,
++                include_raw=True,
++            )
+         else:
+             self._structured_llm = self._llm.with_structured_output(self.response_schema)
+ 
+@@ -585,96 +707,147 @@
+ 
+     # -- LLM invocation -----------------------------------------------------
+ 
++    def _prepare_prompt(self, prompt: str, retry: bool) -> str:
++        """Add the in-prompt schema only on the prompt-driven JSON path."""
++        if self._prompt_json and self.response_schema is not None:
++            return self._wrap_prompt(prompt, retry=retry)
++        return prompt
++
++    def _call_model(self, prompt: str) -> object:
++        """Send one request through whichever path this provider supports."""
++        if self._structured_llm is not None:
++            return self._structured_llm.invoke(prompt)
++        return self._llm.invoke(prompt)
++
++    async def _acall_model(self, prompt: str) -> object:
++        """Async variant of :meth:`_call_model`."""
++        if self._structured_llm is not None:
++            return await self._structured_llm.ainvoke(prompt)
++        return await self._llm.ainvoke(prompt)
++
++    def _parse_model_response(self, response: object) -> object:
++        """Validate *response* and return the Pydantic payload (or raw text).
++
++        Raises ``LLMBadResponseError`` (a ``ValueError``) when a native
++        ``json_schema`` payload violates the schema, and ``ValueError`` /
++        ``TypeError`` when prompt-driven JSON cannot be parsed — both are
++        retried once by the caller.
++        """
++        if self._structured_llm is not None:
++            return _unwrap_structured(response)
++        _log_usage(response)
++        if self.response_schema is None:
++            return _message_text(response)
++        return self._validate_json_response(_message_json(response))
++
+     def _invoke_llm(self, prompt: str) -> object:
+-        """Invoke the chat model, routing DeepSeek through the prompt-driven JSON path.
++        """Invoke the chat model with shared rate limiting and retries.
+ 
+-        For DeepSeek the raw JSON response is validated against
+-        :attr:`response_schema` and the resulting Pydantic instance is
+-        returned — same shape as ``with_structured_output`` would have
+-        produced, so subclasses' ``parse_response`` (which expect a Pydantic
+-        object) keep working unchanged.
++        Every provider shape (native ``json_schema``, prompt-driven JSON and
++        raw-string) goes through one loop, so all three get the same client-side
++        rate limiting and the same single transient retry.  A payload that
++        fails schema/JSON validation consumes one of ``_MAX_JSON_ATTEMPTS`` and
++        is re-asked with the schema reminder.
+ 
+         DeepSeek's reasoning models occasionally exhaust ``max_tokens`` on
+         internal chain-of-thought and return an empty ``content``.  When that
+-        happens we retry once with the schema-instruction suffix stripped so
+-        the model has more output budget for the actual JSON payload.
++        happens the retry passes ``retry=True`` so the schema-instruction
++        suffix is trimmed and the model has more output budget for the payload.
+         """
+-        if self._structured_llm is not None:
+-            return self._structured_llm.invoke(prompt)
+-        if self._is_deepseek and self.response_schema is not None:
+-            wrapped = self._wrap_prompt(prompt)
+-            response = self._llm.invoke(wrapped)
+-            _log_usage(response)
++        tokens = estimate_tokens(prompt) + self._max_output_tokens
++        last_exc: Exception | None = None
++        for attempt in range(_MAX_JSON_ATTEMPTS):
++            wrapped = self._prepare_prompt(prompt, attempt > 0)
+             try:
+-                raw = _message_json(response)
+-            except ValueError as exc:
+-                logger.warning(
+-                    "DeepSeek returned empty content; retrying with stripped suffix: %s",
+-                    exc,
+-                )
+-                response = self._llm.invoke(prompt)
+-                _log_usage(response)
+-                raw = _message_json(response)
+-            return self._validate_json_response(raw)
+-        response = self._llm.invoke(prompt)
+-        _log_usage(response)
+-        return _message_text(response)
++                self._limiter.acquire_sync(tokens)
++                response = self._call_model(wrapped)
++            except Exception as exc:  # noqa: BLE001 - transport-level errors
++                if attempt < _MAX_TRANSIENT_RETRIES and _is_transient_error(exc):
++                    delay = min(30, 3 * (2**attempt))
++                    logger.warning(
++                        "Transient LLM error (%s: %s); retrying in %ds",
++                        type(exc).__name__,
++                        exc,
++                        delay,
++                    )
++                    time.sleep(delay)
++                    continue
++                raise
++            try:
++                return self._parse_model_response(response)
++            except (ValueError, TypeError) as exc:
++                last_exc = exc
++                logger.warning("Malformed LLM reply (attempt %d): %s", attempt + 1, exc)
++        raise LLMBadResponseError(f"LLM returned invalid JSON after retries: {last_exc}")
+ 
+     async def _ainvoke_llm(self, prompt: str) -> object:
+         """Async variant of :meth:`_invoke_llm`."""
+-        if self._structured_llm is not None:
+-            return await self._structured_llm.ainvoke(prompt)
+-        if self._is_deepseek and self.response_schema is not None:
+-            wrapped = self._wrap_prompt(prompt)
+-            response = await self._llm.ainvoke(wrapped)
+-            _log_usage(response)
++        tokens = estimate_tokens(prompt) + self._max_output_tokens
++        last_exc: Exception | None = None
++        for attempt in range(_MAX_JSON_ATTEMPTS):
++            wrapped = self._prepare_prompt(prompt, attempt > 0)
+             try:
+-                raw = _message_json(response)
+-            except ValueError as exc:
+-                logger.warning(
+-                    "DeepSeek returned empty content; retrying with stripped suffix: %s",
+-                    exc,
+-                )
+-                response = await self._llm.ainvoke(prompt)
+-                _log_usage(response)
+-                raw = _message_json(response)
+-            return self._validate_json_response(raw)
+-        response = await self._llm.ainvoke(prompt)
+-        _log_usage(response)
+-        return _message_text(response)
++                await self._limiter.acquire(tokens)
++                response = await self._acall_model(wrapped)
++            except Exception as exc:  # noqa: BLE001 - transport-level errors
++                if attempt < _MAX_TRANSIENT_RETRIES and _is_transient_error(exc):
++                    delay = min(30, 3 * (2**attempt))
++                    logger.warning(
++                        "Transient LLM error (%s: %s); retrying in %ds",
++                        type(exc).__name__,
++                        exc,
++                        delay,
++                    )
++                    await asyncio.sleep(delay)
++                    continue
++                raise
++            try:
++                return self._parse_model_response(response)
++            except (ValueError, TypeError) as exc:
++                last_exc = exc
++                logger.warning("Malformed LLM reply (attempt %d): %s", attempt + 1, exc)
++        raise LLMBadResponseError(f"LLM returned invalid JSON after retries: {last_exc}")
+ 
+-    def _wrap_prompt(self, prompt: str) -> str:
+-        """Append the DeepSeek JSON suffix + schema so the prompt contains ``json``.
++    def _wrap_prompt(self, prompt: str, retry: bool = False) -> str:
++        """Append the JSON suffix + compact schema so the prompt requests JSON.
+ 
+-        DeepSeek's ``response_format={"type":"json_object"}`` mode rejects the
+-        request (400) unless the prompt contains the substring ``json`` (case
+-        insensitive).  We also embed the JSON Schema of
+-        :attr:`response_schema` because DeepSeek cannot enforce it on the
+-        server side — the model needs to see the field names and types to
+-        emit a conformant payload.  ``DEEPSEEK_JSON_PROMPT_SUFFIX`` is
+-        idempotent: repeated calls cheaply short-circuit.
++        ``response_format={"type":"json_object"}`` is used by DeepSeek and
++        SiliconFlow; both reject ``json_schema`` and neither enforces the
++        schema server-side, so the model must see field names and types in the
++        prompt.  ``retry`` adds an explicit correction after a malformed reply.
+         """
+         if DEEPSEEK_JSON_PROMPT_SUFFIX.strip().lower() in prompt.lower():
+-            return prompt
+-        schema_block = ""
+-        if self.response_schema is not None:
+-            try:
+-                schema_text = json.dumps(
+-                    self.response_schema.model_json_schema(), indent=2, ensure_ascii=False
+-                )
+-            except Exception:
+-                schema_text = ""
+-            if schema_text:
+-                schema_block = (
+-                    "\n\nRequired JSON Schema (your response MUST match these "
+-                    "field names and types):\n```json\n" + schema_text + "\n```"
+-                )
+-        return prompt + DEEPSEEK_JSON_PROMPT_SUFFIX + schema_block
++            body = prompt
++        else:
++            schema_block = ""
++            if self.response_schema is not None:
++                try:
++                    schema_text = json.dumps(
++                        _compact_json_schema(self.response_schema.model_json_schema()),
++                        ensure_ascii=False,
++                    )
++                except Exception:
++                    schema_text = ""
++                if schema_text:
++                    schema_block = (
++                        "\n\nRequired JSON Schema (your response MUST match these "
++                        "field names and types):\n" + schema_text
++                    )
++            body = prompt + DEEPSEEK_JSON_PROMPT_SUFFIX + schema_block
++        if retry:
++            body += (
++                "\n\nYour previous reply was NOT valid JSON. Reply again with a single "
++                "JSON object only: no markdown fences, no prose, no trailing commas, "
++                "and do not paste file contents into string values."
++            )
++        return body
+ 
+     def _validate_json_response(self, response: str) -> LLMAnalysisResult:
+         """Parse a JSON-string LLM response into :class:`LLMAnalysisResult`."""
+         try:
+-            data = json.loads(response)
++            # strict=False tolerates raw newlines/control characters inside
++            # strings, which small models routinely emit when quoting content.
++            data = json.loads(response, strict=False)
+         except json.JSONDecodeError as exc:
+             if "Extra data" in str(exc):
+                 # Tolerate trailing content after a complete JSON value.
+@@ -724,7 +897,7 @@
+         self,
+         batches: list[Batch],
+         *,
+-        max_concurrency: int = 10,
++        max_concurrency: int | None = None,
+         **kwargs: object,
+     ) -> list[tuple[Batch, list]]:
+         """Execute LLM calls for all *batches* concurrently.
+@@ -735,6 +908,8 @@
+ 
+         The return type mirrors :meth:`run_batches`.
+         """
++        if max_concurrency is None:
++            max_concurrency = max(1, _env_int("SKILLSPECTOR_MAX_CONCURRENCY", 3))
+         sem = asyncio.Semaphore(max_concurrency)
+ 
+         async def _process(batch: Batch) -> tuple[Batch, list]:
+diff -ruN a/src/skillspector/llm_utils.py b/src/skillspector/llm_utils.py
+--- a/src/skillspector/llm_utils.py	2026-10-28 15:56:45
++++ b/src/skillspector/llm_utils.py	2026-10-28 17:47:07
+@@ -107,10 +107,14 @@
+         ValueError: when no API key is configured (see ``is_llm_available``).
+     """
+     model = model or MODEL_CONFIG["default"]
++    try:
++        timeout = float(os.environ.get("SKILLSPECTOR_LLM_TIMEOUT", "90"))
++    except ValueError:
++        timeout = 90.0
+     return create_chat_model(
+         model=model,
+         max_tokens=get_max_output_tokens(model),
+-        timeout=120,
++        timeout=timeout,
+     )
+ 
+ 
+diff -ruN a/src/skillspector/model_info.py b/src/skillspector/model_info.py
+--- a/src/skillspector/model_info.py	2026-10-28 15:56:45
++++ b/src/skillspector/model_info.py	2026-10-28 15:57:25
+@@ -23,6 +23,7 @@
+ from __future__ import annotations
+ 
+ import functools
++import os
+ 
+ from skillspector.constants import DEFAULT_CONTEXT_LENGTH, MAX_INPUT_TOKENS_PCT
+ from skillspector.logging_config import get_logger
+@@ -54,7 +55,17 @@
+ 
+ 
+ def get_max_input_tokens(model: str) -> int:
+-    """Input token budget for *model* (75 %% of context window)."""
++    """Input token budget for *model* (75 %% of context window).
++
++    ``SKILLSPECTOR_MAX_INPUT_TOKENS`` overrides the computed value so
++    deployments can cap prompt size independently of the context window.
++    """
++    override = os.environ.get("SKILLSPECTOR_MAX_INPUT_TOKENS", "").strip()
++    if override:
++        try:
++            return max(1024, int(float(override)))
++        except ValueError:
++            logger.warning("Invalid SKILLSPECTOR_MAX_INPUT_TOKENS=%r", override)
+     return int(_resolve_context_length(model) * MAX_INPUT_TOKENS_PCT)
+ 
+ 
+@@ -65,6 +76,12 @@
+     ``max_output_tokens`` cap exposed by the provider chain (today: only
+     the YAML registry surfaces this).
+     """
++    override = os.environ.get("SKILLSPECTOR_MAX_OUTPUT_TOKENS", "").strip()
++    if override:
++        try:
++            return max(128, int(float(override)))
++        except ValueError:
++            logger.warning("Invalid SKILLSPECTOR_MAX_OUTPUT_TOKENS=%r", override)
+     ctx = _resolve_context_length(model)
+     pct_budget = int(ctx * (1 - MAX_INPUT_TOKENS_PCT))
+ 
+diff -ruN a/src/skillspector/providers/chat_models.py b/src/skillspector/providers/chat_models.py
+--- a/src/skillspector/providers/chat_models.py	2026-10-28 15:56:45
++++ b/src/skillspector/providers/chat_models.py	2026-10-29 16:20:27
+@@ -17,6 +17,8 @@
+ 
+ from __future__ import annotations
+ 
++import os
++
+ from langchain_core.language_models.chat_models import BaseChatModel
+ from langchain_openai import ChatOpenAI
+ from pydantic import SecretStr
+@@ -38,6 +40,29 @@
+     return "api.deepseek.com" in normalized
+ 
+ 
++def is_siliconflow_endpoint(base_url: str | None) -> bool:
++    """Detect SiliconFlow's OpenAI-compatible endpoint from the base URL."""
++    if not base_url:
++        return False
++    return "siliconflow.cn" in base_url.lower()
++
++
++def _supports_native_json_schema(model: str) -> bool:
++    """True for models verified to enforce ``response_format=json_schema``.
++
++    Measured against SiliconFlow (2026-10-29): Qwen3.5 returns a payload that
++    conforms to a strict schema even when the prompt asks for something else,
++    so it can use LangChain's native structured output instead of the
++    prompt-driven JSON path.  Other models on the same gateway historically
++    rejected ``json_schema``, so the allowlist stays explicit; set
++    ``SKILLSPECTOR_NATIVE_JSON_SCHEMA=0`` to force the prompt-driven path.
++    """
++    toggle = os.environ.get("SKILLSPECTOR_NATIVE_JSON_SCHEMA", "1").strip().lower()
++    if toggle in {"0", "false", "no", "off"}:
++        return False
++    return model.strip().lower().startswith("qwen/qwen3.5")
++
++
+ def create_openai_compatible_chat_model(
+     *,
+     model: str,
+@@ -53,6 +78,11 @@
+     api_key, base_url = credentials
+ 
+     model_kwargs: dict[str, object] = {}
++    extra_body: dict[str, object] = {}
++    chat_kwargs: dict[str, object] = {}
++    prompt_json = False
++    native_json_schema = False
++
+     if is_deepseek_endpoint(base_url):
+         model_kwargs["response_format"] = {"type": "json_object"}
+         # DeepSeek's reasoning-capable models (e.g. deepseek-v4-flash) burn
+@@ -60,19 +90,50 @@
+         # visible ``content`` is often empty even when the call succeeded.
+         # Bump the budget by 4x so the JSON payload fits after reasoning.
+         max_tokens = max(max_tokens * 4, 16384)
++        prompt_json = True
+ 
++    if is_siliconflow_endpoint(base_url):
++        if _supports_native_json_schema(model):
++            # Verified on SiliconFlow: Qwen3.5 enforces a strict
++            # ``response_format=json_schema``, so the caller can use LangChain's
++            # native structured output (the gateway drops non-conforming
++            # payloads and repairs them) instead of prompt-driven JSON.
++            native_json_schema = True
++        else:
++            # Other models on this gateway reject ``json_schema``.
++            model_kwargs["response_format"] = {"type": "json_object"}
++            prompt_json = True
++        # Security verdicts should not vary between identical runs.
++        chat_kwargs["temperature"] = 0.0
++        if os.environ.get("SKILLSPECTOR_DISABLE_THINKING", "1").strip().lower() in {
++            "1",
++            "true",
++            "yes",
++            "on",
++        }:
++            # Qwen3.x defaults to thinking mode, which multiplies latency and
++            # output tokens; classification-style calls do not need it.
++            extra_body["enable_thinking"] = False
++
+     chat = ChatOpenAI(
+         model=model,
+         base_url=base_url,
+         api_key=SecretStr(api_key),
+-        max_completion_tokens=max_tokens,
++        max_tokens=max_tokens,
+         timeout=timeout,
+         default_headers=default_headers,
+-        model_kwargs=model_kwargs or None,
++        # Always pass a dict: langchain-openai 1.7.x iterates model_kwargs and
++        # crashes on ``None`` (``argument of type 'NoneType' is not iterable``).
++        model_kwargs=model_kwargs,
++        extra_body=extra_body or None,
++        **chat_kwargs,
+     )
+-    # Explicit tag so downstream code (e.g. llm_analyzer_base) can route
+-    # DeepSeek to the prompt-driven JSON path without poking into private
+-    # LangChain/OpenAI client state.
++    # Explicit tags so downstream code (e.g. llm_analyzer_base) can route to the
++    # prompt-driven JSON path without poking into private client state.
+     if is_deepseek_endpoint(base_url):
+         setattr(chat, "_skillspector_deepseek", True)
++    if prompt_json:
++        setattr(chat, "_skillspector_prompt_json", True)
++    if native_json_schema:
++        setattr(chat, "_skillspector_json_schema", True)
+     return chat
+diff -ruN a/src/skillspector/providers/openai/model_registry.yaml b/src/skillspector/providers/openai/model_registry.yaml
+--- a/src/skillspector/providers/openai/model_registry.yaml	2026-10-28 15:56:45
++++ b/src/skillspector/providers/openai/model_registry.yaml	2026-10-29 16:05:25
+@@ -21,3 +21,11 @@
+   "deepseek-flash":
+     context_length: 1048576
+     max_output_tokens: 393216
++
++  # 硅基流动（SiliconFlow）免费档；限流配额 1000 RPM / 80000 TPM。
++  # 实测（2026-10-29）：256K 上下文；max_tokens 从 8K 到 262144 均被接受，
++  # 即输出上限等于上下文，故这里按库内 25% 规则记 65536。实际部署用
++  # SKILLSPECTOR_MAX_OUTPUT_TOKENS 压到 4096 以换取更高并发（见 compose.yaml）。
++  "Qwen/Qwen3.5-4B":
++    context_length: 262144
++    max_output_tokens: 65536
+diff -ruN a/src/skillspector/rate_limit.py b/src/skillspector/rate_limit.py
+--- a/src/skillspector/rate_limit.py	1970-01-01 08:00:00
++++ b/src/skillspector/rate_limit.py	2026-10-28 15:57:25
+@@ -0,0 +1,124 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Process-wide request/token rate limiter (sliding 60s window).
++
++SiliconFlow's free tiers enforce both RPM and TPM quotas; without client-side
++pacing a concurrent scan immediately trips 429s and wastes calls.  This module
++provides a tiny thread-safe + async-compatible sliding window limiter driven by
++``SKILLSPECTOR_RPM`` / ``SKILLSPECTOR_TPM`` (0 or unset disables a dimension).
++"""
++
++from __future__ import annotations
++
++import asyncio
++import os
++import threading
++import time
++from collections import deque
++
++from skillspector.logging_config import get_logger
++
++logger = get_logger(__name__)
++
++_WINDOW_SECONDS = 60.0
++
++
++def _env_int(name: str, default: int) -> int:
++    raw = os.environ.get(name)
++    if raw is None or not raw.strip():
++        return default
++    try:
++        return int(float(raw.strip()))
++    except ValueError:
++        logger.warning("Invalid %s=%r; using %d", name, raw, default)
++        return default
++
++
++class RateLimiter:
++    """Sliding-window limiter tracking (timestamp, tokens) events."""
++
++    def __init__(self, rpm: int = 0, tpm: int = 0):
++        self._rpm = max(0, rpm)
++        self._tpm = max(0, tpm)
++        self._events: deque[tuple[float, int]] = deque()
++        self._lock = threading.Lock()
++
++    @property
++    def enabled(self) -> bool:
++        return self._rpm > 0 or self._tpm > 0
++
++    def _prune(self, now: float) -> None:
++        cutoff = now - _WINDOW_SECONDS
++        while self._events and self._events[0][0] <= cutoff:
++            self._events.popleft()
++
++    def _plan(self, tokens: int) -> float:
++        """Reserve a slot if possible; return seconds to wait (0 = reserved)."""
++        now = time.monotonic()
++        self._prune(now)
++        wait = 0.0
++
++        if self._rpm > 0 and len(self._events) >= self._rpm:
++            oldest = self._events[0][0]
++            wait = max(wait, oldest + _WINDOW_SECONDS - now)
++
++        if self._tpm > 0:
++            used = sum(t for _, t in self._events)
++            if used + tokens > self._tpm:
++                # Walk oldest→newest until enough budget is free.
++                freed = used
++                for ts, tok in self._events:
++                    freed -= tok
++                    if freed + tokens <= self._tpm:
++                        wait = max(wait, ts + _WINDOW_SECONDS - now)
++                        break
++                else:
++                    wait = max(wait, _WINDOW_SECONDS)
++
++        # Oversized single request: let it through once (nothing else can help).
++        if wait <= 0 or tokens > self._tpm > 0:
++            self._events.append((now, tokens))
++            return 0.0
++        return wait
++
++    def acquire_sync(self, tokens: int = 1000) -> None:
++        if not self.enabled:
++            return
++        while True:
++            with self._lock:
++                wait = self._plan(tokens)
++            if wait <= 0:
++                return
++            time.sleep(min(wait, 5.0))
++
++    async def acquire(self, tokens: int = 1000) -> None:
++        if not self.enabled:
++            return
++        while True:
++            with self._lock:
++                wait = self._plan(tokens)
++            if wait <= 0:
++                return
++            await asyncio.sleep(min(wait, 5.0))
++
++
++_LIMITER: RateLimiter | None = None
++_LIMITER_LOCK = threading.Lock()
++
++
++def get_limiter() -> RateLimiter:
++    """Return the process-wide limiter configured from the environment."""
++    global _LIMITER
++    if _LIMITER is None:
++        with _LIMITER_LOCK:
++            if _LIMITER is None:
++                _LIMITER = RateLimiter(
++                    rpm=_env_int("SKILLSPECTOR_RPM", 0),
++                    tpm=_env_int("SKILLSPECTOR_TPM", 0),
++                )
++                if _LIMITER.enabled:
++                    logger.info(
++                        "Rate limiter active: rpm=%s tpm=%s",
++                        _LIMITER._rpm,
++                        _LIMITER._tpm,
++                    )
++    return _LIMITER

@@ -10,11 +10,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from skillcrawler.core.category_classifier import DeepSeekCategoryClassifier
-from skillcrawler.core.git_operations import GitOperations
-from src.api.services.categories import CANONICAL_CATEGORIES
+from src.ai.category_classifier import DeepSeekCategoryClassifier
+from src.utils.git_operations import GitOperations
+from src.core.categories import CANONICAL_CATEGORIES
+from src.security.audit_trigger import trigger_existing_skill_audit
 from src.security.detector import SecurityDetector, SecurityReport
-from skillcrawler.core.skill_parser import (
+from src.skills.skill_parser import (
     as_optional_str,
     as_optional_str_list,
     build_skill_md_url,
@@ -28,7 +29,7 @@ from skillcrawler.core.skill_parser import (
 from src.models.orm import Skill, SkillVersion
 from src.models.repository import SkillRepository
 
-from src.utils.skill_id import build_skill_id, extract_owner_repo
+from src.skills.skill_id import build_skill_id, extract_owner_repo
 
 if TYPE_CHECKING:
     from src.models.orm import SkillRepoModel
@@ -104,6 +105,8 @@ class SkillScanner:
         author: str | None = None,
         skill_paths: list[str] | None = None,
         skill_path_filter: set[str] | None = None,
+        skill_authors: dict[str, str] | None = None,
+        skill_platforms: dict[str, str] | None = None,
     ) -> tuple[list[Skill], list[SkillVersion]]:
         self._security_cache_hits = 0
         self._security_audit_submitted = 0
@@ -119,7 +122,7 @@ class SkillScanner:
                 self.git_ops.list_skill_paths_for_ref, repo_root, 'HEAD',
             )
         _logger.debug(
-            'Skill file discovery timing: repo=%s files=%d elapsed=%.3fs',
+            '[Discover] Skill file discovery timing: repo=%s files=%d elapsed=%.3fs',
             getattr(repo, 'repo_name', None) or repo.url,
             len(skill_paths),
             time.perf_counter() - discovery_started_at,
@@ -149,6 +152,8 @@ class SkillScanner:
             existing_versions=existing_versions,
             category_cache=category_cache,
             security_cache=security_cache,
+            skill_authors=skill_authors,
+            skill_platforms=skill_platforms,
         )
 
         tagged_skills: list[SkillVersion] = []
@@ -165,6 +170,8 @@ class SkillScanner:
                 category_cache=category_cache,
                 security_cache=security_cache,
                 skill_path_filter=skill_path_filter,
+                skill_authors=skill_authors,
+                skill_platforms=skill_platforms,
                 # HEAD 声明了 frontmatter version 的 skill 自管版本，
                 # 完全跳过 tag 扫描（不再以 tag 作为版本来源）。
                 skip_skill_ids={row.skill_id for row in metadata_version_rows},
@@ -184,6 +191,8 @@ class SkillScanner:
         existing_versions: dict[tuple[str, str | None], SkillVersion],
         category_cache: dict[str, str | None],
         security_cache: dict[str, SecurityResolution] | None = None,
+        skill_authors: dict[str, str] | None = None,
+        skill_platforms: dict[str, str] | None = None,
     ) -> tuple[list[Skill], list[SkillVersion]]:
         discovered: list[Skill] = []
         metadata_version_rows: list[SkillVersion] = []
@@ -203,7 +212,7 @@ class SkillScanner:
             )
             if skill_id in seen_skill_ids:
                 _logger.warning(
-                    'Duplicate skill_id from different paths, keeping first '
+                    '[Discover] Duplicate skill_id from different paths, keeping first '
                     'occurrence: skill_id=%s skipped_path=%s',
                     skill_id, relative_path,
                 )
@@ -217,20 +226,22 @@ class SkillScanner:
                 continue
             if is_low_value_skill_content(metadata_content[1]):
                 _logger.debug(
-                    'Skipped low-value skill content: skill_id=%s ref=HEAD',
+                    '[Discover] Skipped low-value skill content: skill_id=%s ref=HEAD',
                     skill_id,
                 )
                 continue
             # 元数据门禁：frontmatter 必须同时声明 name 与 description
             if is_incomplete_skill_metadata(metadata_content[0]):
                 _logger.warning(
-                    'Skipped skill without required metadata '
+                    '[Discover] Skipped skill without required metadata '
                     '(name/description): skill_id=%s ref=HEAD',
                     skill_id,
                 )
                 continue
             input_elapsed = time.perf_counter() - scan_started_at
             tree_hash = tree_hashes.get(relative_path)
+            skill_author = (skill_authors or {}).get(relative_path)
+            skill_platform = (skill_platforms or {}).get(relative_path)
             skill = await self._build_skill_record(
                 repo=repo,
                 repo_root=repo_root,
@@ -249,9 +260,11 @@ class SkillScanner:
                 input_elapsed=input_elapsed,
                 existing_record=existing_skills.get(skill_id),
                 security_cache=security_cache,
+                skill_author=skill_author,
+                skill_platform=skill_platform,
             )
             _logger.info(
-                'Discovered skill(latest version:%s): skill_id=%s',
+                '[Discover] Discovered skill(latest version:%s): skill_id=%s',
                 skill.version or '-', skill.skill_id,
             )
             discovered.append(skill)
@@ -281,9 +294,11 @@ class SkillScanner:
                         (skill_id, declared_version),
                     ),
                     security_cache=security_cache,
+                    skill_author=skill_author,
+                    skill_platform=skill_platform,
                 )
                 _logger.info(
-                    'Discovered skill(metadata version:%s): skill_id=%s',
+                    '[Discover] Discovered skill(metadata version:%s): skill_id=%s',
                     version_record.version or '-', version_record.skill_id,
                 )
                 metadata_version_rows.append(version_record)
@@ -302,6 +317,8 @@ class SkillScanner:
         security_cache: dict[str, SecurityResolution] | None = None,
         skill_path_filter: set[str] | None = None,
         skip_skill_ids: set[str] | None = None,
+        skill_authors: dict[str, str] | None = None,
+        skill_platforms: dict[str, str] | None = None,
     ) -> list[SkillVersion]:
         discovered: list[SkillVersion] = []
         seen_versions: set[tuple[str, str]] = set()
@@ -336,7 +353,7 @@ class SkillScanner:
                 repo_root, current_tag_skill_paths, ref=ref,
             )
             _logger.debug(
-                'Tag skill path listing timing: repo=%s ref=%s current_paths=%d '
+                '[Discover] Tag skill path listing timing: repo=%s ref=%s current_paths=%d '
                 'elapsed=%.3fs',
                 getattr(repo, 'repo_name', None) or repo.url,
                 ref,
@@ -353,20 +370,22 @@ class SkillScanner:
                     continue
                 if is_low_value_skill_content(metadata_content[1]):
                     _logger.debug(
-                        'Skipped low-value skill content: path=%s ref=%s',
+                        '[Discover] Skipped low-value skill content: path=%s ref=%s',
                         relative_path, ref,
                     )
                     continue
                 # 元数据门禁：frontmatter 必须同时声明 name 与 description
                 if is_incomplete_skill_metadata(metadata_content[0]):
                     _logger.warning(
-                        'Skipped skill without required metadata '
+                        '[Discover] Skipped skill without required metadata '
                         '(name/description): path=%s ref=%s',
                         relative_path, ref,
                     )
                     continue
                 input_elapsed = time.perf_counter() - scan_started_at
                 tree_hash = tree_hashes.get(relative_path)
+                skill_author = (skill_authors or {}).get(relative_path)
+                skill_platform = (skill_platforms or {}).get(relative_path)
                 skill_id = build_skill_id(
                     repo.source, extract_owner_repo(repo.url), relative_path,
                 )
@@ -374,7 +393,7 @@ class SkillScanner:
                 # 完全跳过 tag 扫描（版本行由 latest 扫描生成）。
                 if skip_skill_ids and skill_id in skip_skill_ids:
                     _logger.debug(
-                        'Skipped tag scan for metadata-versioned skill: '
+                        '[Discover] Skipped tag scan for metadata-versioned skill: '
                         'skill_id=%s ref=%s',
                         skill_id,
                         ref,
@@ -393,7 +412,7 @@ class SkillScanner:
                 tree_hash_key = (skill_id, tree_hash) if tree_hash else None
                 if tree_hash_key is not None and tree_hash_key in seen_tree_hashes:
                     _logger.debug(
-                        'Skipped duplicate skill tree_hash: skill_id=%s '
+                        '[Discover] Skipped duplicate skill tree_hash: skill_id=%s '
                         'version=%s tree_hash=%s',
                         skill_id,
                         version or '-',
@@ -406,7 +425,7 @@ class SkillScanner:
                 pre_commit_key = (skill_id, commit_id) if commit_id else None
                 if pre_commit_key is not None and pre_commit_key in seen_commits:
                     _logger.debug(
-                        'Skipped duplicate skill commit (pre-check): skill_id=%s '
+                        '[Discover] Skipped duplicate skill commit (pre-check): skill_id=%s '
                         'version=%s commit_id=%s',
                         skill_id,
                         version or '-',
@@ -432,11 +451,13 @@ class SkillScanner:
                     return_skill_model=False,
                     existing_record=existing_versions.get((skill_id, effective_version)),
                     security_cache=security_cache,
+                    skill_author=skill_author,
+                    skill_platform=skill_platform,
                 )
                 version_key = (skill.skill_id, skill.version) if skill.version else None
                 if version_key is not None and version_key in seen_versions:
                     _logger.debug(
-                        'Skipped duplicate skill version: skill_id=%s version=%s commit_id=%s',
+                        '[Discover] Skipped duplicate skill version: skill_id=%s version=%s commit_id=%s',
                         skill.skill_id,
                         skill.version or '-',
                         skill.commit_id or '-',
@@ -450,7 +471,7 @@ class SkillScanner:
                 if tree_hash_key is not None:
                     seen_tree_hashes.add(tree_hash_key)
                 _logger.info(
-                    'Discovered skill(version:%s): skill_id=%s',
+                    '[Discover] Discovered skill(version:%s): skill_id=%s',
                     skill.version or '-', skill.skill_id,
                 )
                 discovered.append(skill)
@@ -478,6 +499,8 @@ class SkillScanner:
         return_skill_model: bool = True,
         existing_record: Skill | SkillVersion | None = None,
         security_cache: dict[str, SecurityResolution] | None = None,
+        skill_author: str | None = None,
+        skill_platform: str | None = None,
     ) -> Skill | SkillVersion:
         prepare_started_at = time.perf_counter()
         skill_file = repo_root / relative_path
@@ -496,7 +519,7 @@ class SkillScanner:
 
         context_started_at = time.perf_counter()
         host, source_author = derive_skill_source(repo.url)
-        author = author or source_author
+        author = skill_author or author or source_author
         prepare_elapsed += time.perf_counter() - context_started_at
 
         category_started_at = time.perf_counter()
@@ -540,7 +563,9 @@ class SkillScanner:
             'repo_url': repo.url,
             'category': category,
             'tags': extract_declared_tags(metadata),
-            'platform': as_optional_str(getattr(repo, 'platform', None)) or as_optional_str(metadata.get('platform')),
+            'platform': skill_platform
+            or as_optional_str(getattr(repo, 'platform', None))
+            or as_optional_str(metadata.get('platform')),
             'extra_metadata': merged_metadata,
             'content': content or None,
             'risk_score': security.risk_score,
@@ -561,7 +586,7 @@ class SkillScanner:
             + assemble_elapsed
         )
         _logger.debug(
-            'Skill timing: skill_id=%s version=%s input=%.3fs prepare=%.3fs '
+            '[Discover] Skill timing: skill_id=%s version=%s input=%.3fs prepare=%.3fs '
             'category=%.3fs security=%.3fs assemble=%.3fs '
             'other=%.3fs total=%.3fs',
             skill_id,
@@ -601,7 +626,7 @@ class SkillScanner:
         ):
             audit_details = existing_metadata.get('security_audit')
             _logger.debug(
-                'Reused security result: skill_id=%s version=%s tree_hash=%s score=%s',
+                '[Discover] Reused security result: skill_id=%s version=%s tree_hash=%s score=%s',
                 skill_id,
                 version or '-',
                 tree_hash,
@@ -621,7 +646,7 @@ class SkillScanner:
             cached = security_cache.get(tree_hash)
             if cached is not None:
                 _logger.debug(
-                    'Reused cache submitted by security: skill_id=%s', skill_id,
+                    '[Discover] Reused cache submitted by security: skill_id=%s', skill_id,
                 )
                 self._security_cache_hits += 1
                 if cached.audit_triggered:
@@ -713,85 +738,10 @@ class SkillScanner:
         The crawler stays DB-agnostic; ``SkillManager`` persists the
         ``SecurityAudit`` row after the skill is stored.
         """
-        if self.security_detector is None or not self.security_detector.has_skillspector:
-            return None
-        skill_path = Path(relative_path).parent.as_posix()
-        if skill_path == '.':
-            skill_path = ''
-
-        # skillspector 容器以只读方式挂载缓存仓库且无网络访问，
-        # 此处提前物化技能路径的所有 blob，避免容器内触发懒拉取失败。
-        if repo.local_path and commit_id:
-            materialized = await asyncio.to_thread(
-                self.git_ops.materialize_skill_objects,
-                Path(repo.local_path), commit_id, skill_path,
-            )
-            if not materialized:
-                _logger.warning(
-                    'Security audit skipped for skill %s: objects not materialized',
-                    skill_id,
-                )
-                return SecurityReport(
-                    resource_type='skill',
-                    resource_id=skill_id,
-                    risk_level='unknown',
-                    risk_signals=[],
-                    details={'error': 'materialize_failed', 'source': 'skillspector'},
-                )
-
-        try:
-            if self.security_async_mode:
-                build_number = await self.security_detector.trigger_skillspector(
-                    repo.url, version=commit_id, skill_path=skill_path,
-                )
-                report = SecurityReport(
-                    resource_type='skill',
-                    resource_id=skill_id,
-                    risk_level='unknown',
-                    risk_signals=[],
-                    details={
-                        'skillspector_async': True,
-                        'skillspector_build_number': build_number,
-                        'source': 'skillspector',
-                    },
-                )
-            else:
-                report = await self.security_detector.detect_skillspector(
-                    repo.url, version=commit_id, skill_path=skill_path,
-                )
-        except Exception:
-            _logger.warning(
-                'Security audit failed for skill %s', skill_id, exc_info=True,
-            )
-            failed_details: dict[str, Any] = {
-                'error': 'audit_failed',
-                'source': 'skillspector',
-            }
-            if self.security_async_mode:
-                # 保持与触发失败落库路径一致：标记 async 尝试已发起，
-                # 以便 SkillManager 写入 risk_level=unknown 审计记录
-                failed_details['skillspector_async'] = True
-                failed_details['skillspector_build_number'] = None
-            report = SecurityReport(
-                resource_type='skill',
-                resource_id=skill_id,
-                risk_level='unknown',
-                risk_signals=[],
-                details=failed_details,
-            )
-
-        return report
-
-    async def audit_existing_skill(
-        self,
-        *,
-        repo: SkillRepoModel,
-        relative_path: str,
-        commit_id: str | None,
-        skill_id: str,
-    ) -> SecurityReport | None:
-        """Trigger security detection for an already persisted skill record."""
-        return await self._audit_skill_security(
+        return await trigger_existing_skill_audit(
+            git_ops=self.git_ops,
+            security_detector=self.security_detector,
+            security_async_mode=self.security_async_mode,
             repo=repo,
             relative_path=relative_path,
             commit_id=commit_id,

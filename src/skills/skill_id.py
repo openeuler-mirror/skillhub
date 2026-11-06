@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 
@@ -15,7 +16,7 @@ def build_skill_id(
     """Build a public skill_id.
 
     Args:
-        source: e.g. ``"github"``, ``"gitcode"``.
+        source: e.g. ``"github"``, ``"atomgit"``.
         owner_repo: e.g. ``"owner/repo"`` (from ``extract_owner_repo``).
         relative_skill_path: repo-relative SKILL.md path, e.g.
             ``"skills/foo/SKILL.md"`` or ``"SKILL.md"`` (root-level).
@@ -30,6 +31,54 @@ def build_skill_id(
     else:
         raise ValueError(f'Expected a SKILL.md file, got: {relative_skill_path}')
     return f'{source}:{owner_repo}/{skill_name}'
+
+
+def resolve_relative_skill_path(repo: Any, record: Any) -> str:
+    """从 skill 记录的 source_url 推导仓库内 SKILL.md 相对路径。
+
+    解析顺序：
+    ① 已知 ref 精确匹配 ``/blob/<ref>/``（commit_id / version / v{version} /
+       branch / HEAD / master / main），兼容含 ``/`` 的 ref；
+    ② 通用单段 ref 正则提取（任意 tag/分支名，如 ``v0.0.3``）；
+    ③ skill_id 反推兜底（``{source}:{owner}/{repo}/{skill_name}`` →
+       ``{skill_name}/SKILL.md``，会丢失中间目录前缀，仅在 URL 无 ``/blob/``
+       结构时使用）。
+    扫描路径与安全补齐路径共用同一实现，保证触发审计时 skill_path 口径一致。
+    """
+    refs = []
+    if getattr(record, 'commit_id', None):
+        refs.append(record.commit_id)
+    version = getattr(record, 'version', None)
+    if version:
+        refs.append(version)
+        # tag 常带 v 前缀：version 字段 "0.0.3" ↔ URL 中 "v0.0.3"
+        refs.append(version[1:] if version.startswith('v') else f'v{version}')
+    branch = getattr(repo, 'branch', None)
+    if branch:
+        refs.append(branch)
+    refs.extend(['HEAD', 'master', 'main'])
+
+    source_url = getattr(record, 'source_url', '') or ''
+    for ref in dict.fromkeys(refs):
+        marker = f'/blob/{ref}/'
+        if marker in source_url:
+            relative_path = source_url.split(marker, 1)[1]
+            if relative_path == 'SKILL.md' or relative_path.endswith('/SKILL.md'):
+                return relative_path
+
+    # 已知 ref 全未命中（URL 里是其它 tag 名等）→ 按「单段 ref + SKILL.md 结尾」
+    # 通用提取。ref 含 / 时会有歧义，但那种情况已由上面的已知 ref 精确匹配覆盖。
+    match = re.search(r'/blob/[^/]+/((?:.+/)?SKILL\.md)(?:[?#]|$)', source_url)
+    if match:
+        return match.group(1)
+
+    owner_repo = extract_owner_repo(getattr(repo, 'url', None))
+    prefix = f'{getattr(repo, "source", "")}:{owner_repo}/'
+    skill_path = record.skill_id.removeprefix(prefix)
+    repository_name = owner_repo.rsplit('/', 1)[-1]
+    if skill_path == repository_name:
+        return 'SKILL.md'
+    return f'{skill_path.strip("/")}/SKILL.md'
 
 
 def extract_owner_repo(repo_url: str | None) -> str:

@@ -30,11 +30,3 @@ def category_label(category_key: str | None) -> str:
     if not category_key:
         return ""
     return CATEGORY_LABELS.get(category_key, category_key)
-
-
-def annotate_categories(categories: list[dict]) -> list[dict]:
-    """Attach a Chinese ``label`` to each category dict (keyed by ``name``)."""
-    return [
-        {**cat, "label": category_label(cat.get("name"))}
-        for cat in categories
-    ]

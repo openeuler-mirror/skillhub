@@ -23,15 +23,22 @@ from src.core.config import get_settings
 settings = get_settings()
 
 
-class _SecurityDetectorLogAdapter(logging.LoggerAdapter):
-    """给本模块所有日志消息统一加 "SecurityDetector: " 前缀。"""
+class _SecurityLogAdapter(logging.LoggerAdapter):
+    """给本模块日志统一加 `[域名][子域]` 前缀，区分 collector 与检测功能两类目标。"""
+
+    def __init__(self, logger: logging.Logger, component: str) -> None:
+        super().__init__(logger, {})
+        self._component = component
 
     def process(self, msg: Any, kwargs: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
-        return f"SecurityDetector: {msg}", kwargs
+        return f"{self._component} {msg}", kwargs
 
 
-logger: logging.LoggerAdapter[None] = _SecurityDetectorLogAdapter(
-    logging.getLogger(__name__), {}
+logger: logging.LoggerAdapter[None] = _SecurityLogAdapter(
+    logging.getLogger(__name__), "[Security][Detector]"
+)
+collector_logger: logging.LoggerAdapter[None] = _SecurityLogAdapter(
+    logging.getLogger(__name__), "[Security][Collector]"
 )
 
 ALLOWED_GIT_HOSTS = frozenset({
@@ -40,7 +47,6 @@ ALLOWED_GIT_HOSTS = frozenset({
     "bitbucket.org",
     "gitea.io",
     "gitee.com",
-    "gitcode.com",
     "atomgit.com",
     "codeberg.org",
     "git.sr.ht",
@@ -186,7 +192,7 @@ def _log_skillspector_final_result(
         "signal_count": signal_count,
         "error": error,
     }
-    logger.info(
+    collector_logger.info(
         "Skillspector final result: %s",
         json.dumps(result, ensure_ascii=False, separators=(",", ":")),
     )
@@ -195,8 +201,8 @@ def _log_skillspector_final_result(
 def _log_collector_event(event: str, **fields: Any) -> None:
     """Write one structured trace entry for an async collector decision."""
     payload = {"event": event, **fields}
-    logger.info(
-        "Skillspector collector: %s",
+    collector_logger.info(
+        "%s",
         json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str),
     )
 
@@ -631,7 +637,7 @@ class SkillspectorCollector:
             return
         self._running = True
         self._task = asyncio.create_task(self._loop())
-        logger.info("SkillspectorCollector started (poll every %ds)", self._poll_interval)
+        collector_logger.info("SkillspectorCollector started (poll every %ds)", self._poll_interval)
 
     async def stop(self) -> None:
         self._running = False
@@ -642,7 +648,7 @@ class SkillspectorCollector:
             except asyncio.CancelledError:
                 pass
             self._task = None
-        logger.info("SkillspectorCollector stopped")
+        collector_logger.info("SkillspectorCollector stopped")
 
     async def collect_once(self) -> int:
         """Scan for pending async audits and collect completed results.
@@ -652,6 +658,8 @@ class SkillspectorCollector:
         processed = 0
         async with self._session_factory() as session:
             pending = await self._fetch_pending(session)
+            if not pending:
+                return 0
             _log_collector_event(
                 "batch_started",
                 pending_count=len(pending),
@@ -698,7 +706,7 @@ class SkillspectorCollector:
                     # Roll back to keep the session usable for subsequent pending
                     # audits; the snapshot values keep them readable.
                     await session.rollback()
-                    logger.exception(
+                    collector_logger.exception(
                         "Failed to collect result for audit %s (build #%s)",
                         audit_id, build_number,
                     )
@@ -721,12 +729,12 @@ class SkillspectorCollector:
 
             corrected = await ContributorRepository(session).reconcile_skill_counts()
             if corrected:
-                logger.info(
+                collector_logger.info(
                     "Contributor skill_count reconciled after audit collection: %d row(s)",
                     corrected,
                 )
         except Exception:
-            logger.warning(
+            collector_logger.warning(
                 "Failed to reconcile contributor skill_count after audit collection",
                 exc_info=True,
             )
@@ -740,9 +748,9 @@ class SkillspectorCollector:
             try:
                 processed = await self.collect_once()
                 if processed:
-                    logger.info("Collected %d async audit result(s)", processed)
+                    collector_logger.info("Collected %d async audit result(s)", processed)
             except Exception:
-                logger.exception("SkillspectorCollector loop error")
+                collector_logger.exception("SkillspectorCollector loop error")
             await asyncio.sleep(self._poll_interval)
 
     async def _fetch_pending(self, session: AsyncSession) -> list[Any]:
@@ -778,7 +786,7 @@ class SkillspectorCollector:
         """
         from src.models.orm import SecurityAudit, Skill, SkillVersion
 
-        logger.debug(
+        collector_logger.debug(
             "Collecting Skillspector result: audit_id=%s build_number=%s",
             audit_id,
             build_number,
@@ -815,7 +823,7 @@ class SkillspectorCollector:
             action="collect_terminal_result",
         )
 
-        logger.info(
+        collector_logger.info(
             "Jenkins build completed: build_number=%s status=%s",
             build_number,
             status,
@@ -878,7 +886,7 @@ class SkillspectorCollector:
 
             attempts = updated_details["skillspector_report_fetch_attempts"]
             if exhausted:
-                logger.error(
+                collector_logger.error(
                     "Build #%d ended with %s but report is unavailable after %d attempts; "
                     "marking audit as collected",
                     build_number,
@@ -923,7 +931,7 @@ class SkillspectorCollector:
                 action="retry_next_poll",
                 poll_interval_seconds=self._poll_interval,
             )
-            logger.warning(
+            collector_logger.warning(
                 "Build #%d ended with %s but report is unavailable; will retry (%d/%d)",
                 build_number,
                 status,
@@ -972,7 +980,7 @@ class SkillspectorCollector:
                     skill_version.risk_score = score
                     score_write_target = "skill_versions.risk_score"
                 else:
-                    logger.warning(
+                    collector_logger.warning(
                         "Security audit resource not found: resource_id=%s",
                         resource_id,
                     )
@@ -1012,7 +1020,7 @@ class SkillspectorCollector:
             score=score,
             signal_count=len(signals),
         )
-        logger.info(
+        collector_logger.info(
             "Collected build #%d → score=%s risk=%s signals=%d",
             build_number, score, risk_level, len(signals),
         )
@@ -1339,7 +1347,7 @@ async def start_skillspector_collector() -> SkillspectorCollector | None:
         timeout=settings.security.skillspector_timeout,
     )
     if not client.enabled:
-        logger.warning("Skillspector enabled but no credentials — collector skipped")
+        collector_logger.warning("Skillspector enabled but no credentials — collector skipped")
         return None
 
     collector = SkillspectorCollector(
@@ -1351,5 +1359,5 @@ async def start_skillspector_collector() -> SkillspectorCollector | None:
         poll_interval=120,
     )
     await collector.start()
-    logger.info("SkillspectorCollector background task started")
+    collector_logger.info("SkillspectorCollector background task started")
     return collector

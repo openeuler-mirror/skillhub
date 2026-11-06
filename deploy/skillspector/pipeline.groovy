@@ -80,11 +80,14 @@ pipeline {
 
                                         mkdir -p "${REPORT_DIR}/${scanner}"
 
+                                        # 大模型调用范围由容器环境变量决定（deploy/compose.yaml）：
+                                        #   SKILLSPECTOR_LLM_NODES=meta_analyzer —— 只有 meta 复核节点调用
+                                        #   大模型（剔除静态误报 + 富化），语义发现节点不调用；因此这里
+                                        #   不能再加 --no-llm，否则会退化成纯静态扫描
                                         # skillspector 扫描到严重风险时即使已写出报告也会返回非零退出码，
                                         # 用 || true 忽略其退出码，改以 report.json 是否存在作为成功判据
                                         skillspector scan \\
                                             "${env.SKILL_DIR}" \\
-                                            --no-llm \\
                                             --format json -o "${REPORT_DIR}/${scanner}/report.json" \\
                                             --format markdown -o "${REPORT_DIR}/${scanner}/report.md" || true
 

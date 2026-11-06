@@ -5,12 +5,14 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shutil
 import subprocess
+import threading
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from skillcrawler.core.skill_parser import (
+from src.skills.skill_parser import (
     parse_skill_frontmatter_text,
     should_skip_relative_path,
 )
@@ -27,7 +29,7 @@ DEFAULT_MAX_TAGS_PER_REPO = 5
 TAG_CANDIDATE_REF_PREFIX = 'refs/crawler/tag-candidates'
 UNSUPPORTED_FILTER_MESSAGES = ( # 检测服务端不支持 partial clone filter 的错误关键词
     'filtering not recognized by server', # Git < 2.25 / 旧版 GitLab
-    'server does not support filter', # Gitea / gitcode.com
+    'server does not support filter', # Gitea / atomgit.com
 )
 # 禁止 git 弹出交互式认证提示: 
 # 后台服务运行时没有 TTY，如果 git 遇到需要认证的私有仓库（或 token 过期），没有这个环境变量会 挂住等待输入 ，
@@ -36,6 +38,13 @@ GIT_NON_INTERACTIVE_ENV = {
     'GIT_TERMINAL_PROMPT': '0', # git 通用：禁止终端交互
     'GCM_INTERACTIVE': 'Never', # Git Credential Manager：禁止弹窗
 }
+
+
+# catalog 同步互斥锁：API 进程内 discover 调度与分类补齐会并发调用
+# sync_catalog_repository，check-then-act（.git 检查 → clone/pull）不互斥时
+# clone 进行中的目录会被误判为残留并 rmtree，或第二个 clone 撞上 "File exists"。
+# 跨进程并发（CLI 与 API 同时跑）不在此锁范围，属同一操作的幂等重试场景。
+_CATALOG_SYNC_LOCK = threading.Lock()
 
 
 class GitCommandError(subprocess.CalledProcessError):
@@ -88,17 +97,26 @@ class GitOperations:
 
     def sync_catalog_repository(self, repository_dir: Path, repository_url: str) -> None:
         """Clone or fast-forward an openEuler-skills catalog repository."""
-        if not (repository_dir / '.git').exists():
-            repository_dir.parent.mkdir(parents=True, exist_ok=True)
+        with _CATALOG_SYNC_LOCK:
+            if not (repository_dir / '.git').exists():
+                repository_dir.parent.mkdir(parents=True, exist_ok=True)
+                # 残留目录与断链符号链接都会让 git clone 报 "File exists"：
+                # 断链 symlink 的 exists() 为 False（会漏过 rmtree），但 git 按
+                # 链接本身存在判定；symlink 用 unlink 只删链接（不碰目标目录），
+                # 残留目录用 rmtree 清掉后重新 clone。
+                if repository_dir.is_symlink():
+                    repository_dir.unlink()
+                elif repository_dir.exists():
+                    shutil.rmtree(repository_dir)
+                self._run_git_command_with_auth_retry(
+                    ['git', 'clone', '--depth', '1', repository_url, str(repository_dir)],
+                    repository_url, repository_url, 'catalog clone',
+                )
+                return
             self._run_git_command_with_auth_retry(
-                ['git', 'clone', '--depth', '1', repository_url, str(repository_dir)],
-                repository_url, repository_url, 'catalog clone',
+                ['git', '-C', str(repository_dir), 'pull', '--ff-only'],
+                repository_url, repository_url, 'catalog pull',
             )
-            return
-        self._run_git_command_with_auth_retry(
-            ['git', '-C', str(repository_dir), 'pull', '--ff-only'],
-            repository_url, repository_url, 'catalog pull',
-        )
 
     def update_existing_repository(
         self,
@@ -309,6 +327,23 @@ class GitOperations:
             return False
 
         pathspec = skill_path.strip('/') if skill_path else '.'
+
+        # 先确认 pathspec 在 ref 下确实存在：ls-tree 对不存在的路径静默返回
+        # 空结果，不校验的话错误路径（如少了目录前缀）会通过 materialize 并被
+        # 发往 Jenkins，在 checkout 阶段才报 exit code 3
+        if pathspec != '.':
+            check_command = [
+                'git', '-C', str(repo_root), 'cat-file', '-e',
+                f'{ref}:{pathspec}',
+            ]
+            try:
+                self._run_git_command(check_command)
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                _logger.warning(
+                    'Skill path %s does not exist at %s in %s', pathspec, ref, repo_root,
+                )
+                return False
+
         ls_command = [
             'git', '-C', str(repo_root), 'ls-tree', '-r',
             '--format=%(objectname) %(objecttype)', ref, '--', pathspec,

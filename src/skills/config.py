@@ -7,9 +7,13 @@ from typing import Any
 
 import yaml
 
-from skillcrawler.core.git_operations import GitOperations
+from src.utils.git_operations import GitOperations
 
-OPENEULER_SKILLS_URL = "https://gitcode.com/openeuler/openEuler-skills"
+OPENEULER_SKILLS_URL = "https://atomgit.com/openeuler/openEuler-skills"
+
+# catalog 的三个平台渠道（community/enterprise/personal）统一在此定义，
+# 供本模块与 skill_manager / discover_requests 引用，避免多处硬编码不同步。
+CATALOG_PLATFORMS = ("community", "enterprise", "personal")
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +35,7 @@ def _iter_catalog_entries(path: Path) -> Iterator[tuple[str, str, dict[str, Any]
     ``owner`` the directory name under it. Malformed YAML files are skipped
     with a warning instead of aborting the whole read.
     """
-    for platform in ("community", "enterprise", "personal"):
+    for platform in CATALOG_PLATFORMS:
         root = path / platform
         if not root.is_dir():
             continue
@@ -69,7 +73,7 @@ def load_crawler_config(repository_path: Path | None = None) -> dict[str, Any]:
     if not path.is_dir():
         raise ValueError(f"Catalog path must be a repository directory: {path}")
 
-    result: dict[str, Any] = {"community": [], "enterprise": [], "personal": []}
+    result: dict[str, Any] = {platform: [] for platform in CATALOG_PLATFORMS}
     for platform, owner, entry in _iter_catalog_entries(path):
         repos = entry.get("skill_repos", [])
         if not isinstance(repos, list):
@@ -112,6 +116,40 @@ def load_catalog_skill_url_entries(repository_path: Path | None = None) -> list[
     return entries
 
 
+def load_catalog_local_skill_entries(repository_path: Path | None = None) -> list[dict[str, Any]]:
+    """收集 catalog 中的原文件方式贡献条目（``local_skills``）。
+
+    返回 ``{"platform", "owner", "author", "skill_name", "skill_path"}`` 列表。
+    ``skill_path`` 为仓库根目录 ``skills/<skill_name>/SKILL.md`` 相对路径；
+    ``author`` 口径与 ``load_contributor_profiles`` 一致（enterprise 取
+    organization 字段否则 owner，community/personal 取 owner）。
+    """
+    path = (repository_path or sync_openEuler_skills_repo()).expanduser()
+    entries: list[dict[str, Any]] = []
+    for platform, owner, entry in _iter_catalog_entries(path):
+        local_skills = entry.get("local_skills")
+        if not isinstance(local_skills, list):
+            continue
+        if platform == "enterprise":
+            author = _clean_optional_str(entry.get("organization")) or owner
+        else:
+            author = owner
+        for skill_name in local_skills:
+            if not isinstance(skill_name, str):
+                continue
+            name = skill_name.strip()
+            if not name:
+                continue
+            entries.append({
+                "platform": platform,
+                "owner": owner,
+                "author": author,
+                "skill_name": name,
+                "skill_path": f"skills/{name}/SKILL.md",
+            })
+    return entries
+
+
 def load_single_catalog_entry(skill_yaml: Path) -> tuple[str, str, dict[str, Any]]:
     """读取单个 skill.yaml → ``(platform, owner, entry)``（``--url`` 单文件模式）。
 
@@ -127,7 +165,7 @@ def load_single_catalog_entry(skill_yaml: Path) -> tuple[str, str, dict[str, Any
         raise ValueError(f"expected a skill.yaml file: {skill_yaml}")
     owner = path.parent.name
     platform = path.parent.parent.name
-    if platform not in ("community", "enterprise", "personal") or not owner:
+    if platform not in CATALOG_PLATFORMS or not owner:
         raise ValueError(
             "skill.yaml must live at <catalog>/<platform>/<owner>/skill.yaml: "
             f"{skill_yaml}"
@@ -140,18 +178,6 @@ def load_single_catalog_entry(skill_yaml: Path) -> tuple[str, str, dict[str, Any
     if not isinstance(entry, dict):
         raise ValueError(f"Invalid skill.yaml format: {skill_yaml}")
     return platform, owner, entry
-
-
-def load_skill_categories(repository_path: Path | None = None) -> list[str]:
-    """Read category names from ``templates/skill-spec.yaml`` in the catalog."""
-    repo = repository_path or sync_openEuler_skills_repo()
-    spec_path = repo.expanduser() / "templates" / "skill-spec.yaml"
-    if not spec_path.exists():
-        raise FileNotFoundError(f"Skill spec not found: {spec_path}")
-    with spec_path.open("r", encoding="utf-8") as fh:
-        data = yaml.safe_load(fh) or {}
-    categories = data.get("categories", []) if isinstance(data, dict) else []
-    return [str(item).strip() for item in categories if str(item).strip()] if isinstance(categories, list) else []
 
 
 def _first_repo_url(entry: dict[str, Any]) -> str | None:
@@ -230,7 +256,7 @@ def load_contributor_profiles(repository_path: Path | None = None) -> list[dict[
     ``name`` / ``description`` / ``git_profile`` (git hosting profile) /
     ``website`` (official site) and ``repo_url`` (first registered repo URL).
     """
-    from skillcrawler.core.skill_parser import derive_skill_source
+    from src.skills.skill_parser import derive_skill_source
 
     path = (repository_path or sync_openEuler_skills_repo()).expanduser()
     profiles: list[dict[str, Any]] = []

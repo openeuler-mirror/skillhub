@@ -38,15 +38,15 @@ class TestSkillsTelemetry:
 
         assert skill_id == "github:acme/agent-skills/agent-skills"
 
-    def test_build_skill_id_from_telemetry_gitcode_matches_crawler(self):
+    def test_build_skill_id_from_telemetry_atomgit_matches_crawler(self):
         skill_id = build_skill_id_from_telemetry(
-            "gitcode",
+            "atomgit",
             "openeuler/yuanrong",
-            "gitcode-api",
-            {"gitcode-api": ".skills/gitcode-api/SKILL.md"},
+            "atomgit-api",
+            {"atomgit-api": ".skills/atomgit-api/SKILL.md"},
         )
 
-        assert skill_id == "gitcode:openeuler/yuanrong/gitcode-api"
+        assert skill_id == "atomgit:openeuler/yuanrong/atomgit-api"
 
     def test_process_install_telemetry_increments_each_matched_skill(self):
         service = TelemetryService(AsyncMock())
@@ -67,7 +67,7 @@ class TestSkillsTelemetry:
         }
 
         matched_skill_ids = asyncio.run(
-            service.process(params, ip_address="127.0.0.1", user_agent="wittyhub-cli/1.0")
+            service.process(params, ip_address="127.0.0.1", user_agent="skillhub-cli/1.0")
         )
 
         assert matched_skill_ids == [
@@ -88,7 +88,7 @@ class TestSkillsTelemetry:
         assert {r.resource_id for r in added_records} == {skill_uuid_1, skill_uuid_2}
         assert all(r.resource_type == "skill" for r in added_records)
         assert all(r.ip_address == "127.0.0.1" for r in added_records)
-        assert all(r.user_agent == "wittyhub-cli/1.0" for r in added_records)
+        assert all(r.user_agent == "skillhub-cli/1.0" for r in added_records)
         service.session.commit.assert_awaited_once()
 
     def test_process_install_telemetry_skips_unmatched_skill_ids(self):

@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import logging
 import os
 import re
 import shutil
@@ -12,9 +13,10 @@ import aiofiles
 
 from src.core.config import get_settings
 from src.models.orm import Skill, SkillRepoModel, SkillVersion
-from src.utils.skill_id import slugify_identifier
+from src.skills.skill_id import slugify_identifier
 
 settings = get_settings()
+logger = logging.getLogger(__name__)
 MAX_STORAGE_READ_BYTES = 20 * 1024 * 1024
 
 
@@ -35,6 +37,7 @@ class SkillArchive:
     path: Path
     filename: str
     media_type: str = "application/zip"
+    sha256: str | None = None
 
 
 class DownloadManager:
@@ -80,6 +83,7 @@ class DownloadManager:
         return SkillArchive(
             path=archive_path,
             filename=self._build_archive_filename(skill),
+            sha256=await self._sha256_of(archive_path),
         )
 
     @staticmethod
@@ -216,6 +220,19 @@ class DownloadManager:
         finally:
             temporary_path.unlink(missing_ok=True)
         return archive_path
+
+    @staticmethod
+    async def _sha256_of(path: Path) -> str | None:
+        """SHA-256 digest of a packaged archive, for client-side verification."""
+        digest = hashlib.sha256()
+        try:
+            async with aiofiles.open(path, 'rb') as handle:
+                while chunk := await handle.read(1024 * 1024):
+                    digest.update(chunk)
+        except OSError:
+            logger.warning("Failed to hash Skill archive: %s", path, exc_info=True)
+            return None
+        return digest.hexdigest()
 
     @staticmethod
     async def _run_git(repository_path: Path, *args: str) -> tuple[int, bytes, bytes]:

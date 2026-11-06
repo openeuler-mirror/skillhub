@@ -1,5 +1,6 @@
-import asyncio
 import logging
+import logging.handlers
+import asyncio
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -29,7 +30,8 @@ class _HealthProbeFilter(logging.Filter):
 
     def filter(self, record: logging.LogRecord) -> bool:
         try:
-            path = record.args[1]  # uvicorn.access: (method, path, http_version)
+            # uvicorn.access 参数顺序: (client_addr, method, path, http_version, status)
+            path = record.args[2].split("?")[0]
         except (AttributeError, IndexError, TypeError):
             return True
         return path not in self._PROBE_PATHS
@@ -53,10 +55,22 @@ def configure_logging() -> None:
         root_logger.addHandler(root_handler)
     # 文件日志：与 skillcrawler/main.py 口径一致，落在
     # storage.local_path/logs/ 下，便于排查线上问题（stdout 会被容器回收）。
+    # 按 logging.max_bytes/backup_count 轮转，避免长期运行把磁盘写满。
     if not any(isinstance(h, logging.FileHandler) for h in root_logger.handlers):
         log_dir = Path(settings.storage.local_path).expanduser().resolve() / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
-        file_handler = logging.FileHandler(log_dir / "api.log", encoding="utf-8")
+        log_file = log_dir / "api.log"
+        max_bytes = max(0, int(settings.logging.max_bytes))
+        backup_count = max(0, int(settings.logging.backup_count))
+        if max_bytes > 0:
+            file_handler = logging.handlers.RotatingFileHandler(
+                log_file,
+                maxBytes=max_bytes,
+                backupCount=backup_count,
+                encoding="utf-8",
+            )
+        else:
+            file_handler = logging.FileHandler(log_file, encoding="utf-8")
         file_handler.setFormatter(
             logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
         )
@@ -105,30 +119,10 @@ def configure_logging() -> None:
     )
 
 
-async def _backfill_embeddings() -> None:
-    """启动时后台补跑缺失 embedding，失败不影响服务启动。
-
-    与 discover 末尾的增量补嵌入同一入口（embed_missing），并发安全：
-    通过 pg_advisory_lock 与全量重建脚本互斥，锁被占用时直接跳过。
-    """
-    logger = structlog.get_logger()
-    try:
-        from src.ai.embedding_indexer import LockBusyError, embed_missing
-
-        stats = await embed_missing()
-        logger.info("Startup embedding backfill: %s", stats.as_dict())
-    except LockBusyError:
-        logger.info(
-            "Startup embedding backfill skipped: reindex lock held by another task"
-        )
-    except Exception:
-        logger.exception("Startup embedding backfill failed")
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger = structlog.get_logger()
-    logger.info("wittyhub starting up")
+    logger.info("skillhub starting up")
 
     collector = None
     if settings.security.enable_audit:
@@ -136,26 +130,77 @@ async def lifespan(app: FastAPI):
 
         collector = await start_skillspector_collector()
 
-    discover_scheduler = None
-    if settings.discover_scheduler.enabled:
-        from src.api.services.discover_scheduler import start_discover_scheduler
+    # 一次性迁移 + 启动补跑 + discover 调度器串成一条后台引导链：
+    # migration → startup remediation → discover 首轮扫描，顺序保持不变，
+    # 但整体放到后台，避免迁移（约 18s）阻塞 API 启动。
+    # discover scheduler 的引用经 app.state 回传，供 shutdown 阶段停止。
+    app.state.discover_scheduler = None
+    app.state.audit_llm_review = None
+    
+    async def _bootstrap() -> None:
+        # 一次性幂等迁移先于 discover 扫描执行；失败仅记录，不阻断后续步骤。
+        try:
+            from src.jobs.migration import run_migration
+            await run_migration()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("startup migration failed")
 
-        discover_scheduler = await start_discover_scheduler()
+        # 启动补一轮衍生字段缺口（security/category/embedding）并落盘；
+        # 扫描后的缺口由 discover 每轮末尾的全表补齐兜底。
+        try:
+            from src.jobs.remediation import run_remediation_on_startup
 
-    # 启动时补跑嵌入：增量补嵌入原本只挂在 discover 末尾，而重启后调度会跳过
-    # 当天已过触发点、不补跑（compute_next_run 规则），导致新入库 skill 的
-    # embedding 长时间缺失、语义检索搜不到（如 vsag-rabitq-optimization）。
-    # 启动时后台补一次即可自愈，不必等下轮 discover（最长 24h）。
-    embed_task = None
-    if settings.ai.enable_semantic_search:
-        embed_task = asyncio.create_task(_backfill_embeddings())
+            await run_remediation_on_startup()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("startup remediation failed")
+
+        if settings.discover_scheduler.enabled:
+            from src.jobs.discover_scheduler import start_discover_scheduler
+
+            try:
+                app.state.discover_scheduler = await start_discover_scheduler()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("discover scheduler start failed")
+        
+        # LLM 审核调度器：依赖 migration 与 discover 首轮扫描完成后启动。
+        # 等待 discover 首轮结束信号，避免审核与首轮扫描并发争抢资源；
+        # 引用经 app.state 回传，供 shutdown 阶段停止。
+        if settings.audit_llm_review.enabled:
+            from src.jobs.audit_llm_review import start_audit_llm_review_scheduler
+    
+            try:
+                discover_scheduler = app.state.discover_scheduler
+                if discover_scheduler is not None:
+                    await discover_scheduler.first_round_done.wait()
+                app.state.audit_llm_review = await start_audit_llm_review_scheduler()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("audit llm review scheduler start failed")               
+
+    bootstrap_task = asyncio.create_task(_bootstrap(), name="startup-bootstrap")
 
     yield
 
-    if embed_task is not None:
-        embed_task.cancel()
+    if not bootstrap_task.done():
+        bootstrap_task.cancel()
+    try:
+        await bootstrap_task
+    except asyncio.CancelledError:
+        pass
+
+    discover_scheduler = app.state.discover_scheduler
     if discover_scheduler is not None:
         await discover_scheduler.stop()
+    audit_llm_review = app.state.audit_llm_review
+    if audit_llm_review is not None:
+        await audit_llm_review.stop()       
     if collector is not None:
         await collector.stop()
     from src.ai.embedding import close_embedding_service
@@ -164,14 +209,14 @@ async def lifespan(app: FastAPI):
     from src.ai.translation import close_translation_service
 
     await close_translation_service()
-    logger.info("wittyhub shutting down")
+    logger.info("skillhub shutting down")
 
 
 def create_app() -> FastAPI:
     configure_logging()
 
     app = FastAPI(
-        title="WittyHub API",
+        title="SkillHub API",
         description="Agent and Skill Discovery Platform",
         version="0.1.0",
         lifespan=lifespan,
@@ -185,6 +230,8 @@ def create_app() -> FastAPI:
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+        # 下载接口用响应头回传制品摘要，浏览器端需要能读到
+        expose_headers=["X-Artifact-SHA256", "Content-Disposition"],
     )
     install_response_wrapper(app)
 

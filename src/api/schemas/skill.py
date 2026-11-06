@@ -26,7 +26,9 @@ class SkillBase(BaseModel):
     @field_validator("source")
     @classmethod
     def validate_source(cls, v: str) -> str:
-        allowed = {"github", "gitcode", "gitlab", "gitee", "clawhub", "local"}
+        if v == "gitcode":
+            v = "atomgit"
+        allowed = {"github", "atomgit", "gitlab", "gitee", "clawhub", "local"}
         if v not in allowed:
             raise ValueError(f"source must be one of {allowed}")
         return v

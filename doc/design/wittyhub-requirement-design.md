@@ -16,13 +16,13 @@
 
 ### 1.1 项目背景
 
-随着AI Agent和Skill生态的快速发展，开发者需要在一个集中的平台上发现、评估和获取可复用的Skill。当前存在多个Skill分发渠道（如skills.sh、clawhub.ai等），但缺乏统一的标准和本地化支持。本项目旨在构建一个去中心化的WittyHub平台，支持CLI/API访问，本地只存储索引，Skill内容存储在GitHub/GitCode等外部仓库。
+随着AI Agent和Skill生态的快速发展，开发者需要在一个集中的平台上发现、评估和获取可复用的Skill。当前存在多个Skill分发渠道（如skills.sh、clawhub.ai等），但缺乏统一的标准和本地化支持。本项目旨在构建一个去中心化的WittyHub平台，支持CLI/API访问，本地只存储索引，Skill内容存储在GitHub/AtomGit等外部仓库。
 
 ### 1.2 项目目标
 
 - **核心功能**：为Agent和Skill提供统一的检索、发现、下载和安全检测服务
 - **访问方式**：支持CLI工具和REST API访问
-- **数据管理**：去中心化存储，数据存储在GitHub/GitCode，本地只存储索引
+- **数据管理**：去中心化存储，数据存储在GitHub/AtomGit，本地只存储索引
 - **安全优先**：提供多级安全检测和风险评分
 - **扩展能力**：模块化架构，支持后续扩展Agent等资源类型
 
@@ -50,7 +50,7 @@
 | R-04 | Web浏览功能 | P1 | 已实现 | 首页、搜索结果、详情、分类浏览、排行榜 |
 | R-05 | 数据库索引存储 | P0 | 已实现 | PostgreSQL存储索引，不存储Skill内容 |
 | R-06 | 全文搜索引擎 | P0 | 已实现 | PostgreSQL tsvector 全文检索 |
-| R-07 | CLI工具 | P0 | 已实现 | wittyhub CLI（add, use, list, update, audit, get, init 等命令） |
+| R-07 | CLI工具 | P0 | 已实现 | skillhub CLI（add, use, list, update, audit, get, init 等命令） |
 | R-08 | Web前端 | P1 | 已实现 | Vue.js + TypeScript + Tailwind CSS |
 | R-09 | Docker部署 | P0 | 已实现 | Docker Compose一键部署 |
 | R-10 | 多版本支持 | P1 | 已实现 | Skill版本管理，历史版本查询 |
@@ -66,7 +66,7 @@
 |------|--------|------|
 | N-01 | 无用户系统 | 暂不做用户系统，无个人收藏功能 |
 | N-02 | 参考openEuler风格 | 前端UI参考openEuler蓝色调简洁风格 |
-| N-03 | 中国区优化 | 考虑GitCode/Gitee等国内平台支持 |
+| N-03 | 中国区优化 | 考虑AtomGit/Gitee等国内平台支持 |
 | N-04 | 离线索引 | CLI支持离线使用本地缓存索引（待开发） |
 
 ---
@@ -136,7 +136,7 @@
 │       Users             │     │   External Services     │     │     Data Storage        │
 │                         │     │                         │     │                         │
 │  ┌───────────────────┐ │     │  ┌─────────────────┐  │     │  ┌─────────────────┐  │
-│  │   CLI Users       │ │     │  │  GitCode API   │  │     │  │  PostgreSQL     │  │
+│  │   CLI Users       │ │     │  │  AtomGit API   │  │     │  │  PostgreSQL     │  │
 │  │   - skill search  │ │     │  │  - 下载仓库     │  │     │  │  - tsvector    │  │
 │  │   - skill install │ │     │  └─────────────────┘  │     │  └─────────────────┘  │
 │  │   - skill audit   │ │     │                        │     │                        │
@@ -206,7 +206,7 @@
 │  4. 下载流程 (Download)                                                                 │
 │     ┌──────────┐      ┌─────────────┐      ┌──────────────┐      ┌───────────────┐     │
 │     │   CLI/   │ ───► │  Download   │ ───► │   Source     │ ───► │   GitHub/     │     │
-│     │   Web    │      │   Manager   │      │   Formatter  │      │   GitCode     │     │
+│     │   Web    │      │   Manager   │      │   Formatter  │      │   AtomGit     │     │
 │     └──────────┘      └─────────────┘      └──────────────┘      └───────────────┘     │
 │                                                                                         │
 │  5. 全文索引流程 (Full-text Index)                                                     │
@@ -223,7 +223,7 @@
 | 外部系统 | 接口类型 | 用途 | 数据格式 |
 |----------|----------|------|----------|
 | GitHub API | REST API | 下载仓库存档、获取文件内容 | JSON |
-| GitCode API | REST API | 下载仓库存档（国内镜像） | JSON |
+| AtomGit API | REST API | 下载仓库存档（国内镜像） | JSON |
 | Gitee API | REST API | 下载仓库存档（国内平台） | JSON |
 | Jenkins SkillSpector | Jenkins REST API | Skill 目录深度安全扫描、风险评分 | JSON |
 | Local Storage | 文件系统 | CLI安装的Skill本地存储 | 目录/文件 |
@@ -284,7 +284,7 @@
 ### 5.2 项目目录结构
 
 ```
-wittyhub/
+skillhub/
 ├── src/                           # 后端源代码
 │   ├── __init__.py
 │   ├── api/                      # FastAPI 应用
@@ -389,22 +389,22 @@ wittyhub/
 | `src/security/detector.py` | 安全检测 | `SkillSpectorClient`, `SecurityResultCollector` |
 | `src/storage/downloader.py` | 下载管理 | `DownloadManager.create_skill_archive()` |
 | `src/core/config.py` | 配置管理 | `Settings` (从 YAML 加载) |
-| `wittyhub-cli` (独立 npm 包) | CLI 命令 | `add`, `use`, `list`, `update`, `audit`, `get`, `init` |
+| `skillhub-cli` (独立 npm 包) | CLI 命令 | `add`, `use`, `list`, `update`, `audit`, `get`, `init` |
 
 ---
 
 ## 6. CLI 工具设计
 
-> CLI 已独立为 npm 包 `wittyhub`（仓库 `wittyhub-cli`），由平台 API
+> CLI 已独立为 npm 包 `skillhub`（仓库 `skillhub-cli`），由平台 API
 > 提供检索/下载/审计数据。本节描述 CLI 的命令面与本地存储约定。
 
 ### 6.1 CLI 功能概览
 
 ```
-wittyhub - open agent skills ecosystem CLI
+skillhub-cli - open agent skills ecosystem CLI
 
 用法:
-  wittyhub <command> [options]
+  skillhub-cli <command> [options]
 
 命令:
   add <pkg>              从 git 仓库/URL/本地路径安装 Skills
@@ -427,7 +427,7 @@ wittyhub - open agent skills ecosystem CLI
 #### 6.2.1 add - 安装命令
 
 ```
-wittyhub add <source> [选项]
+skillhub-cli add <source> [选项]
 
 参数:
   <source>                 git 仓库地址 / GitHub 简写 / 本地路径
@@ -438,8 +438,8 @@ wittyhub add <source> [选项]
   -y, --yes                跳过交互确认
 
 示例:
-  wittyhub add vercel-labs/agent-skills
-  wittyhub add https://github.com/anthropics/skills --list
+  skillhub-cli add vercel-labs/agent-skills
+  skillhub-cli add https://github.com/anthropics/skills --list
 ```
 
 #### 6.2.2 其他命令
@@ -518,7 +518,7 @@ wittyhub add <source> [选项]
 CREATE TABLE skill_repos (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     repo_name VARCHAR(255) UNIQUE NOT NULL,
-    source VARCHAR(50) NOT NULL,           -- github, gitcode, gitee, local
+    source VARCHAR(50) NOT NULL,           -- github, atomgit, gitee, local
     platform VARCHAR(100),
     branch VARCHAR(255),
     url TEXT,                              -- 仓库克隆地址
@@ -554,7 +554,7 @@ CREATE TABLE skills (
     author VARCHAR(255),
 
     -- 来源信息
-    source VARCHAR(50) NOT NULL,           -- github, gitcode, gitee, local
+    source VARCHAR(50) NOT NULL,           -- github, atomgit, gitee, local
     source_url TEXT NOT NULL,
     repo_url TEXT,
 
@@ -798,7 +798,7 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      - DATABASE_URL=postgresql://wittyhub:wittyhub@postgres:5432/wittyhub
+      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
 
   web:
     build: ./web
@@ -828,9 +828,9 @@ services:
 postgres:
   host: "localhost"
   port: 5432
-  user: "wittyhub"
+  user: ""
   password: ""
-  db: "wittyhub"
+  db: ""
 
 storage:
   local_path: /opt/wittyhub

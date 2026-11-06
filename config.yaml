@@ -27,7 +27,7 @@ model:
 
 crawler:
   github_token: ""
-  gitcode_token: ""
+  atomgit_token: ""
 
 security:
   # Skillspector (Jenkins-based scanner) — sensitive fields via env vars
@@ -46,6 +46,33 @@ security:
   skillspector_jenkins_num_executors: 10
   skillspector_jenkins_quiet_period: 1
   skillspector_repository_root: "/opt/wittyhub/skill-repositories"
+  # SkillSpector 大模型复核参数：生产部署不读 deploy/compose.yaml 的环境变量，
+  # 统一由本文件提供给 skillspector 容器（容器入口启动时读取，注入为
+  # SKILLSPECTOR_* / OPENAI_* 环境变量）。
+  # model/base_url/api_key 留空时复用 model.providers 当前 provider
+  #（默认 siliconflow / Qwen3.5-4B），需要为扫描单独指定时再覆盖。
+  skillspector_llm_nodes: "meta_analyzer"   # 仅 meta 复核节点调用大模型，语义发现节点不调用
+  skillspector_model: ""
+  skillspector_base_url: ""
+  skillspector_api_key: ""
+  # 成本/上下文控制：跳过二进制、按规则×文件类别裁剪、只送命中窗口行
+  skillspector_text_only: true
+  skillspector_rule_scope: true
+  skillspector_window_lines: 20
+  skillspector_window_header_lines: 40
+  # 客户端限流，与 Qwen3.5-4B 免费档配额对齐（0 = 不限流）
+  skillspector_rpm: 1000
+  skillspector_tpm: 80000
+  # 输出预算与思考模式：4096 足够单批判定，也能为 TPM 预留留出并发空间
+  skillspector_max_output_tokens: 4096
+  skillspector_disable_thinking: true
+  skillspector_log_level: "INFO"
+  # 并发与超时：免费档实测可用并发约 4；BATCH_TIMEOUT 需覆盖 LLM 重试总时长；
+  # BUDGET_SECONDS 必须小于 security.skillspector_timeout 与 nginx 读超时
+  skillspector_max_concurrency: 4
+  skillspector_batch_timeout: 300
+  skillspector_llm_timeout: 90
+  skillspector_llm_budget_seconds: 540
 
 postgres:
   host: "localhost"
@@ -68,14 +95,76 @@ app:
     - "http://127.0.0.1:8080"
 
 # 后台定时 discover：按 openEuler-skills catalog 全量扫描仓库
-# 环境变量覆盖示例：DISCOVER_SCHEDULER__ENABLED=true、DISCOVER_SCHEDULER__INTERVAL=weekly
+# 环境变量覆盖示例：DISCOVER_SCHEDULER__ENABLED=true、DISCOVER_SCHEDULER__START_TIME=16:00、
+# DISCOVER_SCHEDULER__TIMEZONE=Asia/Shanghai
 discover_scheduler:
   enabled: true
-  interval: "daily"   # 二选一： daily：每天 | weekly：每周
-  time: "16:00"       # 触发时刻（UTC HH:MM；UTC+8 下即北京时间 00:00）
-  weekday: "sun"      # 仅 weekly 生效：mon/tue/wed/thu/fri/sat/sun
-  result_dir: ""      # 每轮结果 JSON 保存目录；留空则用 storage.local_path/logs
+  start_time: "00:00"        # 触发时刻（HH:MM，按 timezone 解释）
+  timezone: "Asia/Shanghai"  # 触发时刻时区（与容器 TZ 无关）
+  result_dir: ""             # 每轮结果 JSON 保存目录；留空则用 storage.local_path/logs
+
+# 后台定时 LLM 复核：每天 01:00-08:00（按 timezone 解释，默认北京时间，
+# 与容器 TZ 解耦）
+# 在窗口内分批复核未复核过的 SkillSpector 风险项，剔除误报后回写
+# security_audits 与 skills/skill_versions。model/base_url/api_key 留空时
+# 复用 model.providers 当前 provider（默认 siliconflow / Qwen3.5-4B）；
+# 需要单独指定复核模型时再用 AUDIT_LLM_REVIEW__MODEL / __BASE_URL / __API_KEY
+# 覆盖。全部为空时任务自动跳过（仅告警）。
+# 环境变量覆盖示例：AUDIT_LLM_REVIEW__START_TIME=01:00、
+# AUDIT_LLM_REVIEW__TIMEZONE=Asia/Shanghai、
+# AUDIT_LLM_REVIEW__CONCURRENCY=3、AUDIT_LLM_REVIEW__MAX_FINDINGS_PER_AUDIT=200
+audit_llm_review:
+  enabled: true
+  start_time: "01:00"
+  end_time: "08:00"
+  timezone: "Asia/Shanghai"             # 窗口时区（与容器 TZ 无关）
+  model: ""                             # 留空复用 model.providers 的模型名
+  base_url: ""                          # 留空复用 model.providers 的 base_url
+  api_key: ""                           # 留空复用 model.providers 的 key
+  timeout: 90
+  concurrency: 3
+  max_findings_per_call: 10
+  max_findings_per_audit: 200           # 单轮 pass 上限；一轮扫完后立即开始下一轮，窗口内可连续推进；0=不限
+  # 复核上下文：本地 repo 缓存 -> 远端 raw -> 现有 snippet。
+  # window 模式对小文件送全文，大文件按命中位置取窗口行。
+  context_mode: "window"                # snippet | window | full
+  window_lines: 40
+  window_header_lines: 40
+  window_max_ranges: 24
+  window_gap: 3
+  full_file_max_bytes: 65536
+  max_file_bytes: 524288
+  max_context_chars: 60000
+  repo_cache_root: "/opt/wittyhub/skill-repositories"
+  git_timeout: 20
+  remote_fetch_enabled: true
+  remote_fetch_timeout: 15
+  remote_fetch_max_bytes: 524288
+  remote_fetch_max_files_per_audit: 40
+  github_token: ""
+  gitcode_token: ""
+  gitlab_token: ""
+  gitee_token: ""
+  context_cache_max_bytes: 67108864
+  max_output_tokens: 2048               # 判定仅返回 index/is_vulnerability/confidence/reason
+  min_confidence: 0.6                   # 确认为真但置信度低于该值的命中按上游口径丢弃；0=关闭
+  min_false_positive_confidence: 0.85   # 误报删除门槛：false 判定低于该值不删除；0=关闭
+  min_false_positive_confidence_high: 0.9  # HIGH/CRITICAL 命中使用更严格的删除门槛
+  max_attempts: 3                       # 失败重试轮次（跨天累计）
+  rpm: 1000
+  tpm: 80000
+  # 可观测性：单次 LLM 调用 / 限流等待超过阈值时打 warning（0=关闭）
+  slow_llm_seconds: 30
+  rate_limit_slow_wait_seconds: 30
+  # 每轮结果 JSON 保存目录（空则 storage.local_path/logs）；
+  # 按天数和份数双重保留，超出后自动清理（0=不限制该维度）
+  result_dir: ""
+  result_keep_days: 30
+  result_max_files: 200
 
 logging:
   level: "INFO"
   format: "json"
+  # api.log 轮转：单文件 100MB，保留 5 份（max_bytes=0 关闭轮转）
+  max_bytes: 104857600
+  backup_count: 5

@@ -27,7 +27,7 @@ PLATFORMS = [
     "csharp", "ruby", "php", "swift", "kotlin", "scala"
 ]
 
-SOURCES = ["github", "gitlab", "gitcode", "local", "clawhub"]
+SOURCES = ["github", "gitlab", "atomgit", "local", "clawhub"]
 
 SKILL_TEMPLATES = {
     "python": {
@@ -552,9 +552,9 @@ def main():
     parser.add_argument("--count", type=int, default=200, help="Number of skills to generate")
     parser.add_argument("--host", default="localhost", help="Database host")
     parser.add_argument("--port", type=int, default=5432, help="Database port")
-    parser.add_argument("--user", default="wittyhub", help="Database user")
-    parser.add_argument("--db", default="wittyhub", help="Database name")
-    parser.add_argument("--password", default="wittyhub123", help="Database password")
+    parser.add_argument("--user", default="skillhub", help="Database user")
+    parser.add_argument("--db", default="skillhub", help="Database name")
+    parser.add_argument("--password", default="skillhub123", help="Database password")
     args = parser.parse_args()
 
     print(f"=== Generating {args.count} test skills ===")

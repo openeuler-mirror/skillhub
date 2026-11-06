@@ -12,7 +12,7 @@ services:
     volumes:
       - postgres-data:/var/lib/postgresql/data
     networks:
-      - wittyhub-network
+      - skillhub-network
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
       interval: 10s
@@ -42,7 +42,7 @@ services:
       - ../config.yaml:/app/config.yaml:ro
       - huggingface-cache:/models-cache
     networks:
-      - wittyhub-network
+      - skillhub-network
     healthcheck:
       # 用标准库 urllib：embedding 镜像不含 httpx，healthcheck 需零第三方依赖
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8082/health', timeout=5)"]
@@ -77,12 +77,40 @@ services:
       SECURITY__SKILLSPECTOR_JENKINS_URL: ${SECURITY__SKILLSPECTOR_JENKINS_URL:-http://skillspector:8083}
       SECURITY__SKILLSPECTOR_JENKINS_USER: ${SECURITY__SKILLSPECTOR_JENKINS_USER:-admin}
       SECURITY__SKILLSPECTOR_JENKINS_TOKEN: ${SECURITY__SKILLSPECTOR_JENKINS_TOKEN:-}
+      # 后台定时 LLM 复核：每天 01:00-08:00（下方 TZ 为北京时间）复核数据库中
+      # 未复核过的 SkillSpector 风险项，剔除误报并回写审计结果。
+      # model/base_url/api_key 留空时复用 model.providers 当前 provider
+      # （默认 siliconflow / Qwen3.5-4B）；需要单独指定时再覆盖。
+      AUDIT_LLM_REVIEW__ENABLED: ${AUDIT_LLM_REVIEW__ENABLED:-true}
+      AUDIT_LLM_REVIEW__API_KEY: ${AUDIT_LLM_REVIEW__API_KEY:-}
+      AUDIT_LLM_REVIEW__START_TIME: "${AUDIT_LLM_REVIEW__START_TIME:-01:00}"
+      AUDIT_LLM_REVIEW__END_TIME: "${AUDIT_LLM_REVIEW__END_TIME:-08:00}"
+      AUDIT_LLM_REVIEW__CONCURRENCY: ${AUDIT_LLM_REVIEW__CONCURRENCY:-3}
+      AUDIT_LLM_REVIEW__MIN_CONFIDENCE: ${AUDIT_LLM_REVIEW__MIN_CONFIDENCE:-0.6}
+      AUDIT_LLM_REVIEW__MIN_FALSE_POSITIVE_CONFIDENCE: ${AUDIT_LLM_REVIEW__MIN_FALSE_POSITIVE_CONFIDENCE:-0.85}
+      AUDIT_LLM_REVIEW__MIN_FALSE_POSITIVE_CONFIDENCE_HIGH: ${AUDIT_LLM_REVIEW__MIN_FALSE_POSITIVE_CONFIDENCE_HIGH:-0.9}
+      AUDIT_LLM_REVIEW__MAX_OUTPUT_TOKENS: ${AUDIT_LLM_REVIEW__MAX_OUTPUT_TOKENS:-2048}
+      # 上下文：本地 repo 缓存优先，缺失时按 commit 拉取远端 raw，失败回退 snippet
+      AUDIT_LLM_REVIEW__CONTEXT_MODE: ${AUDIT_LLM_REVIEW__CONTEXT_MODE:-window}
+      AUDIT_LLM_REVIEW__WINDOW_LINES: ${AUDIT_LLM_REVIEW__WINDOW_LINES:-40}
+      AUDIT_LLM_REVIEW__REPO_CACHE_ROOT: ${AUDIT_LLM_REVIEW__REPO_CACHE_ROOT:-/opt/wittyhub/skill-repositories}
+      AUDIT_LLM_REVIEW__REMOTE_FETCH_ENABLED: ${AUDIT_LLM_REVIEW__REMOTE_FETCH_ENABLED:-true}
+      AUDIT_LLM_REVIEW__GITHUB_TOKEN: ${AUDIT_LLM_REVIEW__GITHUB_TOKEN:-}
+      AUDIT_LLM_REVIEW__GITCODE_TOKEN: ${AUDIT_LLM_REVIEW__GITCODE_TOKEN:-}
+      AUDIT_LLM_REVIEW__GITLAB_TOKEN: ${AUDIT_LLM_REVIEW__GITLAB_TOKEN:-}
+      AUDIT_LLM_REVIEW__GITEE_TOKEN: ${AUDIT_LLM_REVIEW__GITEE_TOKEN:-}
+      # 结果文件与慢调用/限流可观测性（RESULT_DIR 留空 = storage.local_path/logs）
+      AUDIT_LLM_REVIEW__RESULT_DIR: ${AUDIT_LLM_REVIEW__RESULT_DIR:-}
+      AUDIT_LLM_REVIEW__RESULT_KEEP_DAYS: ${AUDIT_LLM_REVIEW__RESULT_KEEP_DAYS:-30}
+      AUDIT_LLM_REVIEW__RESULT_MAX_FILES: ${AUDIT_LLM_REVIEW__RESULT_MAX_FILES:-200}
+      AUDIT_LLM_REVIEW__SLOW_LLM_SECONDS: ${AUDIT_LLM_REVIEW__SLOW_LLM_SECONDS:-30}
+      AUDIT_LLM_REVIEW__RATE_LIMIT_SLOW_WAIT_SECONDS: ${AUDIT_LLM_REVIEW__RATE_LIMIT_SLOW_WAIT_SECONDS:-30}
       TZ: Asia/Shanghai
     volumes:
       - ../config.yaml:/app/config.yaml:ro
       - /opt/wittyhub:/opt/wittyhub
     networks:
-      - wittyhub-network
+      - skillhub-network
     depends_on:
       db:
         condition: service_healthy
@@ -109,7 +137,7 @@ services:
       - "8080:8080"
       - "443:8443"
     networks:
-      - wittyhub-network
+      - skillhub-network
     depends_on:
       api:
         condition: service_healthy
@@ -124,8 +152,11 @@ services:
       - "8083:8083"
       - "50000:50000"
     environment:
-      # Jenkins 部署参数（含 admin 密码）由 config.yaml（WITTYHUB_CONFIG）统一管理，
-      # 容器入口会把 security.skillspector_* 注入为 JENKINS_* 环境变量。
+      # Jenkins 部署参数与大模型复核参数（admin 密码、模型、API Key、限流、
+      # 并发与超时等）统一由 config.yaml（WITTYHUB_CONFIG）管理：容器入口启动时
+      # 读取 security.skillspector_*，注入为 JENKINS_* / SKILLSPECTOR_* / OPENAI_*。
+      # 生产部署不依赖本文件；确需临时覆盖时可用 docker -e（仅当 config.yaml
+      # 对应值为空时生效，例如 OPENAI_API_KEY）。
       WITTYHUB_CONFIG: /app/config.yaml
       TZ: Asia/Shanghai
     volumes:
@@ -133,7 +164,7 @@ services:
       - jenkins-data:/var/jenkins_home
       - /opt/wittyhub:/opt/wittyhub:ro
     networks:
-      - wittyhub-network
+      - skillhub-network
     healthcheck:
       test: ["CMD-SHELL", "curl --fail --silent http://localhost:8083/login >/dev/null"]
       interval: 30s
@@ -148,5 +179,5 @@ volumes:
   jenkins-data:
 
 networks:
-  wittyhub-network:
+  skillhub-network:
     driver: bridge

@@ -34,3 +34,15 @@ data/
 # Misc
 .DS_Store
 Thumbs.db
+
+# Web 前端本地产物（web/.dockerignore 不生效：build context 是仓库根目录，
+# Docker 只读 <context>/.dockerignore）。node_modules 由镜像内 npm ci 生成，
+# pnpm 装的 node_modules 是符号链接，COPY 进镜像会覆盖目录报
+# "cannot replace to directory ... with file"
+web/node_modules/
+web/dist/
+web/.vite/
+web/*.tsbuildinfo
+web/npm-debug.log*
+web/.env
+web/.env.*

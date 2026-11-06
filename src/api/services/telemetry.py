@@ -2,7 +2,7 @@ import json
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.utils.skill_id import build_skill_id, extract_owner_repo, slugify_identifier
+from src.skills.skill_id import build_skill_id, extract_owner_repo, slugify_identifier
 
 from src.models.orm import DownloadHistory
 from src.models.repository import SkillRepository
@@ -14,7 +14,9 @@ def build_skill_id_from_telemetry(
     skill_name: str,
     skill_files: dict[str, str] | None = None,
 ) -> str | None:
-    if source_type not in {"github", "gitcode", "gitlab", "gitee"}:
+    if source_type == "gitcode":
+        source_type = "atomgit"
+    if source_type not in {"github", "atomgit", "gitlab", "gitee"}:
         return None
     if not repo_url:
         return None

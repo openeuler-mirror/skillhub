@@ -1,0 +1,950 @@
+diff -ruN a/src/skillspector/nodes/build_context.py b/src/skillspector/nodes/build_context.py
+--- a/src/skillspector/nodes/build_context.py	2026-10-28 15:56:45
++++ b/src/skillspector/nodes/build_context.py	2026-10-28 15:57:25
+@@ -22,4 +22,5 @@
+ from __future__ import annotations
+ 
++import os
+ import re
+ from pathlib import Path
+@@ -61,5 +62,29 @@
+ )
+ 
++# Extensions read as text when SKILLSPECTOR_TEXT_ONLY=1.  Binaries (images,
++# archives, PDFs, fonts, media) carry no scannable instructions but dominate
++# the token bill once encoded into prompts, so they are skipped entirely.
++_TEXT_EXTENSIONS = frozenset(
++    {
++        ".md", ".markdown", ".rst", ".txt", ".py", ".sh", ".bash", ".zsh", ".js",
++        ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".rb", ".go", ".rs", ".pl", ".php",
++        ".java", ".kt", ".c", ".cc", ".cpp", ".h", ".ps1", ".bat", ".lua",
++        ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".env",
++        ".properties", ".xml", ".html", ".htm", ".css", ".scss", ".sql", ".csv",
++        ".tsv", ".lock", ".gitignore", ".dockerfile", ".mod", ".sum",
++    }
++)
+ 
++
++def _text_only() -> bool:
++    return os.environ.get("SKILLSPECTOR_TEXT_ONLY", "").strip().lower() in {
++        "1",
++        "true",
++        "yes",
++        "on",
++    }
++
++
++
+ def _resolve_skill_dir(state: SkillspectorState) -> Path:
+     """Resolve state skill_path to an existing directory Path."""
+@@ -82,4 +107,5 @@
+     """
+     paths: list[str] = []
++    text_only = _text_only()
+     for item in skill_dir.rglob("*"):
+         if not item.is_file():
+@@ -88,4 +114,6 @@
+             continue
+         if item.name.startswith(".") and not item.name.startswith(".claude"):
++            continue
++        if text_only and item.suffix.lower() not in _TEXT_EXTENSIONS:
+             continue
+         try:
+diff -ruN a/src/skillspector/nodes/meta_analyzer.py b/src/skillspector/nodes/meta_analyzer.py
+--- a/src/skillspector/nodes/meta_analyzer.py	2026-10-28 15:56:45
++++ b/src/skillspector/nodes/meta_analyzer.py	2026-10-29 09:47:30
+@@ -25,12 +25,23 @@
+ import asyncio
+ import json
++import os
++import re
++import time
++from collections import defaultdict
+ from typing import Literal
+ 
+-from pydantic import BaseModel, Field, ValidationError, field_validator
+-
++from pydantic import (
++    AliasChoices,
++    BaseModel,
++    ConfigDict,
++    Field,
++    ValidationError,
++    field_validator,
++)
+ from skillspector.llm_analyzer_base import (
+     Batch,
+     LLMAnalyzerBase,
+     LLMBadResponseError,
++    _is_transient_error,
+     estimate_tokens,
+     run_llm_coro,
+@@ -44,7 +55,42 @@
+ )
+ from skillspector.state import MetaAnalyzerResponse, SkillspectorState
++from skillspector.rule_scope import enabled as rule_scope_enabled
++from skillspector.rule_scope import split_findings
+ 
+ logger = get_logger(__name__)
+ 
++_RULE_ID_RE = re.compile(r"\b([A-Z]{2}\d+)\b")
++
++
++def _env_int(name: str, default: int) -> int:
++    raw = os.environ.get(name)
++    if raw is None or not raw.strip():
++        return default
++    try:
++        return int(float(raw.strip()))
++    except ValueError:
++        logger.warning("Invalid %s=%r; using %d", name, raw, default)
++        return default
++
++
++def _env_flag(name: str, default: bool) -> bool:
++    raw = os.environ.get(name)
++    if raw is None or not raw.strip():
++        return default
++    return raw.strip().lower() in {"1", "true", "yes", "on"}
++
++
++def _normalise_enum(value: object, allowed: tuple[str, ...], default: str) -> str:
++    """Map a free-form model answer onto one of *allowed* (or *default*)."""
++    if isinstance(value, bool):
++        return default
++    text = str(value).strip().lower() if value is not None else ""
++    if text in allowed:
++        return text
++    for candidate in allowed:
++        if candidate in text:
++            return candidate
++    return default
++
+ ANALYZER_ID = "meta_analyzer"
+ 
+@@ -55,5 +101,20 @@
+ _UNJUDGED = "_unjudged"
+ 
++#: Appended to the prompt when a well-formed but *empty* verdict list comes back
++#: for a batch that does have findings.  Small models occasionally answer
++#: ``{"findings": []}`` without evaluating anything; that is not a "no
++#: vulnerability" verdict, so it is retried once and then treated as unjudged.
++_EMPTY_VERDICT_REMINDER = """
+ 
++## REMINDER (your previous answer was empty)
++
++You returned an empty `findings` array, but this batch contains
++{count} static finding(s). You MUST return exactly one object per static
++finding listed above, each with its `pattern_id`, its `start_line`, and an
++explicit `is_vulnerability` boolean (false when it is a false positive).
++Returning an empty array is not an acceptable answer.
++"""
++
++
+ # ---------------------------------------------------------------------------
+ # Structured output schemas
+@@ -64,5 +125,13 @@
+     """A single finding evaluated by the meta-analyzer LLM (filter/enrich mode)."""
+ 
+-    pattern_id: str = Field(description="The static analysis pattern ID (e.g. E2, P1)")
++    # Small models emit field-name variants ("id", "vulnerable") and stray
++    # descriptors; aliases + normalisation keep a mostly-correct batch usable
++    # instead of failing the whole response validation.
++    model_config = ConfigDict(populate_by_name=True)
++
++    pattern_id: str = Field(
++        validation_alias=AliasChoices("pattern_id", "rule_id", "id", "pattern"),
++        description="The static analysis pattern ID (e.g. E2, P1)",
++    )
+     start_line: int | None = Field(
+         default=None,
+@@ -74,18 +143,64 @@
+         description="The end line number from the finding's Location, if available.",
+     )
+-    is_vulnerability: bool = Field(description="Whether this is a true vulnerability")
++    is_vulnerability: bool = Field(
++        validation_alias=AliasChoices(
++            "is_vulnerability", "vulnerable", "is_vulnerable", "is_true_positive"
++        ),
++        description="Whether this is a true vulnerability",
++    )
+     # No ge/le bound on purpose: Pydantic bounds emit JSON-schema
+     # minimum/maximum, which some OpenAI-compatible structured-output endpoints
+     # reject. The range is enforced by the validator below instead.
+-    confidence: float = Field(description="Confidence score between 0.0 and 1.0")
++    confidence: float = Field(default=0.7, description="Confidence score between 0.0 and 1.0")
+     intent: Literal["malicious", "negligent", "benign"] = Field(
+-        description="Likely intent behind the finding"
++        default="benign", description="Likely intent behind the finding"
+     )
+     impact: Literal["critical", "high", "medium", "low"] = Field(
+-        description="Potential impact if exploited"
++        default="medium", description="Potential impact if exploited"
+     )
+     explanation: str = Field(default="", description="Why this is dangerous (2-3 sentences)")
+     remediation: str = Field(default="", description="How to fix the issue (actionable steps)")
+ 
++    @field_validator("is_vulnerability", mode="before")
++    @classmethod
++    def _coerce_bool(cls, v: object) -> bool:
++        if isinstance(v, bool):
++            return v
++        if isinstance(v, (int, float)):
++            return bool(v)
++        text = str(v or "").strip().lower()
++        if text in {"true", "yes", "y", "1", "vulnerability", "vulnerable", "tp"}:
++            return True
++        if text in {"false", "no", "n", "0", "safe", "benign", "fp", "false_positive"}:
++            return False
++        # "high"/"critical" style answers: treat anything affirmative as true.
++        return "true" in text or "vulnerab" in text
++
++    @field_validator("pattern_id", mode="after")
++    @classmethod
++    def _normalise_pattern_id(cls, v: str) -> str:
++        """Extract the bare rule id from "[TM1] Tool Parameter Abuse (HIGH)"."""
++        text = str(v or "").strip()
++        match = _RULE_ID_RE.search(text.upper())
++        return match.group(1) if match else text
++
++    @field_validator("intent", mode="before")
++    @classmethod
++    def _normalise_intent(cls, v: object) -> str:
++        return _normalise_enum(v, ("malicious", "negligent", "benign"), "benign")
++
++    @field_validator("impact", mode="before")
++    @classmethod
++    def _normalise_impact(cls, v: object) -> str:
++        return _normalise_enum(v, ("critical", "high", "medium", "low"), "medium")
++
++    @field_validator("confidence", mode="before")
++    @classmethod
++    def _coerce_confidence(cls, v: object) -> float:
++        try:
++            return float(v)  # type: ignore[arg-type]
++        except (TypeError, ValueError):
++            return 0.7
++
+     @field_validator("confidence")
+     @classmethod
+@@ -99,6 +214,6 @@
+     """Overall risk assessment for the analyzed file."""
+ 
+-    risk_level: str = Field(description="Overall risk level: LOW, MEDIUM, HIGH, or CRITICAL")
+-    summary: str = Field(description="Brief summary of findings")
++    risk_level: str = Field(default="LOW", description="Overall risk level: LOW, MEDIUM, HIGH, or CRITICAL")
++    summary: str = Field(default="", description="Brief summary of findings")
+ 
+ 
+@@ -184,4 +299,14 @@
+ this is dangerous and remediation steps for HOW to fix the issue.
+ 
++5. Documentation rule: if the file is documentation (.md/.rst/.txt or under
++   docs/), a command shown as an *example*, a code block that is illustrative,
++   or a URL that is merely mentioned is NOT a vulnerability. Only confirm when
++   the skill instructs the agent to run something dangerous in its own flow.
++6. Instruction file rule (SKILL.md / AGENTS.md / references/): confirm when the
++   instructions direct the agent to perform the risky action, not merely when
++   they describe or warn about it.
++7. Never confirm a finding whose only evidence is a line that quotes a security
++   warning, a "do not do X" prohibition, or a threat description.
++
+ Analyze the findings now:"""
+ 
+@@ -227,4 +352,83 @@
+ 
+ 
++def _merge_ranges(
++    ranges: list[tuple[int, int]],
++    gap_tolerance: int,
++    max_ranges: int,
++) -> list[tuple[int, int]]:
++    """Merge overlapping/nearby line ranges, then collapse until <= max_ranges."""
++    if not ranges:
++        return []
++    ordered = sorted(ranges)
++    merged: list[tuple[int, int]] = [ordered[0]]
++    for start, end in ordered[1:]:
++        last_start, last_end = merged[-1]
++        if start <= last_end + gap_tolerance + 1:
++            merged[-1] = (last_start, max(last_end, end))
++        else:
++            merged.append((start, end))
++
++    # Too many disjoint windows: repeatedly merge the closest pair.  Cheaper
++    # than emitting dozens of tiny prompts that each pay the fixed overhead.
++    while len(merged) > max_ranges:
++        best_idx = 0
++        best_gap = None
++        for i in range(len(merged) - 1):
++            gap = merged[i + 1][0] - merged[i][1]
++            if best_gap is None or gap < best_gap:
++                best_gap = gap
++                best_idx = i
++        first = merged[best_idx]
++        second = merged[best_idx + 1]
++        merged[best_idx : best_idx + 2] = [(first[0], second[1])]
++    return merged
++
++
++def _render_block(lines: list[str], start: int, end: int) -> str:
++    """Render 1-indexed inclusive line range with explicit ``L<n>:`` prefixes."""
++    return "\n".join(f"L{idx}: {lines[idx - 1]}" for idx in range(start, end + 1))
++
++
++def _split_oversized(
++    ranges: list[tuple[int, int]],
++    lines: list[str],
++    content_budget: int,
++) -> list[tuple[int, int]]:
++    """Split any range whose rendered text exceeds the per-prompt budget."""
++    out: list[tuple[int, int]] = []
++    for start, end in ranges:
++        tokens = estimate_tokens(_render_block(lines, start, end))
++        if tokens <= content_budget:
++            out.append((start, end))
++            continue
++        parts = max(2, int(tokens / content_budget) + 1)
++        step = max(1, (end - start + 1) // parts)
++        cursor = start
++        while cursor <= end:
++            out.append((cursor, min(end, cursor + step - 1)))
++            cursor += step
++    return out
++
++
++def _match_item_files(
++    batch_findings: list[Finding],
++    rule_id: str,
++    start_line: object,
++) -> set[str]:
++    """Map an LLM-judged item back to the file(s) it came from (multi-file batch)."""
++    try:
++        line = int(start_line) if start_line is not None else None  # type: ignore[arg-type]
++    except (TypeError, ValueError):
++        line = None
++    exact = {
++        f.file
++        for f in batch_findings
++        if f.rule_id == rule_id and (line is None or f.start_line == line)
++    }
++    if exact:
++        return exact
++    return {f.file for f in batch_findings if f.rule_id == rule_id}
++
++
+ def _fallback_filtered(findings: list[Finding]) -> list[Finding]:
+     """Apply default remediation to all findings (pass-through with defaults)."""
+@@ -285,4 +489,185 @@
+         )
+ 
++    # -- Window batching ----------------------------------------------------
++
++    def get_batches(
++        self,
++        file_paths: list[str],
++        file_cache: dict[str, str],
++        findings: list[Finding] | None = None,
++    ) -> list[Batch]:
++        """Batch findings into windows, optionally packing several files together.
++
++        With ``SKILLSPECTOR_WINDOW_LINES=N`` only N lines of context around each
++        finding (plus the first ``SKILLSPECTOR_WINDOW_HEADER_LINES`` lines) are
++        sent, instead of the whole file.  Large docs files spend most of their
++        tokens on prose unrelated to the hits, so this is the single biggest
++        cost lever for documentation-heavy skills.
++
++        With ``SKILLSPECTOR_MULTI_FILE_BATCH=1`` the windows from *different*
++        files are packed into the same prompt until the input budget is reached.
++        Disabled by default: on documentation-heavy skills the token estimate
++        (chars/4) undercounts code-heavy content by ~2.4x, so filling the
++        nominal budget produced 28k-token prompts versus 3.9k per-file prompts,
++        which increased total input by ~50% instead of reducing it.
++
++        In every mode a prompt carries at most
++        ``SKILLSPECTOR_MAX_FINDINGS_PER_BATCH`` findings (default 20), so one
++        hit-dense document is reviewed in several smaller, answerable calls.
++        """
++        window = _env_int("SKILLSPECTOR_WINDOW_LINES", 0)
++        if window <= 0:
++            return super().get_batches(file_paths, file_cache, findings)
++
++        header_lines = _env_int("SKILLSPECTOR_WINDOW_HEADER_LINES", 40)
++        max_ranges = max(1, _env_int("SKILLSPECTOR_WINDOW_MAX_RANGES", 24))
++        multi_file = _env_flag("SKILLSPECTOR_MULTI_FILE_BATCH", False)
++        max_batch_findings = max(1, _env_int("SKILLSPECTOR_MAX_FINDINGS_PER_BATCH", 20))
++        base_overhead = estimate_tokens(self.base_prompt)
++        content_budget = max(1024, self._input_budget - base_overhead)
++
++        findings_by_file: dict[str, list[Finding]] = defaultdict(list)
++        for f in findings or []:
++            findings_by_file[f.file].append(f)
++
++        batches: list[Batch] = []
++
++        def _window_ranges(group: list[Finding], lines: list[str]) -> list[tuple[int, int]]:
++            ranges: list[tuple[int, int]] = []
++            if header_lines > 0:
++                ranges.append((1, min(header_lines, len(lines))))
++            for f in group:
++                start = max(1, (f.start_line or 1) - window)
++                end = min(len(lines), (f.end_line or f.start_line or 1) + window)
++                ranges.append((start, end))
++            return _merge_ranges(ranges, window, max_ranges)
++
++        if not multi_file:
++            # One file per batch, but never more than ``max_batch_findings``
++            # findings per prompt: a single document with 40+ hits produced a
++            # prompt the provider never answered within the batch timeout, so
++            # the whole file stayed unjudged (and its noisy hits stayed in the
++            # report).  Every finding lands in exactly one group, so nothing is
++            # dropped when ``_merge_ranges`` trims the window list.
++            for path in file_paths:
++                content = file_cache.get(path)
++                if content is None:
++                    # Unreadable file: keep findings untouched, no LLM call.
++                    batches.append(
++                        Batch(file_path=path, content="", findings=findings_by_file.get(path, []))
++                    )
++                    continue
++                file_findings = findings_by_file.get(path, [])
++                if not file_findings:
++                    continue
++
++                lines = content.splitlines()
++                if not lines:
++                    batches.append(Batch(file_path=path, content=content, findings=file_findings))
++                    continue
++
++                ordered = sorted(file_findings, key=lambda item: item.start_line or 1)
++                for offset in range(0, len(ordered), max_batch_findings):
++                    group = ordered[offset : offset + max_batch_findings]
++                    blocks = [
++                        _render_block(lines, start, end)
++                        for start, end in _split_oversized(
++                            _window_ranges(group, lines), lines, content_budget
++                        )
++                    ]
++                    batches.append(
++                        Batch(
++                            file_path=path,
++                            content=f"### File: {path}\n" + "\n".join(blocks),
++                            findings=list(group),
++                        )
++                    )
++            return batches
++
++        chunks: list[tuple[str, str, list[Finding]]] = []
++
++        for path in file_paths:
++            content = file_cache.get(path)
++            if content is None:
++                # Unreadable file: keep findings untouched, no LLM call.
++                batches.append(
++                    Batch(file_path=path, content="", findings=findings_by_file.get(path, []))
++                )
++                continue
++            file_findings = findings_by_file.get(path, [])
++            if not file_findings:
++                continue
++
++            lines = content.splitlines()
++            if not lines:
++                batches.append(Batch(file_path=path, content=content, findings=file_findings))
++                continue
++
++            ranges: list[tuple[int, int]] = []
++            if header_lines > 0:
++                ranges.append((1, min(header_lines, len(lines))))
++            for f in sorted(file_findings, key=lambda item: item.start_line or 1):
++                start = max(1, (f.start_line or 1) - window)
++                end = min(len(lines), (f.end_line or f.start_line or 1) + window)
++                ranges.append((start, end))
++
++            merged = _merge_ranges(ranges, window, max_ranges)
++            for start, end in _split_oversized(merged, lines, content_budget):
++                block = _render_block(lines, start, end)
++                block_findings = [
++                    f for f in file_findings if start <= (f.start_line or 1) <= end
++                ]
++                chunks.append((path, f"### File: {path}\n{block}", block_findings))
++
++        if not chunks:
++            return batches
++
++        cur_texts: list[str] = []
++        cur_paths: list[str] = []
++        cur_findings: list[Finding] = []
++        cur_seen: set[int] = set()
++        cur_tokens = 0
++
++        def _flush() -> None:
++            nonlocal cur_texts, cur_paths, cur_findings, cur_seen, cur_tokens
++            if not cur_texts:
++                return
++            unique_paths = list(dict.fromkeys(cur_paths))
++            if len(unique_paths) == 1:
++                label = unique_paths[0]
++            else:
++                head = ", ".join(unique_paths[:3])
++                more = "..." if len(unique_paths) > 3 else ""
++                label = f"{len(unique_paths)} files: {head}{more}"
++            batch = Batch(
++                file_path=label,
++                content="\n\n".join(cur_texts),
++                findings=list(cur_findings),
++            )
++            # Consumed by parse_response to map each judged item back to a file.
++            batch.file_paths = unique_paths  # type: ignore[attr-defined]
++            batches.append(batch)
++            cur_texts = []
++            cur_paths = []
++            cur_findings = []
++            cur_seen = set()
++            cur_tokens = 0
++
++        for path, text, block_findings in chunks:
++            cost = estimate_tokens(text) + self._estimate_extra_overhead(block_findings)
++            new_findings = [f for f in block_findings if id(f) not in cur_seen]
++            over_budget = cur_tokens + cost > content_budget
++            over_findings = len(cur_findings) + len(new_findings) > max_batch_findings
++            if cur_texts and (over_budget or over_findings):
++                _flush()
++            cur_texts.append(text)
++            cur_paths.append(path)
++            for f in new_findings:
++                cur_seen.add(id(f))
++                cur_findings.append(f)
++            cur_tokens += cost
++        _flush()
++        return batches
++
+     def parse_response(
+         self,
+@@ -292,8 +677,21 @@
+         """Convert the validated Pydantic response to dicts for ``apply_filter``."""
+         items: list[dict[str, object]] = []
++        file_paths = getattr(batch, "file_paths", None)
++        multi = bool(file_paths) and len(file_paths) > 1
+         for f in response.findings:
+             d = f.model_dump()
+-            d["_file"] = batch.file_path
+-            items.append(d)
++            if not multi:
++                d["_file"] = batch.file_path
++                items.append(d)
++                continue
++            # Multi-file prompt: attribute the judged item to the file(s) whose
++            # static findings match its rule id and start line.
++            matched = _match_item_files(
++                batch.findings, str(d.get("pattern_id") or ""), d.get("start_line")
++            )
++            for path in matched:
++                item = dict(d)
++                item["_file"] = path
++                items.append(item)
+         return items
+ 
+@@ -302,5 +700,5 @@
+         batches: list[Batch],
+         *,
+-        max_concurrency: int = 10,
++        max_concurrency: int | None = None,
+         **kwargs: object,
+     ) -> list[tuple[Batch, list[dict[str, object]]]]:
+@@ -313,11 +711,42 @@
+         reported with the ``_unjudged`` marker (:data:`_UNJUDGED`) so that only its
+         findings stay in the report while the remaining batches are still filtered
+-        normally.  Errors that are not evidence of an unusable payload (network,
+-        credentials, event loop) keep propagating.
++        normally.  Provider capacity errors and per-batch timeouts are isolated the
++        same way; genuine configuration errors (``ValueError`` without a payload
++        problem) keep propagating.
++
++        A batch that answers with a well-formed but *empty* verdict list is retried
++        once with an explicit reminder, then reported as unjudged: small models
++        emit ``{"findings": []}`` for ~25% of batches, and reading that as "all
++        false positives" silently deleted every hit in the batch.
+         """
++        if max_concurrency is None:
++            max_concurrency = max(1, _env_int("SKILLSPECTOR_MAX_CONCURRENCY", 3))
++        batch_timeout = max(1, _env_int("SKILLSPECTOR_BATCH_TIMEOUT", 300))
++        # Wall-clock budget for the whole review stage.  Once exhausted, the
++        # remaining batches are left unjudged (their findings are kept) instead
++        # of extending the scan indefinitely on a slow/throttled provider.
++        budget = _env_int("SKILLSPECTOR_LLM_BUDGET_SECONDS", 0)
++        deadline = time.monotonic() + budget if budget > 0 else None
++        skipped = 0
+         sem = asyncio.Semaphore(max_concurrency)
+ 
+         async def _process(batch: Batch) -> list[dict[str, object]]:
++            nonlocal skipped
+             async with sem:
++                # The deadline is re-checked here (not only when the coroutine is
++                # created): every batch is scheduled up-front, so a check at
++                # creation time passes for all of them before the first request
++                # has even been sent.  The per-call timeout is also clipped to the
++                # remaining budget, otherwise in-flight calls keep running long
++                # past it and the budget never actually stops the review.
++                timeout = float(batch_timeout)
++                if deadline is not None:
++                    remaining = deadline - time.monotonic()
++                    if remaining <= 0:
++                        skipped += 1
++                        return [{_UNJUDGED: True}]
++                    timeout = max(1.0, min(timeout, remaining))
++                if not batch.content:
++                    return [{_UNJUDGED: True}]
+                 prompt = self.build_prompt(batch, **kwargs)
+                 logger.debug(
+@@ -328,19 +757,102 @@
+                 )
+                 try:
+-                    response = await self._ainvoke_llm(prompt)
+-                except (LLMBadResponseError, ValidationError) as exc:
++                    response = await asyncio.wait_for(
++                        self._ainvoke_llm(prompt), timeout=timeout
++                    )
++                except (LLMBadResponseError, ValidationError, asyncio.TimeoutError) as exc:
++                    if deadline is not None and time.monotonic() >= deadline:
++                        skipped += 1
++                        return [{_UNJUDGED: True}]
+                     logger.warning(
+-                        "%s: unusable LLM payload for %s (%s) -- keeping its %d "
++                        "%s: unusable LLM payload for %s (%s: %s) -- keeping its %d "
+                         "findings, other batches unaffected",
+                         ANALYZER_ID,
+                         batch.file_label,
++                        type(exc).__name__,
+                         exc,
+                         len(batch.findings),
+                     )
+                     return [{_UNJUDGED: True}]
++                except ValueError:
++                    raise
++                except Exception as exc:  # noqa: BLE001 - provider/network errors
++                    if not _is_transient_error(exc):
++                        raise
++                    logger.warning(
++                        "%s: transient provider error for %s (%s: %s) -- keeping its "
++                        "%d findings",
++                        ANALYZER_ID,
++                        batch.file_label,
++                        type(exc).__name__,
++                        exc,
++                        len(batch.findings),
++                    )
++                    return [{_UNJUDGED: True}]
+                 logger.debug("LLM response for %s", batch.file_label)
+-                return self.parse_response(response, batch)
++                items = self.parse_response(response, batch)
++                if batch.findings and not items:
++                    # A well-formed but empty verdict list is not a verdict: the
++                    # model ignored the "one object per finding" instruction.
++                    # Small models do this on ~25% of batches, and treating it as
++                    # "every finding is a false positive" silently deletes real
++                    # hits. Ask once more, explicitly; if it stays empty, keep the
++                    # findings (conservative) instead of dropping them.
++                    logger.warning(
++                        "%s: empty verdict for %s (%d findings) -- retrying with an "
++                        "explicit reminder",
++                        ANALYZER_ID,
++                        batch.file_label,
++                        len(batch.findings),
++                    )
++                    retry_timeout = timeout
++                    if deadline is not None:
++                        remaining = deadline - time.monotonic()
++                        if remaining <= 0:
++                            skipped += 1
++                            return [{_UNJUDGED: True}]
++                        retry_timeout = max(1.0, min(float(batch_timeout), remaining))
++                    reminder = prompt + _EMPTY_VERDICT_REMINDER.format(
++                        count=len(batch.findings)
++                    )
++                    try:
++                        response = await asyncio.wait_for(
++                            self._ainvoke_llm(reminder), timeout=retry_timeout
++                        )
++                    except ValueError:
++                        raise
++                    except Exception as exc:  # noqa: BLE001 - keep findings on failure
++                        logger.warning(
++                            "%s: retry for empty verdict failed on %s (%s: %s) -- "
++                            "keeping its %d findings",
++                            ANALYZER_ID,
++                            batch.file_label,
++                            type(exc).__name__,
++                            exc,
++                            len(batch.findings),
++                        )
++                        return [{_UNJUDGED: True}]
++                    items = self.parse_response(response, batch)
++                    if not items:
++                        logger.warning(
++                            "%s: still no verdict for %s after retry -- keeping its %d "
++                            "findings (treated as unjudged, not as false positives)",
++                            ANALYZER_ID,
++                            batch.file_label,
++                            len(batch.findings),
++                        )
++                        return [{_UNJUDGED: True}]
++                return items
+ 
+-        return list(zip(batches, await asyncio.gather(*[_process(b) for b in batches])))
++        results = list(zip(batches, await asyncio.gather(*[_process(b) for b in batches])))
++        if skipped:
++            logger.warning(
++                "%s: LLM budget of %ds exhausted -- %d/%d batches left unjudged "
++                "(their findings are kept, report is conservative)",
++                ANALYZER_ID,
++                budget,
++                skipped,
++                len(batches),
++            )
++        return results
+ 
+     # -- Apply filter (keyed by file + rule_id + start/end_line) -------------
+@@ -363,4 +875,8 @@
+         callers that omit it still match.  Falls back to coarse
+         ``(file, rule_id)`` keying for LLM responses that omit ``start_line``.
++
++        A finding with **no** verdict at all (the model answered for the batch but
++        skipped this item) is kept with default remediation, exactly like an
++        unjudged batch: only an explicit ``is_vulnerability=false`` removes a hit.
+         """
+         _enrichment = tuple[str, str, float]
+@@ -369,19 +885,39 @@
+         confirmed_by_start: dict[tuple[str, str, int], _enrichment] = {}
+         confirmed_coarse: dict[tuple[str, str], _enrichment] = {}
++        # Every (file, rule, line) the model actually answered for, regardless of
++        # the verdict; used to tell "rejected" apart from "never answered".
++        judged_granular: set[tuple[str, str, int, int | None]] = set()
++        judged_by_start: set[tuple[str, str, int]] = set()
++        judged_coarse: set[tuple[str, str]] = set()
+ 
+         for batch, llm_items in batch_results:
+             for item in llm_items:
+                 pattern_id = item.get("pattern_id")
+-                if not pattern_id or not item.get("is_vulnerability", False):
++                if not pattern_id:
+                     continue
++                pattern_id = str(pattern_id)
++                file_path = item.get("_file", batch.file_path)
++                start_line = item.get("start_line")
++                if start_line is not None:
++                    end_line = item.get("end_line")
++                    judged_granular.add(
++                        (
++                            file_path,
++                            pattern_id,
++                            int(start_line),
++                            int(end_line) if end_line is not None else None,
++                        )
++                    )
++                    judged_by_start.add((file_path, pattern_id, int(start_line)))
++                else:
++                    judged_coarse.add((file_path, pattern_id))
++                if not item.get("is_vulnerability", False):
++                    continue
+                 conf = float(item.get("confidence", 0.7))
+                 if conf < 0.6:
+                     continue
+-                pattern_id = str(pattern_id)
+                 explanation = (item.get("explanation") or "").strip() or get_explanation(pattern_id)
+                 remediation = (item.get("remediation") or "").strip() or get_remediation(pattern_id)
+-                file_path = item.get("_file", batch.file_path)
+                 enrichment: _enrichment = (explanation, remediation, conf)
+-                start_line = item.get("start_line")
+                 if start_line is not None:
+                     end_line = item.get("end_line")
+@@ -423,4 +959,15 @@
+                 expl, rem, conf = confirmed_coarse[coarse_key]
+             else:
++                # Not confirmed. Keep it unless the model explicitly rejected it:
++                # an item the model silently omitted must not become a false
++                # negative (that was the "empty verdict" bug, one level deeper).
++                answered = (
++                    exact_key in judged_granular
++                    or start_only_key in judged_granular
++                    or (start_key is not None and start_key in judged_by_start)
++                    or coarse_key in judged_coarse
++                )
++                if not answered:
++                    result.append(_fallback_filtered([f])[0])
+                 continue
+             result.append(
+@@ -476,4 +1023,20 @@
+         return {"filtered_findings": _fallback_filtered(findings)}
+ 
++    if rule_scope_enabled():
++        applicable, suppressed = split_findings(findings)
++        suppressed_total = sum(suppressed.values())
++        if suppressed_total:
++            logger.info(
++                "Rule scope: %d findings not applicable to their file class (%s)",
++                suppressed_total,
++                ", ".join(
++                    f"{rule}={count}"
++                    for rule, count in sorted(suppressed.items(), key=lambda kv: -kv[1])
++                ),
++            )
++        findings = applicable
++        if not findings:
++            return {"filtered_findings": []}
++
+     file_cache: dict[str, str] = state.get("file_cache") or {}
+     manifest: dict[str, object] = state.get("manifest") or {}
+@@ -488,6 +1051,7 @@
+     try:
+         batches = analyzer.get_batches(files_with_findings, file_cache, findings)
+-        logger.debug(
+-            "Meta-analyzer: %d files -> %d batches (model=%s)",
++        logger.info(
++            "Meta-analyzer: %d findings in %d files -> %d batches (model=%s)",
++            len(findings),
+             len(files_with_findings),
+             len(batches),
+diff -ruN a/src/skillspector/rule_scope.py b/src/skillspector/rule_scope.py
+--- a/src/skillspector/rule_scope.py	1970-01-01 08:00:00
++++ b/src/skillspector/rule_scope.py	2026-10-28 15:57:25
+@@ -0,0 +1,139 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Rule-scope matrix: drop static findings whose rule cannot apply to a file class.
++
++Static regex rules fire on documentation prose far more often than on real code
++(a doc that *mentions* ``curl | bash`` is not executing it).  Sending every such
++hit to the LLM dominates scanning cost, so this module declares, per rule, which
++file classes the rule is meaningful for and suppresses the rest before the LLM
++sees them.
++
++Enabled with ``SKILLSPECTOR_RULE_SCOPE=1``; matrix can be overridden with a YAML
++file via ``SKILLSPECTOR_RULE_SCOPE_FILE`` (format: ``RULE: [class, ...]``).
++"""
++
++from __future__ import annotations
++
++import os
++from pathlib import Path
++
++from skillspector.logging_config import get_logger
++from skillspector.models import Finding
++
++logger = get_logger(__name__)
++
++DOCS = "docs"
++INSTRUCTIONS = "instructions"
++CODE = "code"
++CONFIG = "config"
++OTHER = "other"
++
++_CODE_EXT = {
++    ".py", ".sh", ".bash", ".zsh", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx",
++    ".rb", ".go", ".rs", ".pl", ".php", ".java", ".kt", ".c", ".cc", ".cpp", ".h",
++    ".ps1", ".bat", ".lua",
++}
++_CONFIG_EXT = {
++    ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".env", ".properties",
++    ".lock", ".xml",
++}
++_INSTRUCTION_NAMES = {"skill.md", "agents.md", "claude.md", "readme.md"}
++_INSTRUCTION_DIRS = {"references", "reference", ".claude"}
++
++# Rule -> file classes where the rule can plausibly produce a true positive.
++_BUILTIN_MATRIX: dict[str, set[str]] = {
++    "PE1": {CODE, CONFIG, INSTRUCTIONS},
++    "PE2": {CODE, CONFIG, INSTRUCTIONS},
++    "PE3": {CODE, CONFIG, INSTRUCTIONS},
++    "TM1": {CODE, CONFIG, INSTRUCTIONS},
++    "TM2": {CODE, CONFIG, INSTRUCTIONS},
++    "MP2": {CODE, CONFIG, INSTRUCTIONS},
++    "MP3": {CODE, INSTRUCTIONS},
++    "RA1": {CODE, INSTRUCTIONS},
++    "RA2": {CODE, INSTRUCTIONS},
++    "EA2": {CODE, CONFIG, INSTRUCTIONS},
++    "EA4": {CODE, CONFIG},
++    "OH1": {CODE},
++    "SC1": {CODE, CONFIG, INSTRUCTIONS},
++    "SC2": {CODE, CONFIG, INSTRUCTIONS},
++    "SC4": {CODE, CONFIG},
++}
++
++_SCOPE_ENV = "SKILLSPECTOR_RULE_SCOPE"
++_MATRIX_FILE_ENV = "SKILLSPECTOR_RULE_SCOPE_FILE"
++
++_matrix: dict[str, set[str]] | None = None
++
++
++def enabled() -> bool:
++    return os.environ.get(_SCOPE_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
++
++
++def classify_path(path: str) -> str:
++    """Classify a relative file path into docs / instructions / code / config / other."""
++    p = Path(path)
++    lower_name = p.name.lower()
++    parts = [part.lower() for part in p.parts[:-1]]
++
++    if lower_name in _INSTRUCTION_NAMES:
++        return INSTRUCTIONS
++    if any(part in _INSTRUCTION_DIRS for part in parts):
++        return INSTRUCTIONS
++
++    suffix = p.suffix.lower()
++    if suffix in {".md", ".markdown", ".rst", ".txt"}:
++        # docs/ wins over generic markdown; README/SKILL already handled above.
++        if "docs" in parts or "doc" in parts:
++            return DOCS
++        return DOCS
++    if suffix in _CODE_EXT:
++        return CODE
++    if suffix in _CONFIG_EXT:
++        return CONFIG
++    return OTHER
++
++
++def _load_matrix() -> dict[str, set[str]]:
++    global _matrix
++    if _matrix is not None:
++        return _matrix
++    matrix = {rule: set(classes) for rule, classes in _BUILTIN_MATRIX.items()}
++    override = os.environ.get(_MATRIX_FILE_ENV, "").strip()
++    if override:
++        try:
++            import yaml
++
++            data = yaml.safe_load(Path(override).read_text(encoding="utf-8")) or {}
++            for rule, classes in data.items():
++                if isinstance(classes, list):
++                    matrix[str(rule)] = {str(c).strip().lower() for c in classes}
++            logger.info("Loaded rule-scope matrix override from %s", override)
++        except Exception as exc:  # noqa: BLE001 - never fail a scan over config
++            logger.warning("Failed to load rule-scope matrix %s: %s", override, exc)
++    _matrix = matrix
++    return matrix
++
++
++def rule_applies(rule_id: str, file_class: str) -> bool:
++    """True when *rule_id* may apply to *file_class*.
++
++    Unknown rules stay applicable (fail-open) so new rules are never silently
++    dropped before the matrix is updated.
++    """
++    matrix = _load_matrix()
++    allowed = matrix.get(rule_id)
++    if allowed is None:
++        return True
++    return file_class in allowed
++
++
++def split_findings(findings: list[Finding]) -> tuple[list[Finding], dict[str, int]]:
++    """Split into (applicable, suppressed counts keyed by rule id)."""
++    applicable: list[Finding] = []
++    suppressed: dict[str, int] = {}
++    for f in findings:
++        cls = classify_path(f.file)
++        if rule_applies(f.rule_id, cls):
++            applicable.append(f)
++        else:
++            suppressed[f.rule_id] = suppressed.get(f.rule_id, 0) + 1
++    return applicable, suppressed

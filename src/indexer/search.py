@@ -6,7 +6,7 @@ from sqlalchemy import case, desc, func, literal_column, select, text, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Any
 
-from src.api.services.categories import category_label
+from src.core.categories import category_label
 from src.models.orm import DownloadHistory, Skill
 
 

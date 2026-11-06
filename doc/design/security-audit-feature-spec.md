@@ -48,17 +48,20 @@ skillcrawler discover（后台定时或 CLI）
 
 skill_manager.py : discover_skill_repository()
   │
-  ├── commit 未变化（短路分支）
-  │     └── _retry_unscored_security_audits()
-  │           ├── 查询该仓库 risk_score 为 NULL 的 skills/skill_versions
-  │           ├── 有 → 逐条重新触发 Skillspector（自愈上次失败的审计）
-  │           │      日志: retry unscored audits for unchanged repo %s:
-  │           │             triggered=%d skipped=%d total_unscored=%d
-  │           └── 无 → 标记 unchanged 直接返回（不触发审计）
+  ├── commit 未变化（短路分支）→ 标记 unchanged 直接返回（不触发审计）
   │
   └── HEAD 已变更 → 完整扫描（latest + 最近 N 个 Tag）
         └── 每条记录组装时调用 _resolve_security_result() 决定是否触发审计
               （见下方三层复用）
+
+  未评分记录补审计（src/ai/security_backfill.py，原 _retry_unscored_security_audits）
+    │  每轮 discover 末尾与 API 侧低频补齐循环执行，全局扫描
+    │  risk_score 为 NULL 且无在途异步审计的 skills/skill_versions 行
+    ├── 逐条重新触发 Skillspector（自愈上次失败的审计）
+    │   （触发实现与扫描路径共用 src.security.audit_trigger.trigger_existing_skill_audit）
+    ├── 成功 → 写 extra_metadata.security_audit + upsert security_audits
+    │          保持 risk_score=NULL，等待 collector 回填
+    └── 失败 → 保持 NULL，由下一轮补跑重试
 
   安全审计复用判定与提交（skill_scanner.py : _resolve_security_result，三层策略）
     │  返回 SecurityResolution(risk_score, audit_details, audit_triggered)
@@ -158,6 +161,188 @@ collector 不属于 `python skillcrawler/main.py discover` 进程。discover 退
 
 启动: `src/security/detector.py` → `start_skillspector_collector()`（内部自行导入 `AsyncSessionLocal`），由 `src/api/main.py` lifespan 调用。
 
+### 3.3 后台定时 LLM 复核（误报剔除）
+
+已入库的 SkillSpector 报告可能仍包含大量静态误报。新增的后台任务在每天
+`audit_llm_review.start_time` ~ `end_time`（默认 01:00-08:00，按
+`audit_llm_review.timezone` 解释，默认 `Asia/Shanghai`，与容器 TZ 解耦）窗口内，
+分批对**尚未复核**的审计做 LLM 二次判定：
+
+```
+AuditLLMReviewScheduler（src/jobs/audit_llm_review.py）
+  ├── 查询 security_audits：
+  │     details.skillspector_report.issues 非空
+  │     且 details.llm_review 为空（或 status=failed 且 attempts < max_attempts）
+  │     且 resource_id 仍对应 skills / skill_versions
+  │     排序：社区 SIG（platform=community）绝对优先 -> 风险等级降序
+  │     （critical/high/medium/low）-> 命中数升序 -> audited_at 升序 -> id 升序；
+  │     keyset 游标为 community_priority/risk_rank/issue_count/audited_at/id
+  │     五元组
+  ├── 按文件分组、文件内按严重度排序挑最多 max_findings_per_audit 条命中
+  │     （默认 200/pass；同文件命中尽量落在同一批）
+  │     超出部分写 details.llm_review.status=partial + reviewed_count 游标，
+  │     下次继续；单个 pass 内用
+  │     community_priority/risk_rank/issue_count/audited_at/id keyset 游标
+  │     保证每条审计只处理一次，超大审计不会挤占其他审计。一个 pass 扫完后若窗口
+  │     未结束且仍有剩余，立即重置游标开始下一个 pass（round-robin），
+  │     因此队列空闲时同一条超大审计当晚可连续推进多个 200 条
+  ├── 每 max_findings_per_call 条一批调用 OpenAI 兼容接口
+  │     （默认硅基流动 Qwen/Qwen3.5-4B，temperature=0，关闭 thinking）
+  ├── 删除规则：
+  │     显式 is_vulnerability=false 且 confidence 达到误报删除门槛
+  │     （默认 0.85，HIGH/CRITICAL 为 0.9）的命中；
+  │     确认为真但 confidence < min_confidence（默认 0.6，与上游
+  │     meta_analyzer 的置信度过滤一致）的命中；
+  │     未出现在模型结果里的命中一律保留（避免漏报）；
+  │     命中所在文件上下文为 snippet/missing 时不做任何删除
+  ├── LP1/LP3（MCP 最小权限）不走模型：直接按 SKILL.md
+  │     frontmatter 的 permissions/allowed-tools 静态判定
+  │     （支持空格/逗号分隔与 Bash(man:*) 作用域写法）
+  └── 全部命中复核完成后写回：
+        security_audits.risk_level / risk_signals
+        details.skillspector_report.issues / risk_assessment
+        details.skillspector_score / recommendation
+        details.llm_review（复核模型、时间、误报/低置信度明细、分数变化）
+        skills.risk_score 或 skill_versions.risk_score
+```
+
+约束与容错：
+
+- 单条审计复核完成后写入 `details.llm_review.status=completed`，后续轮次不再重复
+  消耗模型调用；失败记录 `status=failed` 与 `attempts`，超过 `max_attempts`
+  后不再自动重试。
+- 置信度门槛：模型对每条命中返回 `confidence`（缺省 `0.7`）。显式
+  `is_vulnerability=false` 的命中还需达到误报删除门槛
+  `min_false_positive_confidence`（默认 `0.85`，HIGH/CRITICAL 使用
+  `min_false_positive_confidence_high`，默认 `0.9`），否则保留并计入
+  `findings_false_positive_below_threshold`；确认为真但 `confidence` 低于
+  `min_confidence`（默认 `0.6`）的命中按上游 `meta_analyzer` 口径丢弃，
+  单独记录在 `details.llm_review.low_confidence_findings`，不计入误报数；
+  两个门槛均可用 `0` 关闭。
+- 上下文保护：若命中所在文件的上下文来自 snippet 兜底或缺失，本轮不做任何
+  删除（误报/低置信度命中全部保留），计入
+  `findings_kept_incomplete_context`。
+- 只记录被删除命中的理由：误报写入 `false_positive_findings`（含
+  `confidence`），低置信度写入 `low_confidence_findings`；确认项不写入
+  额外字段，保持原始 issue 结构不变，避免报告 JSONB 膨胀。
+- 全部命中被删除时直接应用结果（分数归零、等级 low），
+  `details.llm_review.all_removed=true` 仅作标记，不保留原分数，
+  也不进入二次复核或人工审核。
+- 分数对**保留命中**用 SkillSpector 原生算法重算（与上游
+  `nodes/report.py:_compute_risk_score` 完全一致）：按规则 ID 统计出现次数，
+  前 3 次分别按 1 / 0.5 / 0.25 递减权重计入 `severity_points × weight ×
+  confidence`，第 4 次起不计分；存在可执行脚本时总分 ×1.3；最终 `int()`
+  截断并封顶 100。没有命中被删除时重算结果与原分完全相同（测试库 540 条
+  审计实测 100% 一致）；全部剔除时为 0。风险等级按 0-20 low / 21-50
+  medium / 51-80 high / 81-100 critical 重算。
+- 模型返回合法但空的 findings 数组时先追加纠正提示重试一次，仍为空则整条审计
+  按失败处理，不删除任何命中。
+- 连续失败达到阈值时熔断本轮，避免供应商不可用时把整个待复核队列消耗成失败。
+- 写回前用报告指纹（`metadata.scanned_at` / `skill.scanned_at`）做乐观校验，
+  复核期间被重新扫描的审计直接丢弃本次结果。
+- 复核上下文按 **本地 repo 缓存 → 远端 raw → snippet** 解析：
+  - 本地缓存使用 `security_audits.commit_id` 对应的 skill 目录，只读执行
+    `git cat-file` / `git show`，不修改 shared cache；
+  - 本地缺失时按平台 raw 地址拉取（GitHub / GitCode / GitLab / Gitee），
+    固定域名白名单、15s 超时、单文件 512KB 上限、单审计最多 40 个远端文件；
+  - 远端超时/404/403/429/超大小/二进制时回退该文件的 `code_snippet`，不影响审计状态。
+- 小文件（≤64KB）送全文；大文件按命中位置合并窗口行（默认前后各 40 行，
+  文件头 40 行），单次上下文最多 60000 字符；`details.llm_review` 记录
+  `context_version` / `context_mode` / `context_blocks_*` / `context_sources_*`。
+  partial 记录在 context_version 升级后从头复核，避免旧游标错位。
+
+配置见 `config.yaml` 的 `audit_llm_review` 段：`start_time` / `end_time` /
+`timezone` 控制窗口，`model` / `base_url` / `api_key`
+留空时复用 `model.providers` 当前 provider（默认 siliconflow / Qwen3.5-4B），
+与分类、翻译共用同一份凭据；需要为复核单独指定模型或 Key 时再通过
+`AUDIT_LLM_REVIEW__MODEL` / `__BASE_URL` / `__API_KEY` 覆盖；全部为空时任务
+自动跳过。请求体复用 `src/ai/llm.build_chat_payload`，仅额外开启
+`response_format=json_object`。
+
+#### 3.3.1 日志字段
+
+复核日志统一由 `src/security/audit_review/log.py` 输出，前缀为
+`[AuditLLMReview] run=<run_id>`；底层 logger 名为
+`src.jobs.audit_llm_review.<scheduler|review|llm|queue|persistence|metrics>`，
+既可按前缀整体过滤，也可按子模块定位。`run_id` 在每轮 `run_once` 开始时生成
+（`YYYYmmdd-HHMMSS`），同一轮的所有日志可用 `grep "run=<run_id>"` 串联。
+
+| 阶段 | 日志字段 | 级别 |
+|------|----------|------|
+| 启动 | `scheduler started (window=01:00-08:00 Asia/Shanghai, model=..., concurrency=..., max_findings_per_audit=..., context_mode=..., rpm/tpm, min_confidence, min_false_positive_confidence(_high), max_attempts, repo_cache_root, remote_fetch, result_dir)` | INFO |
+| 轮次开始 | `run started: id=<run_id> window=<start>-<end> <tz> model=... concurrency=... max_findings_per_audit=... context_mode=...` | INFO |
+| 单条开始 | `[i] reviewing audit=<id> skill=<skill_id> name=<name> level=<risk_level>` | INFO |
+| 单条结束 | `audit=<id> outcome=<reviewed\|partial\|failed\|skipped> skill=... name=... issues=<n> reviewed=<n> confirmed=<n> false_positive=<n> low_confidence=<n> score=<before>-><after> level=<before>-><after> duration=<s> context=<cache\|remote\|snippet> llm_calls=<n> retries=<n> tokens~<n>` | INFO |
+| 轮次进度 | `progress: reviewed=... partial=... failed=... skipped=... rate_limit_wait=<s> elapsed=<s>`，每处理一页输出一次 | INFO |
+| 限流 | `rate limit waited <s> (rpm=..., tpm=...)` | 单次等待 ≥ `rate_limit_slow_wait_seconds` 为 WARNING，否则 DEBUG |
+| LLM 慢调用 | `slow LLM call: <s> (threshold=<s>, tokens~<n>)` | WARNING |
+| LLM 重试 | `LLM retry <i>/<n> after <error>; backoff=<s>` | WARNING |
+| LLM 失败 | `LLM request failed after <n> attempts: <error>`，上层再输出 `audit <id> review failed: ...`（含堆栈） | WARNING |
+| 上下文降级 | `audit=<id> file=<path> context degraded to snippet reason=<reason>`；本地缓存与远端均失败时为组合原因（如 `cache_file_missing+remote_disabled`），便于区分缓存缺失与远端关闭 | INFO |
+| 结果丢弃 | `audit <id> was re-scanned during review; result discarded` / `audit <id> disappeared before persistence` | INFO |
+| 轮次汇总 | `run finished: id=... reviewed=... partial=... failed=... skipped=... total=... duration=... avg=.../audit stopped=<no_work\|deadline\|error> slowest: audit=<id>(<n> issues)=<s>` | INFO |
+| 统计汇总 | `llm stats: calls=... retries=... tokens~... llm_seconds=... slow_calls=... rate_limit_wait=... rate_limit_events=...`；`context stats: sources={...} degraded={...}`；`false positives by rule (top 10): ...`；`skip reasons: {...}` | INFO |
+| 明细 | `failed audit: audit=... skill=... error_type=... error=...`（WARNING）、`skipped audit: ... reason=...`（INFO）；各最多 20 条，超出打印 `truncated` 提示 | WARNING / INFO |
+| 结果文件 | `result saved to <path>` | INFO |
+
+日志落点与 API 其他日志一致：stdout + `<storage.local_path>/logs/api.log`。
+`api.log` 使用 `RotatingFileHandler`，由 `logging.max_bytes`（默认 100MB）与
+`logging.backup_count`（默认 5）控制轮转；`max_bytes=0` 关闭轮转。日志中
+不打印 prompt 与模型响应原文，只记录批大小、token 估算、耗时和错误类型，
+避免把 skill 源码与审计报告写入日志。
+
+#### 3.3.2 每轮结果 JSON
+
+每轮 `run_once` 结束后（`no_work` / `deadline` / `error` 均会落盘）异步写入：
+
+```
+<audit_llm_review.result_dir>/audit-review-<YYYYmmdd-HHMMSS>.json
+```
+
+`result_dir` 留空时写到 `<storage.local_path>/logs`（与 api.log 同目录），
+**不跟随** `discover_scheduler.result_dir`。保留策略由 `result_keep_days`
+（默认 30 天）和 `result_max_files`（默认 200 份）控制，按 mtime 倒序清理，
+`0` 表示关闭对应维度。进程取消（shutdown）时不落盘；落盘失败只记录 warning，
+不影响已经完成的数据回写。
+
+文档结构：
+
+| 字段 | 说明 |
+|------|------|
+| `run_id` | 轮次标识，与日志中的 `run=<id>` 一致 |
+| `started_at` / `finished_at` / `duration_seconds` | 轮次起止时间与耗时 |
+| `stopped` | 结束原因：`no_work` / `deadline` / `error` |
+| `window` | `start_time` / `end_time` / `timezone` |
+| `model` | 模型名、base_url、context_mode、并发、rpm/tpm、单批/单条命中上限、max_attempts、置信度门槛 |
+| `counters` | `reviewed` / `partial` / `failed` / `skipped` / `total`，每个字段旁附 `<key>_note` 说明 |
+| `avg_seconds_per_audit` / `slowest_audits` | 平均单条耗时与最慢 3 条（audit_id、命中数、耗时） |
+| `llm` | 调用次数、重试次数、token 估算、LLM 耗时、慢调用数、限流等待时长/次数（均带 note） |
+| `context` | `sources`（cache/remote/snippet 分布）、`reasons`（降级原因分布，如 `cache_file_missing+remote_disabled`） |
+| `false_positive_rules` | 按规则 ID 统计的误报删除条数，降序 |
+| `skip_reasons` | 跳过原因分布 |
+| `failed_audits` / `skipped_audits` | 明细，最多 50 条；超出时对应 `*_truncated=true` |
+| `audits` | 本轮全部处理记录（不分页），字段见下表 |
+
+`audits[]` 单条记录：
+
+| 字段 | 说明 |
+|------|------|
+| `audit_id` / `skill_id` / `name` / `risk_level` | 审计与 skill 标识 |
+| `issues_count` | 报告命中总数 |
+| `outcome` | `reviewed` / `partial` / `failed` / `skipped` |
+| `reviewed` / `confirmed` / `false_positive` / `low_confidence` | 已复核 / 确认为真 / 误报删除 / 低置信度丢弃条数 |
+| `score_before` / `score_after` / `level_before` / `level_after` | 分数与等级变化；partial 不修改分数，字段为 `null` / `unknown` |
+| `duration_seconds` | 单条审计耗时 |
+| `context_source` / `context_degraded` / `context_degrade_reason` | 最终上下文来源与降级原因 |
+| `llm_calls` / `llm_retries` / `slow_llm_calls` / `estimated_tokens` / `llm_seconds` | 本条审计的 LLM 调用统计 |
+| `error` / `error_type` | 失败详情与异常类型 |
+| `skip_reason` | `no_issues` / `already_completed` / `already_skipped` / `persist_discarded` |
+| `false_positive_rules` | 本条审计按规则 ID 的误报条数 |
+
+统计口径：`total` 是本轮**处理结果数**，不是唯一审计数——同一条审计在
+`partial` 之后于同一轮下一个 pass 继续推进时，会在 `audits` 中出现两条记录。
+`deadline` 导致的主动中断不计入 `counters` 和 `audits`。
+
 ---
 
 ## 四、模块架构
@@ -165,17 +350,26 @@ collector 不属于 `python skillcrawler/main.py discover` 进程。discover 退
 ```
 skillcrawler/                      ← 爬虫侧（discover 主要触发源）
   core/skill_manager.py
-  │   ├── discover_skill_repository()      ← 入口: commit 未变 → 重试未评分审计
-  │   ├── _retry_unscored_security_audits() ← 重试 risk_score=NULL 的记录
+  │   ├── discover_skill_repository()      ← 入口: commit 未变 → 标记 unchanged
   │   └── _store_to_security_audits()     ← 扫描后写入 security_audits
-  core/skill_scanner.py
-  │   ├── _scan_latest_skills()           ← HEAD 技能扫描
-  │   ├── _scan_tagged_skills()           ← tag 技能扫描（commit/version 去重）
-  │   ├── _resolve_security_result()      ← 三层复用（DB / 扫描缓存 / 新提交）
-  │   └── _audit_skill_security()         ← 物化 blob + 触发 Jenkins
-  └── core/git_operations.py
-      ├── get_skill_tree_hashes()         ← 目录级 tree hash（复用 key）
-      └── materialize_skill_objects()     ← 触发前物化技能路径 blob
+  └── core/skill_scanner.py
+      ├── _scan_latest_skills()           ← HEAD 技能扫描
+      ├── _scan_tagged_skills()           ← tag 技能扫描（commit/version 去重）
+      ├── _resolve_security_result()      ← 三层复用（DB / 扫描缓存 / 新提交）
+      └── _audit_skill_security()         ← 委托 src.security.audit_trigger
+
+src/utils/git_operations.py       ← git 基础设施（爬虫与补齐共用）
+  ├── get_skill_tree_hashes()             ← 目录级 tree hash（复用 key）
+  └── materialize_skill_objects()         ← 触发前物化技能路径 blob
+
+src/security/audit_trigger.py     ← 审计触发（扫描与补齐共用）
+  └── trigger_existing_skill_audit()      ← 物化 blob + 触发 Jenkins（git_ops: GitOperations）
+
+src/ai/security_backfill.py       ← 未评分审计重提（补齐实现）
+  └── backfill_missing_security_audits()  ← 全局扫描 risk_score=NULL 行重提 Jenkins
+
+src/jobs/remediation.py       ← 补齐编排
+  └── run_remediations()                  ← security/category/embedding 任务编排
 
 src/security/detector.py          ← 唯一核心（扫描逻辑 + Collector 工厂函数）
   ├── SecurityDetector             ← 总入口
@@ -185,6 +379,17 @@ src/security/detector.py          ← 唯一核心（扫描逻辑 + Collector �
 
 src/api/services/security.py      ← 编排层
   └── SecurityService.audit_skill()
+src/jobs/audit_llm_review.py  ← 后台 LLM 误报复核（见 3.3）
+  ├── AuditLLMReviewScheduler.run_once()
+  └── start_audit_llm_review_scheduler()
+src/security/audit_review/review.py       ← 单条审计复核流程
+src/security/audit_review/apply.py        ← 误报剔除 + 分数/等级重算（纯函数）
+src/security/audit_review/context.py      ← 复核上下文（本地缓存/远端/窗口）
+src/security/audit_review/remote_raw.py   ← GitLab/Gitee/GitHub/GitCode raw 适配
+src/security/audit_review/prompt.py       ← 提示词与模型响应解析
+src/security/audit_review/llm.py          ← OpenAI 兼容模型客户端
+src/security/audit_review/persistence.py  ← 复核结果/游标/失败状态写回
+src/utils/skill_path.py                   ← skill 目录推导（crawler/手动审计共用）
 
 src/api/routes/skills.py          ← 业务入口
   ├── trigger_skill_audit()       ← POST /skills/{id}/audit  手动触发
@@ -429,7 +634,7 @@ GET /api/v1/skills/{skill_id}/audit
 # 已入库 Skill 审计（写库）
 async def audit_skill(
     skill_id: str,                        # skill 唯一标识
-    source: str,                          # "github" / "gitcode" / "clawhub"
+    source: str,                          # "github" / "atomgit" / "clawhub"
     source_url: str,                      # 仓库 URL（优先 repo_url）
     metadata: dict[str, Any],             # { version, commit_id, content, skill_path }
     scanners: list[str] | None = None,    # None → 自动检测可用扫描器
@@ -517,8 +722,8 @@ GET /api/v1/skills/{skill_id}/audit-report
 {
     "skill_id": "github:openeuler/find-skills/find-skills",
     "skill_name": "find-skills",
-    "source_url": "https://gitcode.com/.../SKILL.md",
-    "repo_url": "https://gitcode.com/openeuler/find-skills",
+    "source_url": "https://atomgit.com/.../SKILL.md",
+    "repo_url": "https://atomgit.com/openeuler/find-skills",
     "version": "1.0.0",
     "has_report": true,
     "reason": null,
@@ -528,7 +733,7 @@ GET /api/v1/skills/{skill_id}/audit-report
     "score": 12,
     "level": "safe",
     "level_label": "安全",
-    "level_description": "无显著风险，可以放心使用",
+    "level_description": "SkillSpector 得分 0–20，处于安全区间",
     "recommendation": "SAFE",
     "summary": "该 Skill 综合得分 12/100，评估等级为安全，共检测到 2 项高风险、1 项中风险、1 项低风险。建议保持当前的权限与依赖管理实践。",
     "rule_count": 89,
@@ -788,6 +993,14 @@ SC4 模块实时查询 [OSV.dev](https://osv.dev) 检查依赖包已知 CVE：
 | `skillspector_jenkins_user` | `SKILLSPECTOR_JENKINS_USER` | Basic Auth 用户名 |
 | `skillspector_jenkins_token` | `SKILLSPECTOR_JENKINS_TOKEN` | Basic Auth Token |
 | `skillspector_timeout` | `SECURITY__SKILLSPECTOR_TIMEOUT` | 同步扫描等待 Jenkins 构建结束的超时（秒），默认 600（10 分钟） |
+| `skillspector_llm_nodes` | `SKILLSPECTOR_LLM_NODES`（容器入口注入） | 调用大模型的节点白名单，默认 `meta_analyzer`（仅静态误报剔除 + 富化） |
+| `skillspector_model` / `skillspector_base_url` / `skillspector_api_key` | `SKILLSPECTOR_MODEL` / `OPENAI_BASE_URL` / `OPENAI_API_KEY` | 复核模型配置；留空时复用 `model.providers` 当前 provider |
+| `skillspector_text_only` / `skillspector_rule_scope` | `SKILLSPECTOR_TEXT_ONLY` / `SKILLSPECTOR_RULE_SCOPE` | 跳过二进制文件、按「规则 × 文件类别」裁剪命中 |
+| `skillspector_window_lines` / `skillspector_window_header_lines` | `SKILLSPECTOR_WINDOW_LINES` / `SKILLSPECTOR_WINDOW_HEADER_LINES` | 只送命中前后 N 行与文件头，控制上下文长度 |
+| `skillspector_rpm` / `skillspector_tpm` / `skillspector_max_output_tokens` | `SKILLSPECTOR_RPM` / `SKILLSPECTOR_TPM` / `SKILLSPECTOR_MAX_OUTPUT_TOKENS` | 客户端限流与单次输出预算 |
+| `skillspector_disable_thinking` / `skillspector_log_level` | `SKILLSPECTOR_DISABLE_THINKING` / `SKILLSPECTOR_LOG_LEVEL` | 关闭模型思考模式、设置容器日志级别 |
+| `skillspector_max_concurrency` / `skillspector_batch_timeout` / `skillspector_llm_timeout` / `skillspector_llm_budget_seconds` | `SKILLSPECTOR_MAX_CONCURRENCY` / `SKILLSPECTOR_BATCH_TIMEOUT` / `SKILLSPECTOR_LLM_TIMEOUT` / `SKILLSPECTOR_LLM_BUDGET_SECONDS` | 并发数、批次/单次请求超时与 LLM 复核总时长预算 |
+| `audit_llm_review.*` | `AUDIT_LLM_REVIEW__*` | 后台定时 LLM 复核（见 3.3）：开关、时间窗口、模型、并发、单条审计复核上限、限流等 |
 
 ---
 
@@ -802,7 +1015,7 @@ SC4 模块实时查询 [OSV.dev](https://osv.dev) 检查依赖包已知 CVE：
 | 5 | **异步优先** | 批量场景用 `async_mode`，后台 `SkillspectorCollector` 每 30s 轮询回写 |
 | 6 | **评分体系统一** | 全部使用 NVIDIA SkillSpector 原生风险分（0–100，高分=危险），包括直接扫描和降级回退 |
 | 7 | **内容寻址复用** | 以目录级 tree hash 为 key：跨轮次（DB 记录）和同轮扫描内（security_cache）复用审计结果，内容未变的版本不重复提交 Jenkins |
-| 8 | **失败自愈** | 未拿到评分（risk_score=NULL）的记录，即使仓库 commit 未变，也会在后续 discover 轮次自动重试审计；失败的审计结果不进缓存，避免失败被继承；缓存复用产生的多行 pending 按各自 audit.id 独立回填（见 3.1/3.2） |
+| 8 | **失败自愈** | 未拿到评分（risk_score=NULL）的记录由统一补齐（`src/jobs/remediation.py`）全局扫描重提审计：每轮 discover 末尾与 API 侧低频补齐循环（启动即补、每小时一轮）各补一轮，不再受限于"仓库 commit 未变"分支；失败的审计结果不进缓存，避免失败被继承；缓存复用产生的多行 pending 按各自 audit.id 独立回填（见 3.1/3.2） |
 | 9 | **容器只读解耦** | 爬虫宿主机负责 blob 物化（partial clone 懒拉取），skillspector 容器只读挂载缓存、无网络依赖，两侧职责隔离 |
 | 10 | **未评分不曝光** | `risk_score` 为 NULL（安全检测未完成）的技能在搜索/列表查询中全局排除，用户不会看到未审计内容 |
 
