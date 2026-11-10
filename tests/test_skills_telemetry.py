@@ -67,7 +67,7 @@ class TestSkillsTelemetry:
         }
 
         matched_skill_ids = asyncio.run(
-            service.process(params, ip_address="127.0.0.1", user_agent="skillhub-cli/1.0")
+            service.process(params, ip_address="127.0.0.1", user_agent="wittyhub/1.0")
         )
 
         assert matched_skill_ids == [
@@ -88,7 +88,7 @@ class TestSkillsTelemetry:
         assert {r.resource_id for r in added_records} == {skill_uuid_1, skill_uuid_2}
         assert all(r.resource_type == "skill" for r in added_records)
         assert all(r.ip_address == "127.0.0.1" for r in added_records)
-        assert all(r.user_agent == "skillhub-cli/1.0" for r in added_records)
+        assert all(r.user_agent == "wittyhub/1.0" for r in added_records)
         service.session.commit.assert_awaited_once()
 
     def test_process_install_telemetry_skips_unmatched_skill_ids(self):

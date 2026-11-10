@@ -13,7 +13,7 @@ OPENEULER_SKILLS_URL = "https://atomgit.com/openeuler/openEuler-skills"
 
 # catalog 的三个平台渠道（community/enterprise/personal）统一在此定义，
 # 供本模块与 skill_manager / discover_requests 引用，避免多处硬编码不同步。
-CATALOG_PLATFORMS = ("community", "enterprise", "personal")
+CATALOG_PLATFORMS = ("personal", "community", "enterprise")
 
 logger = logging.getLogger(__name__)
 

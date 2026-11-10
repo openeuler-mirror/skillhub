@@ -389,22 +389,22 @@ skillhub/
 | `src/security/detector.py` | 安全检测 | `SkillSpectorClient`, `SecurityResultCollector` |
 | `src/storage/downloader.py` | 下载管理 | `DownloadManager.create_skill_archive()` |
 | `src/core/config.py` | 配置管理 | `Settings` (从 YAML 加载) |
-| `skillhub-cli` (独立 npm 包) | CLI 命令 | `add`, `use`, `list`, `update`, `audit`, `get`, `init` |
+| `wittyhub` (独立 npm 包) | CLI 命令 | `add`, `use`, `list`, `update`, `audit`, `get`, `init` |
 
 ---
 
 ## 6. CLI 工具设计
 
-> CLI 已独立为 npm 包 `skillhub`（仓库 `skillhub-cli`），由平台 API
+> CLI 已独立为 npm 包 `wittyhub`（仓库 `skillhub-cli`），由平台 API
 > 提供检索/下载/审计数据。本节描述 CLI 的命令面与本地存储约定。
 
 ### 6.1 CLI 功能概览
 
 ```
-skillhub-cli - open agent skills ecosystem CLI
+wittyhub - open agent skills ecosystem CLI
 
 用法:
-  skillhub-cli <command> [options]
+  wittyhub <command> [options]
 
 命令:
   add <pkg>              从 git 仓库/URL/本地路径安装 Skills
@@ -427,7 +427,7 @@ skillhub-cli - open agent skills ecosystem CLI
 #### 6.2.1 add - 安装命令
 
 ```
-skillhub-cli add <source> [选项]
+wittyhub add <source> [选项]
 
 参数:
   <source>                 git 仓库地址 / GitHub 简写 / 本地路径
@@ -438,8 +438,8 @@ skillhub-cli add <source> [选项]
   -y, --yes                跳过交互确认
 
 示例:
-  skillhub-cli add vercel-labs/agent-skills
-  skillhub-cli add https://github.com/anthropics/skills --list
+  wittyhub add vercel-labs/agent-skills
+  wittyhub add https://github.com/anthropics/skills --list
 ```
 
 #### 6.2.2 其他命令
