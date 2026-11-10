@@ -1,4 +1,4 @@
-# Wittyhub
+# Skillhub
 
 AI Agent Skills 检索与分发平台。发现、评估和获取可复用的 AI Agent Skills，支持关键词搜索、分类浏览和安全检测。
 
@@ -197,7 +197,7 @@ npm run dev
 
 ### 配置优先级
 
-配置加载分为 Compose 插值和 Wittyhub 应用加载两个阶段。
+配置加载分为 Compose 插值和 Skillhub 应用加载两个阶段。
 
 Docker Compose 解析 `${VAR}` 时，优先级从高到低为：
 
@@ -209,7 +209,7 @@ Docker Compose 解析 `${VAR}` 时，优先级从高到低为：
 
 `.env` 中的变量不会自动全部进入容器。只有被 `compose.yaml` 的 `environment`、`build.args`、`ports` 等位置显式引用的变量才会生效。
 
-Wittyhub API 加载应用配置时，优先级从高到低为：
+Skillhub API 加载应用配置时，优先级从高到低为：
 
 ```text
 API 容器中的 SECTION__FIELD 环境变量
@@ -232,7 +232,7 @@ API 容器中的 SECTION__FIELD 环境变量
 flowchart LR
     ENV["deploy/.env"] -->|"${VAR} 插值"| COMPOSE["compose.yaml"]
     COMPOSE -->|"注入 SECTION__FIELD"| CONTAINER["API 容器环境变量"]
-    YAML["config.yaml"] --> LOADER["Wittyhub 配置加载器"]
+    YAML["config.yaml"] --> LOADER["Skillhub 配置加载器"]
     DEFAULTS["代码默认值"] --> LOADER
     CONTAINER -->|"最高优先级覆盖"| LOADER
     LOADER --> SETTINGS["settings"]
@@ -276,10 +276,10 @@ SkillSpector 的大模型复核参数（模型、API Key、调用节点、限流
 ### CLI 工具
 
 ```bash
-skillhub-cli search "api framework"
-skillhub-cli show python-api-framework
-skillhub-cli install python-api-framework
-skillhub-cli list
+wittyhub search "api framework"
+wittyhub show python-api-framework
+wittyhub install python-api-framework
+wittyhub list
 ```
 
 ### API 调用

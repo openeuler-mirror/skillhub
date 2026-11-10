@@ -13,9 +13,9 @@ MIN_NODE_MAJOR=18
 NPM_REGISTRY="${WITTYHUB_NPM_REGISTRY:-https://registry.npmmirror.com}"
 TARGET_VERSION="${WITTYHUB_VERSION:-latest}"
 
-# 1. 检查 Node.js（与 skillhub package.json 的 engines 保持一致）
+# 1. 检查 Node.js（与 wittyhub package.json 的 engines 保持一致）
 if ! command -v node >/dev/null 2>&1; then
-  echo "错误: 未检测到 Node.js。skillhub 需要 Node.js >= ${MIN_NODE_MAJOR}（https://nodejs.org/）" >&2
+  echo "错误: 未检测到 Node.js。wittyhub 需要 Node.js >= ${MIN_NODE_MAJOR}（https://nodejs.org/）" >&2
   exit 1
 fi
 
@@ -25,13 +25,13 @@ if [ "${node_major}" -lt "${MIN_NODE_MAJOR}" ]; then
   exit 1
 fi
 
-# 2. 全局安装 skillhub
-echo "正在安装 skillhub-cli@${TARGET_VERSION} ..."
-npm install -g "skillhub-cli@${TARGET_VERSION}" --registry "${NPM_REGISTRY}"
+# 2. 全局安装 wittyhub
+echo "正在安装 wittyhub@${TARGET_VERSION} ..."
+npm install -g "wittyhub@${TARGET_VERSION}" --registry "${NPM_REGISTRY}"
 
 # 3. 验证安装
 echo ""
 echo "验证安装:"
-skillhub-cli --version
+wittyhub --version
 echo ""
-echo "skillhub-cli 安装完成。使用 \"skillhub-cli --help\" 查看全部命令。"
+echo "wittyhub 安装完成。使用 \"wittyhub --help\" 查看全部命令。"
