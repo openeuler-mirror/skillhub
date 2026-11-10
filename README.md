@@ -38,7 +38,7 @@ cp deploy/.env.example deploy/.env
 编辑 `deploy/.env` 时：
 
 - 至少修改 `POSTGRES__PASSWORD`
-- 仅启用 `skillspector` profile 时设置 `SECURITY__SKILLSPECTOR_JENKINS_TOKEN`
+- 设置 `SECURITY__SKILLSPECTOR_JENKINS_TOKEN`（skillspector 常驻运行）
 
 ### 启动开发环境
 
@@ -75,13 +75,14 @@ docker compose -f compose.yaml exec api alembic upgrade head
 
 ## 架构
 
-默认 Docker Compose 部署由 `web`、`api`、`embedding` 和 `db` 四个服务组成。Jenkins + SkillSpector 安全审计服务通过可选的 `skillspector` profile 启用。
+默认 Docker Compose 部署由 `web`、`api`、`worker`、`embedding`、`db` 和 `skillspector` 六个服务组成。其中 `api` 是纯无状态的 Web 服务，后台任务（discover 调度、LLM 审核、数据补齐、安全采集）全部由独立的 `worker` 单副本承载；`worker` 复用 `deploy/api/Dockerfile` 镜像、仅替换启动命令。
 
 - `web`：提供 Vue 构建产物，并把 `/api/` 请求转发给 `api`
-- `api`：提供搜索、详情、版本、分类和安全检测等接口
-- `embedding`：为中文语义检索生成向量，供 `api` 调用
+- `api`：无状态的 Web 服务，提供搜索、详情、版本、分类和安全检测等接口
+- `worker`：单副本后台服务（复用 `api` 镜像），承载 discover 调度、LLM 审核、数据补齐与安全采集等后台任务
+- `embedding`：为中文语义检索生成向量，供 `api` 与 `worker` 调用
 - `db`：使用 PostgreSQL + pgvector 保存业务数据和向量列
-- `skillspector`：可选的 Jenkins + SkillSpector 安全审计服务
+- `skillspector`：Jenkins + SkillSpector 安全审计服务
 
 ```mermaid
 flowchart LR
@@ -90,12 +91,13 @@ flowchart LR
     subgraph Compose["Docker Compose / skillhub-network"]
         Web["web<br/>Nginx :80<br/>映射宿主机 8080"]
         API["api<br/>FastAPI + Uvicorn :8081<br/>映射宿主机 8081"]
+        Worker["worker<br/>后台任务: discover/审核/补齐/安全采集<br/>复用 api 镜像、单副本、无端口"]
         Embedding["embedding<br/>Embedding Service :8082<br/>模型: BAAI/bge-base-zh-v1.5"]
         DB["db<br/>PostgreSQL + pgvector :5432"]
         SkillData[("/opt/wittyhub<br/>bind mount")]
         PgData[("postgres-data volume")]
         ModelCache[("huggingface-cache volume")]
-        SkillSpector["skillspector<br/>Jenkins :8083<br/>profile 可选"]
+        SkillSpector["skillspector<br/>Jenkins :8083"]
         JenkinsData[("jenkins-data volume")]
     end
 
@@ -105,9 +107,13 @@ flowchart LR
     API -->|"全文检索 / 元数据 / 向量检索"| DB
     API -->|"生成或查询 embedding"| Embedding
     API -->|"本地文件存储"| SkillData
+    API -.->|"按需触发安全审计"| SkillSpector
+    Worker -->|"discover / 审核 / 补齐 读写"| DB
+    Worker -->|"embedding 回填"| Embedding
+    Worker -->|"本地文件存储"| SkillData
+    Worker -.->|"安全采集 collector"| SkillSpector
     DB --> PgData
     Embedding --> ModelCache
-    API -.->|"启用安全审计时"| SkillSpector
     SkillSpector --> JenkinsData
 
     DB:::store
@@ -249,17 +255,7 @@ flowchart LR
 
 ## SkillSpector 安全审计
 
-SkillSpector 使用可选的 `skillspector` profile，默认不会启动。仅在启用该 profile 时，需要在 `deploy/.env` 中设置安全的 `SECURITY__SKILLSPECTOR_JENKINS_TOKEN`。功能开关 `security.enable_audit` 由 `config.yaml` 管理。
-
-所有命令均在 `deploy/` 目录执行：
-
-```bash
-# 开发环境
-docker compose --profile skillspector up --build
-
-# 生产环境
-docker compose -f compose.yaml --profile skillspector up -d --build
-```
+`skillspector`（Jenkins + SkillSpector）服务默认随 Compose 一起启动。需要在 `deploy/.env` 中设置安全的 `SECURITY__SKILLSPECTOR_JENKINS_TOKEN`。功能开关 `security.enable_audit` 由 `config.yaml` 管理——关闭时 `worker` 不启动安全采集 collector，`api` 也不会触发按需审计。
 
 Jenkins 默认通过 http://localhost:8083 访问；API 在 Compose 网络内通过 `http://skillspector:8083` 调用它。Jenkins 部署参数（HTTP 端口、executor 数、quiet period、仓库根目录）统一由 `config.yaml` 的 `security.skillspector_*` 字段管理，容器启动时注入为 `JENKINS_*` / `WITTYHUB_REPOSITORY_ROOT` 环境变量。
 
@@ -330,10 +326,11 @@ skillhub/
 ├── scripts/                # 数据导入和维护脚本
 ├── tests/                  # 自动化测试
 ├── deploy/
-│   ├── api/                # API 镜像
+│   ├── api/                # API / worker 共用镜像
 │   ├── embedding/          # Embedding 服务镜像与应用
 │   ├── skillspector/       # SkillSpector/Jenkins 镜像与初始化
 │   ├── web/                # Web 镜像与 Nginx 配置
+│   ├── worker/             # worker 服务说明（复用 api 镜像）
 │   ├── compose.yaml        # 基础/生产 Compose 配置
 │   └── compose.override.yaml # 开发覆盖配置
 ├── doc/                    # 项目设计文档
