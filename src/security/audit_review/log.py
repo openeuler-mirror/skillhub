@@ -2,8 +2,8 @@
 
 所有复核相关日志统一使用 ``[AuditLLMReview]`` 前缀，并自动带上当前轮次的
 ``run id``（通过 ContextVar 注入），便于按轮次 grep 与关联调度器/审计/LLM
-调用各层日志。子模块通过 :func:`get_logger` 获取各自 logger，保留 ``%(name)s``
-的模块来源信息，同时共享同一套前缀逻辑。
+调用各层日志。子模块通过 :func:`get_logger` 获取各自 logger（底层命名区分来源），
+同时共享同一套前缀与日志级别配置。
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ def get_logger(name: str = "scheduler") -> logging.LoggerAdapter[None]:
     """按子模块名返回带统一前缀的 logger。
 
     底层 logger 名为 ``src.jobs.audit_llm_review.<name>``，父级与调度器一致，
-    既能在 api.log 的 ``%(name)s`` 中区分来源，又共享同一套日志级别配置。
+    共享同一套日志级别配置；来源由消息中的 ``[AuditLLMReview]`` 前缀区分。
     """
     return _AuditReviewLogAdapter(
         logging.getLogger(f"src.jobs.audit_llm_review.{name}"), {}

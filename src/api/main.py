@@ -1,6 +1,5 @@
 import logging
 import logging.handlers
-import asyncio
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -72,7 +71,7 @@ def configure_logging() -> None:
         else:
             file_handler = logging.FileHandler(log_file, encoding="utf-8")
         file_handler.setFormatter(
-            logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+            logging.Formatter("%(asctime)s %(levelname)s %(message)s")
         )
         root_logger.addHandler(file_handler)
     for handler in root_logger.handlers:
@@ -120,89 +119,15 @@ def configure_logging() -> None:
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(_app: FastAPI):
     logger = structlog.get_logger()
     logger.info("skillhub starting up")
 
-    collector = None
-    if settings.security.enable_audit:
-        from src.security.detector import start_skillspector_collector
-
-        collector = await start_skillspector_collector()
-
-    # 一次性迁移 + 启动补跑 + discover 调度器串成一条后台引导链：
-    # migration → startup remediation → discover 首轮扫描，顺序保持不变，
-    # 但整体放到后台，避免迁移（约 18s）阻塞 API 启动。
-    # discover scheduler 的引用经 app.state 回传，供 shutdown 阶段停止。
-    app.state.discover_scheduler = None
-    app.state.audit_llm_review = None
-    
-    async def _bootstrap() -> None:
-        # 一次性幂等迁移先于 discover 扫描执行；失败仅记录，不阻断后续步骤。
-        try:
-            from src.jobs.migration import run_migration
-            await run_migration()
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("startup migration failed")
-
-        # 启动补一轮衍生字段缺口（security/category/embedding）并落盘；
-        # 扫描后的缺口由 discover 每轮末尾的全表补齐兜底。
-        try:
-            from src.jobs.remediation import run_remediation_on_startup
-
-            await run_remediation_on_startup()
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("startup remediation failed")
-
-        if settings.discover_scheduler.enabled:
-            from src.jobs.discover_scheduler import start_discover_scheduler
-
-            try:
-                app.state.discover_scheduler = await start_discover_scheduler()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("discover scheduler start failed")
-        
-        # LLM 审核调度器：依赖 migration 与 discover 首轮扫描完成后启动。
-        # 等待 discover 首轮结束信号，避免审核与首轮扫描并发争抢资源；
-        # 引用经 app.state 回传，供 shutdown 阶段停止。
-        if settings.audit_llm_review.enabled:
-            from src.jobs.audit_llm_review import start_audit_llm_review_scheduler
-    
-            try:
-                discover_scheduler = app.state.discover_scheduler
-                if discover_scheduler is not None:
-                    await discover_scheduler.first_round_done.wait()
-                app.state.audit_llm_review = await start_audit_llm_review_scheduler()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("audit llm review scheduler start failed")               
-
-    bootstrap_task = asyncio.create_task(_bootstrap(), name="startup-bootstrap")
+    # API 保持无状态：后台任务已迁至 src/jobs/worker.py，此处不启动任何调度器。
 
     yield
 
-    if not bootstrap_task.done():
-        bootstrap_task.cancel()
-    try:
-        await bootstrap_task
-    except asyncio.CancelledError:
-        pass
-
-    discover_scheduler = app.state.discover_scheduler
-    if discover_scheduler is not None:
-        await discover_scheduler.stop()
-    audit_llm_review = app.state.audit_llm_review
-    if audit_llm_review is not None:
-        await audit_llm_review.stop()       
-    if collector is not None:
-        await collector.stop()
+    # 仅关闭进程级 httpx 客户端（语义检索 / 分类翻译），API 服务请求仍在使用。
     from src.ai.embedding import close_embedding_service
 
     await close_embedding_service()
