@@ -77,6 +77,54 @@ services:
       SECURITY__SKILLSPECTOR_JENKINS_URL: ${SECURITY__SKILLSPECTOR_JENKINS_URL:-http://skillspector:8083}
       SECURITY__SKILLSPECTOR_JENKINS_USER: ${SECURITY__SKILLSPECTOR_JENKINS_USER:-admin}
       SECURITY__SKILLSPECTOR_JENKINS_TOKEN: ${SECURITY__SKILLSPECTOR_JENKINS_TOKEN:-}
+      TZ: Asia/Shanghai
+    volumes:
+      - ../config.yaml:/app/config.yaml:ro
+      - /opt/wittyhub:/opt/wittyhub
+    networks:
+      - skillhub-network
+    depends_on:
+      db:
+        condition: service_healthy
+      embedding:
+        condition: service_healthy
+      skillspector:
+        condition: service_healthy        
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8081/api/v1/health').raise_for_status()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+
+  # 后台任务独立进程：一次性迁移、启动补缺口、discover 定时调度、LLM 审核、
+  # Skillspector 采集器全部由此进程承载（单实例）。API 已不启动任何后台任务，
+  # 可安全多副本扩展。
+  worker:
+    build:
+      context: ..
+      dockerfile: deploy/api/Dockerfile
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=256m,mode=1777
+    command: ["python", "-m", "src.jobs.worker"]
+    # worker 不监听 HTTP 端口，禁用 api 镜像自带的 8081 healthcheck，
+    # 崩溃由 restart: unless-stopped 兜底。
+    healthcheck:
+      disable: true
+    environment:
+      WITTYHUB_CONFIG: /app/config.yaml
+      PYTHONDONTWRITEBYTECODE: "1"
+      POSTGRES__HOST: db
+      POSTGRES__PORT: 5432
+      POSTGRES__USER: ${POSTGRES__USER:?POSTGRES__USER is required}
+      POSTGRES__PASSWORD: ${POSTGRES__PASSWORD:?POSTGRES__PASSWORD is required}
+      POSTGRES__DB: ${POSTGRES__DB:?POSTGRES__DB is required}
+      AI__EMBEDDING_HOST: http://embedding:8082
+      SECURITY__SKILLSPECTOR_JENKINS_URL: ${SECURITY__SKILLSPECTOR_JENKINS_URL:-http://skillspector:8083}
+      SECURITY__SKILLSPECTOR_JENKINS_USER: ${SECURITY__SKILLSPECTOR_JENKINS_USER:-admin}
+      SECURITY__SKILLSPECTOR_JENKINS_TOKEN: ${SECURITY__SKILLSPECTOR_JENKINS_TOKEN:-}
       # 后台定时 LLM 复核：每天 01:00-08:00（下方 TZ 为北京时间）复核数据库中
       # 未复核过的 SkillSpector 风险项，剔除误报并回写审计结果。
       # model/base_url/api_key 留空时复用 model.providers 当前 provider
@@ -111,17 +159,13 @@ services:
       - /opt/wittyhub:/opt/wittyhub
     networks:
       - skillhub-network
-    depends_on:
-      db:
-        condition: service_healthy
-      embedding:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8081/api/v1/health').raise_for_status()"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
+    # depends_on:
+    #   db:
+    #     condition: service_healthy
+    #   embedding:
+    #     condition: service_healthy
+    #   skillspector:
+    #     condition: service_healthy
     restart: unless-stopped
 
   web:
@@ -144,7 +188,6 @@ services:
     restart: unless-stopped
 
   skillspector:
-    profiles: ["skillspector"]
     build:
       context: ..
       dockerfile: deploy/skillspector/Dockerfile
