@@ -4,7 +4,6 @@ import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-import structlog
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from slowapi import _rate_limit_exceeded_handler
@@ -13,6 +12,7 @@ from slowapi.errors import RateLimitExceeded
 from src.api.routes import agents, health, index, skills
 from src.api.middleware import install_response_wrapper
 from src.core.config import get_settings
+from src.core.logging import log_localtime
 from src.core.rate_limit import limiter
 
 settings = get_settings()
@@ -46,11 +46,9 @@ def configure_logging() -> None:
     root_logger.setLevel(level)
     if not root_logger.handlers:
         root_handler = logging.StreamHandler(sys.stdout)
-        root_handler.setFormatter(
-            logging.Formatter(
-                "%(asctime)s %(levelname)s %(message)s"
-            )
-        )
+        root_formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+        root_formatter.converter = log_localtime
+        root_handler.setFormatter(root_formatter)
         root_logger.addHandler(root_handler)
     # 文件日志：与 skillcrawler/main.py 口径一致，落在
     # storage.local_path/logs/ 下，便于排查线上问题（stdout 会被容器回收）。
@@ -70,9 +68,9 @@ def configure_logging() -> None:
             )
         else:
             file_handler = logging.FileHandler(log_file, encoding="utf-8")
-        file_handler.setFormatter(
-            logging.Formatter("%(asctime)s %(levelname)s %(message)s")
-        )
+        file_formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+        file_formatter.converter = log_localtime
+        file_handler.setFormatter(file_formatter)
         root_logger.addHandler(file_handler)
     for handler in root_logger.handlers:
         handler.setLevel(level)
@@ -105,22 +103,10 @@ def configure_logging() -> None:
             if name.startswith(noisy_parent + ".") and isinstance(logger, logging.Logger):
                 logger.setLevel(logging.NOTSET)
 
-    structlog.configure(
-        processors=[
-            structlog.processors.add_log_level,
-            structlog.processors.TimeStamper(fmt="iso"),
-            structlog.dev.ConsoleRenderer(),
-        ],
-        context_class=dict,
-        wrapper_class=structlog.make_filtering_bound_logger(level),
-        logger_factory=structlog.PrintLoggerFactory(file=sys.stdout),
-        cache_logger_on_first_use=True,
-    )
-
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    logger = structlog.get_logger()
+    logger = logging.getLogger(__name__)
     logger.info("skillhub starting up")
 
     # API 保持无状态：后台任务已迁至 src/jobs/worker.py，此处不启动任何调度器。

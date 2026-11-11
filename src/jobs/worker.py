@@ -26,11 +26,10 @@ import signal
 import sys
 from pathlib import Path
 
-import structlog
-
 from src.ai.embedding import close_embedding_service
 from src.ai.translation import close_translation_service
 from src.core.config import get_settings
+from src.core.logging import log_localtime
 from src.jobs.audit_llm_review import start_audit_llm_review_scheduler
 from src.jobs.discover_scheduler import start_discover_scheduler
 from src.jobs.migration import run_migration
@@ -38,7 +37,7 @@ from src.jobs.remediation import run_remediation_on_startup
 from src.security.detector import start_skillspector_collector
 
 settings = get_settings()
-logger = structlog.get_logger()
+logger = logging.getLogger(__name__)
 
 
 def configure_worker_logging() -> None:
@@ -54,7 +53,9 @@ def configure_worker_logging() -> None:
     root_logger.setLevel(level)
     if not root_logger.handlers:
         root_handler = logging.StreamHandler(sys.stdout)
-        root_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        root_formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+        root_formatter.converter = log_localtime
+        root_handler.setFormatter(root_formatter)
         root_logger.addHandler(root_handler)
 
     if not any(isinstance(h, logging.FileHandler) for h in root_logger.handlers):
@@ -72,9 +73,9 @@ def configure_worker_logging() -> None:
             )
         else:
             file_handler = logging.FileHandler(log_file, encoding="utf-8")
-        file_handler.setFormatter(
-            logging.Formatter("%(asctime)s %(levelname)s %(message)s")
-        )
+        file_formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+        file_formatter.converter = log_localtime
+        file_handler.setFormatter(file_formatter)
         root_logger.addHandler(file_handler)
 
     for handler in root_logger.handlers:
@@ -86,18 +87,6 @@ def configure_worker_logging() -> None:
         for name, registered in logging.Logger.manager.loggerDict.items():
             if name.startswith(noisy_parent + ".") and isinstance(registered, logging.Logger):
                 registered.setLevel(logging.NOTSET)
-
-    structlog.configure(
-        processors=[
-            structlog.processors.add_log_level,
-            structlog.processors.TimeStamper(fmt="iso"),
-            structlog.dev.ConsoleRenderer(),
-        ],
-        context_class=dict,
-        wrapper_class=structlog.make_filtering_bound_logger(level),
-        logger_factory=structlog.PrintLoggerFactory(file=sys.stdout),
-        cache_logger_on_first_use=True,
-    )
 
 
 async def _run_background_tasks():

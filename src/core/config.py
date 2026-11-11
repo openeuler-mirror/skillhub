@@ -227,6 +227,8 @@ class AuditLLMReviewConfig(BaseSettings):
 class LoggingConfig(BaseSettings):
     level: str = "INFO"
     format: str = "json"
+    # 日志时间展示时区；未配置时默认北京时间
+    timezone: str = "Asia/Shanghai"
     # api.log 轮转：单文件上限（字节）与保留份数；max_bytes=0 表示不轮转
     max_bytes: int = 100 * 1024 * 1024
     backup_count: int = 5
