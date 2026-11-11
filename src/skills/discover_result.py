@@ -16,8 +16,9 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -302,6 +303,37 @@ def resolve_discover_result_dir(result_dir: str = "") -> Path:
     return Path(get_settings().storage.local_path) / "logs"
 
 
+def _cleanup_old_result_dirs(target_root: Path, retain_days: int = 30) -> None:
+    """删除早于 retain_days 天的日期归档子目录（如 logs/20261111/）。
+
+    结果文件按日期归档到 YYYYMMDD 子目录，长期运行会持续累积；这里按目录名
+    解析日期，删除早于保留期的目录。整体失败仅记录 warning，不影响主流程。
+    """
+    cutoff = datetime.now() - timedelta(days=retain_days)
+    try:
+        entries = list(target_root.iterdir())
+    except Exception:
+        logger.warning(
+            "Failed to list result dir %s for cleanup", target_root, exc_info=True
+        )
+        return
+    for entry in entries:
+        if not entry.is_dir():
+            continue
+        try:
+            parsed = datetime.strptime(entry.name, "%Y%m%d")
+        except ValueError:
+            continue
+        if parsed < cutoff:
+            try:
+                shutil.rmtree(entry)
+                logger.info("[Discover] removed stale result dir %s", entry)
+            except Exception:
+                logger.warning(
+                    "Failed to remove stale result dir %s", entry, exc_info=True
+                )
+
+
 def save_discover_result_file(
     document: dict[str, Any], result_dir: str = "", file_prefix: str = "discover",
     log: bool = True,
@@ -314,15 +346,21 @@ def save_discover_result_file(
     避免同一结果文件重复打印成功日志。
     """
     try:
-        target_dir = resolve_discover_result_dir(result_dir)
+        now = datetime.now()
+        # 结果文件按日期归档到子目录（如 logs/20261111/），便于按天检索与清理
+        target_root = resolve_discover_result_dir(result_dir)
+        date_dir = now.strftime("%Y%m%d")
+        target_dir = target_root / date_dir
         target_dir.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        timestamp = now.strftime("%Y%m%d-%H%M%S")
         path = target_dir / f"{file_prefix}-{timestamp}.json"
         path.write_text(
             json.dumps(document, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         if log:
             logger.info("[Discover] %s result saved to %s", file_prefix, path)
+        # 清理超过一个月的日期归档目录，避免结果文件无限累积
+        _cleanup_old_result_dirs(target_root)
         return path
     except Exception:
         # 前缀随 file_prefix 变化：discover 调用打 "discover"，补齐调用打
