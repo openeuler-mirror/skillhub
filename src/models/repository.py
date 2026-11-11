@@ -163,11 +163,12 @@ class SkillRepoRepository:
     async def delete_skill_repositories(self, repository_ids: list[str | uuid.UUID]) -> int:
         """批量删除仓库及其级联数据，返回删除的仓库行数。
 
-        skills / skill_versions 通过外键 CASCADE 自动删除，但
-        security_audits 和 download_history 使用 resource_type + resource_id
-        软关联（无外键），需要先按仓库收集 skill 与 skill_versions 的 UUID
-        批量清理（security_audits 对 tag 版本同样按 resource_type='skill'
-        + 版本 UUID 落记录），否则留下孤儿数据。
+        skills / skill_versions 显式删除后再删仓库，不依赖外键 CASCADE
+        （生产库外键未按 ondelete='CASCADE' 生效时，依赖级联会留下孤儿行并
+        触发 skill_id 唯一键冲突）；security_audits 和 download_history 使用
+        resource_type + resource_id 软关联（无外键），需要先按仓库收集 skill
+        与 skill_versions 的 UUID 批量清理（security_audits 对 tag 版本同样按
+        resource_type='skill' + 版本 UUID 落记录），否则留下孤儿数据。
         """
         if not repository_ids:
             return 0
@@ -193,6 +194,16 @@ class SkillRepoRepository:
         if resource_ids:
             related_deleted = await SkillRepository(self.session).delete_skill_related_records(resource_ids)
 
+        # 显式删除子表 rows 再删仓库，避免依赖外键 CASCADE（见方法 docstring）。
+        # skill_versions 可能引用 skills，先删版本再删 skill，最后删仓库。
+        if version_ids:
+            await self.session.execute(
+                delete(SkillVersion).where(SkillVersion.id.in_(version_ids))
+            )
+        if skill_ids:
+            await self.session.execute(
+                delete(Skill).where(Skill.id.in_(skill_ids))
+            )
         result = await self.session.execute(
             delete(SkillRepoModel).where(SkillRepoModel.id.in_(repo_ids))
         )
