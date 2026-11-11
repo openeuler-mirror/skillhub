@@ -17,3 +17,11 @@ services:
   embedding:
     volumes:
       - ./embedding/app.py:/app/app.py:ro
+
+  worker:
+    volumes:
+      - ../src:/app/src:ro
+      - ../scripts:/app/scripts:ro
+      - ../migrations:/app/migrations:ro
+      - ../skillcrawler:/app/skillcrawler:ro
+      - ../skills:/app/skills:ro

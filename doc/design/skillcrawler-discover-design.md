@@ -7,7 +7,7 @@ python skillcrawler/main.py discover
 ```
 > 命令用法、参数和示例见 [`skillcrawler/README.md`](../../skillcrawler/README.md)。
 
-2. 后台自动调度（API 服务内置 `discover_scheduler` 定时任务，每天 / 每周固定触发一轮全量 discover）。
+2. 后台自动调度（独立 worker 进程内置 `discover_scheduler` 定时任务，每天 / 每周固定触发一轮全量 discover）。
 
 两者共用同一执行路径（扫描结束后均补建缺失 embedding）；差异（仓库列表来源）见 §2.1。
 
@@ -97,7 +97,7 @@ flowchart TD
 | `src/ai/category_classifier.py` | Category 规则和模型调用 |
 | `src/models/repository.py` | Skills、SkillVersions、SecurityAudit 持久化 |
 | `src/security/detector.py` | Jenkins 客户端和后台报告 collector |
-| `src/api/main.py` | API 生命周期中启动和停止 collector |
+| `src/jobs/worker.py` | 独立 worker 进程中启动和停止 collector |
 
 ### 1.2 SkillManager 调用链
 
@@ -167,7 +167,7 @@ start_scan(...)
 | `discover --url <skill.yaml>` | 单个 skill.yaml | 是 | 只扫描该文件登记的 `skill_repos` / `skills[]`，不读全量配置 |
 
 2. 后台自动调度（`discover_scheduler` 定时任务）
-**自动调度**（API 服务内置定时任务：服务启动时按 `discover_scheduler.enabled`
+**自动调度**（独立 worker 进程内置定时任务：worker 启动时按 `discover_scheduler.enabled`
 决定是否拉起，实现见[`src/jobs/discover_scheduler.py`](../../src/jobs/discover_scheduler.py)）：
 
 - **每天固定时刻（`discover_scheduler.start_time`，按 `timezone` 解释，默认北京时间）
@@ -185,7 +185,7 @@ start_scan(...)
   embedding 缺口补建向量），各任务自持
   `pg_advisory_lock` 互斥（embedding 的锁另与全量重建脚本
   `scripts/reindex_embeddings.py` 互斥），单任务锁被占用或失败只影响该任务。
-  失败不重试，漏掉的行由下轮 discover 或 API 启动时的补齐自愈（见
+  失败不重试，漏掉的行由下轮 discover 或 worker 启动时的补齐自愈（见
   [`src/jobs/remediation.py`](../../src/jobs/remediation.py)）；
 - 每轮结果（每仓 outcome / 耗时 / 汇总计数 / skill 统计 / 补跑结果）写入
   `result_dir`（默认 `<storage.local_path>/logs`）下的 `discover-<时间戳>.json`，
@@ -440,7 +440,7 @@ error  = commit unchanged
 （`_retry_unscored_security_audits`，结果 `security_retried`）；现已抽离到
 统一补齐框架 [`src/jobs/remediation.py`](../../src/jobs/remediation.py)：
 安全补审计改为**全局扫描**所有 `risk_score` 缺口行（不限于本轮扫到且 commit
-未变的仓库），在每轮 discover 末尾与 API 侧低频补齐循环中执行，覆盖面更大、
+未变的仓库），在 worker 启动补跑与每轮 discover 末尾执行，覆盖面更大、
 且与 category / embedding 补齐同构。未评分记录的重试流程（还原 `SKILL.md`
 相对路径 → 重新提交 Jenkins → 更新 `extra_metadata.security_audit` →
 upsert `security_audits` → 保持 `risk_score=NULL` 等 collector 回填）不变，
@@ -679,7 +679,7 @@ flowchart TD
 
 ## 9. SkillSpector 安全检测
 
-安全检测的完整设计（触发条件、Jenkins 交互参数、API 后台 collector、风险评分与存储
+安全检测的完整设计（触发条件、Jenkins 交互参数、worker 后台 collector、风险评分与存储
 规则）见 [`security-audit-feature-spec.md`](security-audit-feature-spec.md)。本节只
 描述 discover 阶段与扫描相关的行为。
 
@@ -750,10 +750,10 @@ sequenceDiagram
 - Skill 仍会继续构建和入库；
 - 不会创建可供 collector 收集的 SecurityAudit pending 记录。
 
-本轮写入的 pending `SecurityAudit` 由 API 侧后台 collector 异步回填，不属于 discover
-进程；收集流程（30 秒轮询、Build 终态处理、report 下载重试）见
+本轮写入的 pending `SecurityAudit` 由 worker 侧后台 collector 异步回填，独立于
+discover 扫描流程；收集流程（30 秒轮询、Build 终态处理、report 下载重试）见
 [`security-audit-feature-spec.md`](security-audit-feature-spec.md) 3.2 节。discover
-退出后，只要 API 正常运行，collector 仍可继续收集报告。
+一轮结束后，只要 worker 正常运行，collector 仍可继续收集报告。
 
 ## 10. 数据库写入时机
 
@@ -955,7 +955,7 @@ skill仓库扫描结果：
 |---|---|
 | `total` | skills 表 Skill 总数 |
 | `indexed` | 已建 embedding 的 Skill 数（不论是否已审计） |
-| `missing` | 已审计但 embedding 缺失的 Skill 数（**索引创建失败**，等下轮 discover 或 API 启动补跑自愈） |
+| `missing` | 已审计但 embedding 缺失的 Skill 数（**索引创建失败**，等下轮 discover 或 worker 启动补跑自愈） |
 | `not_required` | 未审计且未建索引（`risk_score` 与 `embedding` 均为空）的 Skill 数，暂不建索引属预期状态 |
 
 ## 12. 删除与统计自愈

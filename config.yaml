@@ -168,3 +168,4 @@ logging:
   # api.log 轮转：单文件 100MB，保留 5 份（max_bytes=0 关闭轮转）
   max_bytes: 104857600
   backup_count: 5
+  timezone: "Asia/Shanghai"
