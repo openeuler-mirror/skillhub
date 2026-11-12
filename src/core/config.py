@@ -303,6 +303,18 @@ class LicenseAuditConfig(BaseModel):
     safety: LicenseSafetyConfig = Field(default_factory=LicenseSafetyConfig)
 
 
+class DiscoverLicenseCheckConfig(BaseModel):
+    """discover 入库前的 license 校验开关。"""
+
+    enabled: bool = False
+
+
+class DiscoverConfig(BaseModel):
+    license_check: DiscoverLicenseCheckConfig = Field(
+        default_factory=DiscoverLicenseCheckConfig
+    )
+
+
 class LoggingConfig(BaseSettings):
     level: str = "INFO"
     format: str = "json"
@@ -330,6 +342,7 @@ class Settings(BaseSettings):
     discover_scheduler: DiscoverSchedulerConfig = Field(default_factory=DiscoverSchedulerConfig)
     audit_llm_review: AuditLLMReviewConfig = Field(default_factory=AuditLLMReviewConfig)
     license_audit: LicenseAuditConfig = Field(default_factory=LicenseAuditConfig)
+    discover: DiscoverConfig = Field(default_factory=DiscoverConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     ai: AIConfig = Field(default_factory=AIConfig)
     openeuler_repos: list[SkillRepoEntry] = Field(default_factory=list)
@@ -355,6 +368,7 @@ class Settings(BaseSettings):
             discover_scheduler=DiscoverSchedulerConfig(**data.get("discover_scheduler", {})),
             audit_llm_review=AuditLLMReviewConfig(**data.get("audit_llm_review", {})),
             license_audit=LicenseAuditConfig(**data.get("license_audit", {})),
+            discover=DiscoverConfig(**data.get("discover", {})),
             logging=LoggingConfig(**data.get("logging", {})),
             ai=AIConfig(**data.get("ai", {})),
             openeuler_repos=data.get("openeuler_repos", []) or [],

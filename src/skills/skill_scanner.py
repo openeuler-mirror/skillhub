@@ -11,10 +11,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from src.ai.category_classifier import DeepSeekCategoryClassifier
-from src.utils.git_operations import GitOperations
 from src.core.categories import CANONICAL_CATEGORIES
+from src.models.orm import Skill, SkillVersion
+from src.models.repository import SkillRepository
 from src.security.audit_trigger import trigger_existing_skill_audit
 from src.security.detector import SecurityDetector, SecurityReport
+from src.skills.skill_id import build_skill_id, extract_owner_repo
 from src.skills.skill_parser import (
     as_optional_str,
     as_optional_str_list,
@@ -26,10 +28,7 @@ from src.skills.skill_parser import (
     is_incomplete_skill_metadata,
     is_low_value_skill_content,
 )
-from src.models.orm import Skill, SkillVersion
-from src.models.repository import SkillRepository
-
-from src.skills.skill_id import build_skill_id, extract_owner_repo
+from src.utils.git_operations import GitOperations
 
 if TYPE_CHECKING:
     from src.models.orm import SkillRepoModel
@@ -66,6 +65,10 @@ class SkillScanner:
         self._security_cache_hits: int = 0
         self._security_audit_submitted: int = 0
         self._security_audit_pending: int = 0
+        # 每个仓库扫描内按 skill 目录缓存 license 结论，避免同一目录多版本重复判定
+        self._license_verdicts: dict[tuple[str, str, str], bool] = {}
+        # 本轮被 license 判定淘汰的 skill_id：tag 扫描据此跳过，避免产生孤儿版本
+        self._license_skipped_skill_ids: set[str] = set()
 
     # ── Version snapshots ──────────────────────────────────────────
 
@@ -111,6 +114,9 @@ class SkillScanner:
         self._security_cache_hits = 0
         self._security_audit_submitted = 0
         self._security_audit_pending = 0
+        # 每轮重新判定：仓库新增 LICENSE 后不能被上一轮结论拦截
+        self._license_verdicts = {}
+        self._license_skipped_skill_ids = set()
         if not repo_root.exists():
             raise ValueError(
                 f'Repository root does not exist for repository {repo.id}: {repo_root}'
@@ -237,6 +243,12 @@ class SkillScanner:
                     '(name/description): skill_id=%s ref=HEAD',
                     skill_id,
                 )
+                continue
+            # 入库前 license 校验：不合规直接跳过，避免后续分类/安全审计等昂贵操作
+            if not await self._license_allows(
+                repo_root, relative_path, metadata_content[0],
+            ):
+                self._license_skipped_skill_ids.add(skill_id)
                 continue
             input_elapsed = time.perf_counter() - scan_started_at
             tree_hash = tree_hashes.get(relative_path)
@@ -399,6 +411,15 @@ class SkillScanner:
                         ref,
                     )
                     continue
+                # HEAD 已被 license 校验淘汰：不再生成 tag 版本，避免孤儿版本行
+                if skill_id in self._license_skipped_skill_ids:
+                    _logger.debug(
+                        '[Discover] Skipped tag scan for license-rejected skill: '
+                        'skill_id=%s ref=%s',
+                        skill_id,
+                        ref,
+                    )
+                    continue
                 # 版本号以元数据为准：SKILL.md frontmatter 声明了 version
                 # （顶层或 metadata 嵌套）时优先使用，仅当元数据缺失时
                 # 才回退到 tag 名作为版本号。
@@ -477,6 +498,47 @@ class SkillScanner:
                 discovered.append(skill)
 
         return discovered
+
+    async def _license_allows(
+        self, repo_root: Path, relative_path: str, metadata: dict[str, Any]
+    ) -> bool:
+        """入库前 license 校验；与定时任务共用同一判定模块与动作配置。
+
+        不合规返回 False，调用方直接跳过该 skill，避免后续分类/安全审计。
+        清单不可用时返回 True（不阻断发现流程），由定时任务兜底。
+        """
+        from src.core.config import get_settings
+
+        settings = get_settings()
+        if not settings.discover.license_check.enabled:
+            return True
+        skill_dir = str(Path(relative_path).parent)
+        if skill_dir == ".":
+            skill_dir = ""
+        declared = (metadata or {}).get("license")
+        cache_key = (str(repo_root), skill_dir, declared or "")
+        if cache_key in self._license_verdicts:
+            return self._license_verdicts[cache_key]
+
+        from src.skills.license.runtime import get_license_checker, is_compliant
+
+        checker = await asyncio.to_thread(get_license_checker, False)
+        if checker is None:
+            self._license_verdicts[cache_key] = True
+            return True
+        result = await asyncio.to_thread(
+            checker.check_local, repo_root, skill_dir, declared,
+        )
+        allowed = is_compliant(settings.license_audit, result.verdict)
+        if not allowed:
+            _logger.info(
+                "[Discover] Skipped non-compliant skill license: path=%s status=%s reasons=%s",
+                relative_path,
+                result.verdict.status,
+                "; ".join(result.verdict.reasons) or "-",
+            )
+        self._license_verdicts[cache_key] = allowed
+        return allowed
 
     async def _build_skill_record(
         self,
@@ -574,8 +636,8 @@ class SkillScanner:
         }
         model_class = Skill if return_skill_model else SkillVersion
         record = model_class(**common)
-        setattr(record, '_security_audit_triggered', security.audit_triggered)
-        setattr(record, '_security_audit_attempted', security.audit_attempted)
+        record._security_audit_triggered = security.audit_triggered
+        record._security_audit_attempted = security.audit_attempted
         assemble_elapsed = time.perf_counter() - assemble_started_at
         total_elapsed = time.perf_counter() - scan_started_at
         accounted_elapsed = (
