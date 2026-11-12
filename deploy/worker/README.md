@@ -17,10 +17,11 @@ worker:
 1. 一次性迁移 `run_migration`
 2. 启动补缺口 `run_remediation_on_startup`
 3. discover 定时调度器（含首轮扫描）
-4. LLM 审核调度器（等待 discover 首轮完成后启动）
-5. SkillSpector 安全采集 collector（`security.enable_audit` 开启时）
+4. license 清理调度器（等待 discover 首轮完成后启动）
+5. LLM 审核调度器（等待 license 清理首轮完成后启动）
+6. SkillSpector 安全采集 collector（`security.enable_audit` 开启时）
 
-时序约束：LLM 审核调度器必须等 discover 首轮扫描完成（`first_round_done` 事件）后再启动。
+时序约束：license 清理必须等 discover 首轮扫描完成（`first_round_done`）后再启动；LLM 审核再等待 license 清理首轮完成，避免审核即将被删除的 skill。
 
 ## 运行
 
