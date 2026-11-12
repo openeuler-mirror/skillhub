@@ -215,6 +215,11 @@ license_audit:
       - "atomgit.com/openeuler/*"
     abort_on_access_list_failure: true
 
+# discover 入库前的 license 校验（与定时任务共用同一判定模块）
+discover:
+  license_check:
+    enabled: true
+
 logging:
   level: "INFO"
   format: "json"
