@@ -1,9 +1,5 @@
 """skill license 判定模块（与 openeuler-jenkins 门禁同源）。"""
 
-from src.skills.license.access_list import (
-    LicenseListUnavailableError,
-    load_access_list,
-)
 from src.skills.license.gate_engine import (
     STATUS_ALLOWED,
     STATUS_BLACK,
@@ -16,6 +12,19 @@ from src.skills.license.gate_engine import (
     LicenseScanner,
     LicenseVerdict,
 )
+from src.skills.license.runtime import (
+    action_for_status,
+    build_checker,
+    get_license_checker,
+    is_compliant,
+    reset_license_checker,
+)
+from src.skills.license.scanner import (
+    LicenseChecker,
+    LicenseCheckResult,
+    derive_skill_dir,
+    is_protected_repo,
+)
 
 __all__ = [
     "STATUS_ALLOWED",
@@ -26,8 +35,15 @@ __all__ = [
     "STATUS_RESTRICTED",
     "STATUS_UNKNOWN",
     "LicenseAccessList",
-    "LicenseListUnavailableError",
+    "LicenseCheckResult",
+    "LicenseChecker",
     "LicenseScanner",
     "LicenseVerdict",
-    "load_access_list",
+    "action_for_status",
+    "build_checker",
+    "derive_skill_dir",
+    "get_license_checker",
+    "is_compliant",
+    "is_protected_repo",
+    "reset_license_checker",
 ]

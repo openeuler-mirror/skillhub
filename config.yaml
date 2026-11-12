@@ -162,6 +162,59 @@ audit_llm_review:
   result_keep_days: 30
   result_max_files: 200
 
+# 后台定时 license 清理：与 openeuler-jenkins 门禁使用同一判定引擎与准入清单。
+# 每天 start_time（按 timezone 解释）扫描全库 skill，删除判定为 failed 的 skill；
+# atomgit.com/openeuler/* 默认保护（只报告不删除）。
+# 环境变量覆盖示例：LICENSE_AUDIT__ENABLED=true、LICENSE_AUDIT__START_TIME=00:30
+license_audit:
+  enabled: true
+  start_time: "00:30"
+  timezone: "Asia/Shanghai"
+  dry_run: false                  # true 只出报告不删除（排障用）
+  batch_size: 200                 # 每批提交的删除条数
+  result_dir: ""                  # 空则 storage.local_path/logs
+  result_keep_days: 30
+  result_max_files: 200
+
+  gate:
+    engine_commit: "52f25bd"      # vendored 门禁引擎对应提交（19467f1 + PR #711）
+    access_list_url: "https://api.atomgit.com/api/v5/repos/openeuler/compliance/raw/doc/rule/Licenses_Access_List.yaml?ref=master"
+    access_list_cache: ""         # 空则 storage.local_path/license/Licenses_Access_List.yaml
+    access_list_ttl_hours: 24
+    access_list_timeout: 30
+    extra_allow:                  # 清单未收录/未获 oE 认可但允许分发的许可；不覆盖 black
+      - CANN-2.0
+      - SUL-1.0
+      - FSL-1.1-Apache-2.0
+      - Convex-CPL
+      - CC-BY-3.0-US
+    prefer_file: true             # 声明不可用/受限时以 LICENSE 文件为准
+
+  actions:                        # 与门禁 ac.yaml 一致
+    allowed: success
+    conflict: warning
+    restricted: failed
+    missing: failed
+    unknown: failed
+    black: failed
+
+  repo:
+    remote_cache_root: ""         # 空则 storage.local_path/license-repos
+    remote_cache_ttl_days: 7
+    remote_fetch: true            # 本地 clone 缺失时远程浅克隆
+    remote_concurrency: 4
+    git_timeout: 60
+
+  safety:
+    max_deletions_per_run: 500
+    backup_before_delete: true
+    backup_dir: ""                # 空则 storage.local_path/license-backups
+    backup_keep_days: 30
+    backup_keep_files: 30
+    protected_repos:
+      - "atomgit.com/openeuler/*"
+    abort_on_access_list_failure: true
+
 logging:
   level: "INFO"
   format: "json"
