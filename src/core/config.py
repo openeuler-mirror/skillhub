@@ -224,6 +224,85 @@ class AuditLLMReviewConfig(BaseSettings):
     result_max_files: int = 200
 
 
+class LicenseGateConfig(BaseModel):
+    """门禁 license 判定参数（与 openeuler-jenkins ac.yaml 对应）。"""
+
+    engine_commit: str = "52f25bd"
+    access_list_url: str = (
+        "https://api.atomgit.com/api/v5/repos/openeuler/compliance/raw/"
+        "doc/rule/Licenses_Access_List.yaml?ref=master"
+    )
+    # 空则使用 <storage.local_path>/license/Licenses_Access_List.yaml
+    access_list_cache: str = ""
+    access_list_ttl_hours: int = 24
+    access_list_timeout: float = 30.0
+    # 准入清单未收录/未获 oE 认可、但允许分发的许可（不覆盖 black）
+    extra_allow: list[str] = Field(
+        default_factory=lambda: [
+            "CANN-2.0",
+            "SUL-1.0",
+            "FSL-1.1-Apache-2.0",
+            "Convex-CPL",
+            "CC-BY-3.0-US",
+        ]
+    )
+    prefer_file: bool = True
+
+
+class LicenseActionsConfig(BaseModel):
+    """状态 -> 动作，语义与门禁 ac.yaml 一致。"""
+
+    allowed: Literal["success", "warning", "failed"] = "success"
+    conflict: Literal["success", "warning", "failed"] = "warning"
+    restricted: Literal["success", "warning", "failed"] = "failed"
+    missing: Literal["success", "warning", "failed"] = "failed"
+    unknown: Literal["success", "warning", "failed"] = "failed"
+    black: Literal["success", "warning", "failed"] = "failed"
+
+
+class LicenseRepoConfig(BaseModel):
+    """仓库文件树来源。"""
+
+    # 空则使用 <storage.local_path>/license-repos
+    remote_cache_root: str = ""
+    remote_cache_ttl_days: int = 7
+    remote_fetch: bool = True
+    remote_concurrency: int = 4
+    git_timeout: float = 60.0
+
+
+class LicenseSafetyConfig(BaseModel):
+    """删除安全阀。"""
+
+    max_deletions_per_run: int = 500
+    backup_before_delete: bool = True
+    # 空则使用 <storage.local_path>/license-backups
+    backup_dir: str = ""
+    backup_keep_days: int = 30
+    backup_keep_files: int = 30
+    protected_repos: list[str] = Field(
+        default_factory=lambda: ["atomgit.com/openeuler/*"]
+    )
+    abort_on_access_list_failure: bool = True
+
+
+class LicenseAuditConfig(BaseModel):
+    """后台定时 license 清理任务。"""
+
+    enabled: bool = False
+    start_time: str = "00:30"
+    timezone: str = "Asia/Shanghai"
+    dry_run: bool = False
+    batch_size: int = 200
+    result_dir: str = ""
+    result_keep_days: int = 30
+    result_max_files: int = 200
+    gate: LicenseGateConfig = Field(default_factory=LicenseGateConfig)
+    actions: LicenseActionsConfig = Field(default_factory=LicenseActionsConfig)
+    repo: LicenseRepoConfig = Field(default_factory=LicenseRepoConfig)
+    safety: LicenseSafetyConfig = Field(default_factory=LicenseSafetyConfig)
+
+
 class LoggingConfig(BaseSettings):
     level: str = "INFO"
     format: str = "json"
@@ -250,6 +329,7 @@ class Settings(BaseSettings):
     app: AppConfig = Field(default_factory=AppConfig)
     discover_scheduler: DiscoverSchedulerConfig = Field(default_factory=DiscoverSchedulerConfig)
     audit_llm_review: AuditLLMReviewConfig = Field(default_factory=AuditLLMReviewConfig)
+    license_audit: LicenseAuditConfig = Field(default_factory=LicenseAuditConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     ai: AIConfig = Field(default_factory=AIConfig)
     openeuler_repos: list[SkillRepoEntry] = Field(default_factory=list)
@@ -274,6 +354,7 @@ class Settings(BaseSettings):
             app=AppConfig(**data.get("app", {})),
             discover_scheduler=DiscoverSchedulerConfig(**data.get("discover_scheduler", {})),
             audit_llm_review=AuditLLMReviewConfig(**data.get("audit_llm_review", {})),
+            license_audit=LicenseAuditConfig(**data.get("license_audit", {})),
             logging=LoggingConfig(**data.get("logging", {})),
             ai=AIConfig(**data.get("ai", {})),
             openeuler_repos=data.get("openeuler_repos", []) or [],
