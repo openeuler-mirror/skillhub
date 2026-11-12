@@ -172,12 +172,17 @@ class SkillManager:
     async def discover_configured_skill_repository(
         self,
         request: SkillRepositoryRequest,
+        *,
+        force: bool = False,
     ) -> SkillRepoModel | None:
         """Clone a repo and persist it only when a scannable skill is present.
 
         Returns ``None`` when no scannable ``SKILL.md`` exists and the repository
         has no persisted record. Existing records are deleted when their clone no
         longer contains a scannable skill.
+
+        ``force`` 跳过「commit 未变」短路，强制执行一次完整扫描：用于数据
+        缺行但 commit 已记录（异常状态）或在未改动远端时强制刷新。
 
         Clone and discovery errors propagate to the caller. The clone directory is
         retained for troubleshooting and reuse by a later scan.
@@ -236,7 +241,8 @@ class SkillManager:
             # 登记（platform='community'），即使 git 提交未变化，也必须迁移其
             # 列表来源字段（platform/source）。
             repository = await self._sync_catalog_source(repository, normalized)
-            if await asyncio.to_thread(
+            # force=True 时不比对 commit，直接进入扫描（数据缺口的逃生口）
+            if not force and await asyncio.to_thread(
                 self._is_commit_unchanged, repository, clone_dir,
             ):
                 setattr(repository, "_unchanged", True)

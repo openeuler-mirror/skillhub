@@ -140,9 +140,9 @@ def build_requests_from_skill_yaml(skill_yaml: str) -> list[SkillRepositoryReque
     """从单个 skill.yaml 构建 discover 请求（``--url`` 单文件模式）。
 
     与全量构建同口径：``skill_repos`` 整仓条目 + ``skills[].skill_url`` 单
-    Skill 收窄请求（整仓登记覆盖同文件的 skills[] 条目）；platform / owner
-    取自文件目录结构（不再由 URL 推断）。路径先按本地文件解析，不存在时按
-    catalog 根（``-r`` / 自动同步）解析。
+    Skill 收窄请求（整仓登记覆盖同文件的 skills[] 条目）+ ``local_skills``
+    原文件方式；platform / owner 取自文件目录结构（不再由 URL 推断）。路径
+    先按本地文件解析，不存在时按 catalog 根（``-r`` / 自动同步）解析。
     """
     resolved = Path(skill_yaml).expanduser()
     if not resolved.is_file():
@@ -172,6 +172,20 @@ def build_requests_from_skill_yaml(skill_yaml: str) -> list[SkillRepositoryReque
         if isinstance(skill, dict)
     ]
     requests.extend(_build_requests_from_skill_urls(skill_entries, [platform], seen_urls))
+
+    # 原文件方式贡献（local_skills）：命中的文件声明了 local_skills 时，按
+    # 全量构建口径扫描 openEuler-skills 自身的 skills/<name>/SKILL.md。
+    # 路径取整个 catalog 根的并集而非当前文件：同一仓库记录承载多位作者的
+    # local skill，收窄会让落库的集合 diff 把其它作者已入库的 skill 误删。
+    if entry.get("local_skills") and OPENEULER_SKILLS_URL not in {
+        request.url for request in requests
+    }:
+        catalog_root = resolved.parent.parent.parent
+        local_request = _build_local_skills_request(
+            load_catalog_local_skill_entries(catalog_root)
+        )
+        if local_request is not None:
+            requests.append(local_request)
     return requests
 
 

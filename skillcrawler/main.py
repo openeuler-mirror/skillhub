@@ -294,6 +294,7 @@ async def _discover_repositories_from_requests(
     *,
     source_label: str = "",
     config_keys: list[str] | None = None,
+    force: bool = False,
 ) -> tuple[int, dict[str, Any]]:
     """逐仓库执行 discover，输出表格，返回 (退出码, 本轮运行数据)。
 
@@ -324,7 +325,9 @@ async def _discover_repositories_from_requests(
         repo_started = time.monotonic()
 
         try:
-            result = await manager.discover_configured_skill_repository(request)
+            result = await manager.discover_configured_skill_repository(
+                request, force=force,
+            )
         except Exception as exc:
             elapsed = time.monotonic() - repo_started
             await manager.rollback()
@@ -533,6 +536,7 @@ async def _run_discover_single_skill_yaml(
         requests,
         source_label=f" from {args.url}",
         config_keys=[args.url],
+        force=args.force,
     )
 
 
@@ -556,6 +560,7 @@ async def _run_discover_from_config(
         requests,
         source_label=f" from {', '.join(config_keys)} (catalog: {repository_path})",
         config_keys=config_keys,
+        force=args.force,
     )
 
 
@@ -697,8 +702,9 @@ def _add_discover_parser(subparsers: argparse._SubParsersAction) -> None:
         help=(
             "Single skill.yaml to discover: a local file path, or a path "
             "relative to the openEuler-skills catalog (e.g. "
-            "personal/<owner>/skill.yaml); scans only its skill_repos / "
-            "skills[] entries"
+            "personal/<owner>/skill.yaml); scans its skill_repos / "
+            "skills[] entries, plus the catalog-level local_skills when the "
+            "file declares them"
         ),
     )
     parser.add_argument(
@@ -713,6 +719,15 @@ def _add_discover_parser(subparsers: argparse._SubParsersAction) -> None:
         choices=PLATFORM_CHOICES,
         default=None,
         help="Config repo list to read (default: all repo lists)",
+    )
+    parser.add_argument(
+        "-f",
+        "--force",
+        action="store_true",
+        help=(
+            "Force a rescan even when the repository commit is unchanged "
+            "(skips the commit-based fast path)"
+        ),
     )
 
 
