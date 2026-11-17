@@ -16,7 +16,7 @@ const appStore = useAppStore()
   >
     <ContentWrapper class="app-header-wrap">
       <!-- Logo -->
-      <a href="https://www.openeuler.openatom.cn/zh/" class="logo-link">
+      <a href="https://www.openeuler.org/zh/" class="logo-link">
         <img
           class="logo"
           alt="openEuler logo"
