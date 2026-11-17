@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from collections import OrderedDict
+import re
 import time
 from typing import Any
 
@@ -8,7 +9,9 @@ from src.core.config import get_settings
 
 
 # BGE v1.5 的 query-side instruction，文档向量不添加该前缀。
-BGE_QUERY_INSTRUCTION = "为这个句子生成表示以用于检索相关文章："
+# 按查询语言选择指令：中文查询用中文指令，其余（主要为英文）用英文指令。
+BGE_QUERY_INSTRUCTION = "为这个句子生成表示以用于检索相关文章："  # 中文查询指令
+BGE_QUERY_INSTRUCTION_EN = "Represent this sentence for searching relevant passages: "  # 英文查询指令
 QUERY_CACHE_TTL_SECONDS = 300.0
 QUERY_CACHE_MAX_ENTRIES = 256
 
@@ -151,9 +154,19 @@ def prepare_skill_text(skill: dict[str, Any] | Any) -> str:
     return " ".join(parts)[:MAX_EMBEDDING_TEXT_CHARS]
 
 
+_CJK_RE = re.compile(r"[\u3400-\u9fff]")
+
+
+def _contains_chinese(text: str) -> bool:
+    """判断文本是否包含中文字符。"""
+    return bool(_CJK_RE.search(text))
+
+
 def prepare_search_query(query: str) -> str:
-    """为 BGE 检索查询添加 query-side instruction。"""
-    return f"{BGE_QUERY_INSTRUCTION}{query.strip()}"
+    """为 BGE 检索查询添加 query-side instruction，按查询语言选择指令。"""
+    q = query.strip()
+    instruction = BGE_QUERY_INSTRUCTION if _contains_chinese(q) else BGE_QUERY_INSTRUCTION_EN
+    return f"{instruction}{q}"
 
 
 async def generate_skill_embedding(skill: dict[str, Any] | Any) -> list[float] | None:
