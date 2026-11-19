@@ -634,7 +634,6 @@ class SkillRepository:
                     **self._build_summary_update_values(
                         skill,
                         download_count=existing_skill.download_count,
-                        risk_score=existing_skill.risk_score,
                     )
                 )
             )
@@ -678,7 +677,6 @@ class SkillRepository:
                     **self._build_summary_update_values(
                         version,
                         download_count=existing_version.download_count,
-                        risk_score=existing_version.risk_score,
                     )
                 )
             )
@@ -707,13 +705,16 @@ class SkillRepository:
         representative: Skill | SkillVersion,
         *,
         download_count: int,
-        risk_score: Any,
     ) -> dict[str, Any]:
         """内容变化时的整行更新值。
 
-        ``download_count`` / ``risk_score`` 保留已有值：前者由 popularity 任务
-        维护、后者由安全审计（Jenkins 收集器）回写，均不是本次扫描的产物，
-        用新解析对象的默认值（None）覆盖会丢失已完成的审计分数。
+        ``download_count`` 保留已有值：由 popularity 任务维护，不是本次扫描的
+        产物，用新解析对象的默认值覆盖会丢失已统计的下载计数。
+
+        ``risk_score`` 写扫描实得值（``representative.risk_score``）：内容变化时
+        扫描已重新触发审计，异步模式下该值暂时为 ``None``（由 Jenkins 收集器
+        稍后回填），同步或缓存命中则为新分。不复用旧内容的评分，避免旧分与
+        新内容（新 tree_hash）误绑定。
         """
         return {
             "skill_repo_id": representative.skill_repo_id,
@@ -732,7 +733,7 @@ class SkillRepository:
             "platform": representative.platform,
             "extra_metadata": representative.extra_metadata,
             "content": representative.content,
-            "risk_score": risk_score,
+            "risk_score": representative.risk_score,
             "download_count": download_count,
             "rating": representative.rating,
             "updated_at": datetime.now(timezone.utc),
