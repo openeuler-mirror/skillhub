@@ -15,6 +15,7 @@ from src.skills.config import (
     CATALOG_PLATFORMS,
     load_catalog_skill_url_entries,
     load_catalog_local_skill_entries,
+    load_local_skill_entries_from_entry,
     load_crawler_config,
     load_single_catalog_entry,
     sync_openEuler_skills_repo,
@@ -140,9 +141,9 @@ def build_requests_from_skill_yaml(skill_yaml: str) -> list[SkillRepositoryReque
     """从单个 skill.yaml 构建 discover 请求（``--url`` 单文件模式）。
 
     与全量构建同口径：``skill_repos`` 整仓条目 + ``skills[].skill_url`` 单
-    Skill 收窄请求（整仓登记覆盖同文件的 skills[] 条目）；platform / owner
-    取自文件目录结构（不再由 URL 推断）。路径先按本地文件解析，不存在时按
-    catalog 根（``-r`` / 自动同步）解析。
+    Skill 收窄请求 + ``local_skills`` 原文件贡献（整仓登记覆盖同文件的
+    skills[] 条目）；platform / owner 取自文件目录结构（不再由 URL 推断）。
+    路径先按本地文件解析，不存在时按 catalog 根（``-r`` / 自动同步）解析。
     """
     resolved = Path(skill_yaml).expanduser()
     if not resolved.is_file():
@@ -172,6 +173,12 @@ def build_requests_from_skill_yaml(skill_yaml: str) -> list[SkillRepositoryReque
         if isinstance(skill, dict)
     ]
     requests.extend(_build_requests_from_skill_urls(skill_entries, [platform], seen_urls))
+
+    local_request = _build_local_skills_request(
+        load_local_skill_entries_from_entry(platform, owner, entry)
+    )
+    if local_request is not None:
+        requests.append(local_request)
     return requests
 
 
