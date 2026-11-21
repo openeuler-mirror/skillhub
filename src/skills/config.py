@@ -127,26 +127,40 @@ def load_catalog_local_skill_entries(repository_path: Path | None = None) -> lis
     path = (repository_path or sync_openEuler_skills_repo()).expanduser()
     entries: list[dict[str, Any]] = []
     for platform, owner, entry in _iter_catalog_entries(path):
-        local_skills = entry.get("local_skills")
-        if not isinstance(local_skills, list):
+        entries.extend(load_local_skill_entries_from_entry(platform, owner, entry))
+    return entries
+
+
+def load_local_skill_entries_from_entry(
+    platform: str, owner: str, entry: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """从单个 skill.yaml 条目提取 ``local_skills`` 原文件贡献条目。
+
+    口径与 :func:`load_catalog_local_skill_entries` 一致（author：enterprise
+    取 ``organization`` 否则 owner，community/personal 取 owner），供
+    ``--url`` 单文件模式复用，避免与全量收集逻辑重复。
+    """
+    entries: list[dict[str, Any]] = []
+    local_skills = entry.get("local_skills")
+    if not isinstance(local_skills, list):
+        return entries
+    if platform == "enterprise":
+        author = _clean_optional_str(entry.get("organization")) or owner
+    else:
+        author = owner
+    for skill_name in local_skills:
+        if not isinstance(skill_name, str):
             continue
-        if platform == "enterprise":
-            author = _clean_optional_str(entry.get("organization")) or owner
-        else:
-            author = owner
-        for skill_name in local_skills:
-            if not isinstance(skill_name, str):
-                continue
-            name = skill_name.strip()
-            if not name:
-                continue
-            entries.append({
-                "platform": platform,
-                "owner": owner,
-                "author": author,
-                "skill_name": name,
-                "skill_path": f"skills/{name}/SKILL.md",
-            })
+        name = skill_name.strip()
+        if not name:
+            continue
+        entries.append({
+            "platform": platform,
+            "owner": owner,
+            "author": author,
+            "skill_name": name,
+            "skill_path": f"skills/{name}/SKILL.md",
+        })
     return entries
 
 
