@@ -4,7 +4,6 @@
 让 API 变成无状态、可多副本的纯 Web 服务：
 
 - 一次性迁移 (run_migration)
-- 启动补缺口 (run_remediation_on_startup)
 - discover 定时调度器（含首轮扫描，audit 会等待其首轮完成）
 - LLM 审核调度器（等待 discover 首轮完成后启动）
 - Skillspector 采集器（security.enable_audit 时）
@@ -34,7 +33,6 @@ from src.jobs.audit_llm_review import start_audit_llm_review_scheduler
 from src.jobs.discover_scheduler import start_discover_scheduler
 from src.jobs.license_audit import start_license_audit_scheduler
 from src.jobs.migration import run_migration
-from src.jobs.remediation import run_remediation_on_startup
 from src.security.detector import start_skillspector_collector
 
 settings = get_settings()
@@ -122,16 +120,6 @@ async def _run_background_tasks():
         raise
     except Exception:
         logger.exception("startup migration failed")
-
-    # 启动补一轮衍生字段缺口（security/category/embedding）并落盘。
-    logger.info("running startup remediation")
-    try:
-        await run_remediation_on_startup()
-        logger.info("startup remediation completed")
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        logger.exception("startup remediation failed")
 
     if settings.discover_scheduler.enabled:
         logger.info("starting discover scheduler")

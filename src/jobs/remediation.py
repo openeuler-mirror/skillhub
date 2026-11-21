@@ -15,18 +15,13 @@ LLM 超时、写库中断），且内容不变时 reconcile 不重扫、缺口�
 pg_advisory_lock（embedding 的锁另与全量重建脚本互斥），单任务锁被占用或
 异常只记入该任务统计，不影响其余任务。
 
-触发点两处：
-
-- API 启动时（main lifespan 在 discover 扫描前先补一轮历史遗留缺口）；
-- 每轮 discover 末尾（skillcrawler CLI 与 DiscoverScheduler）：本轮新
-  入库的缺口行立即补齐，不必等启动。
+触发点：每轮 discover 末尾（skillcrawler CLI 与 DiscoverScheduler）。本轮新
+入库的缺口行立即补齐，不必等启动。
 """
 
 from __future__ import annotations
 
 import logging
-import time
-from datetime import datetime
 from typing import Any
 
 from src.core.config import get_settings
@@ -112,51 +107,3 @@ async def run_remediations() -> dict[str, Any]:
             results[name] = {"error": "remediation task failed"}
         logger.info("%s task finished: %s -> %s", LOG_PREFIX, name, results[name])
     return results
-
-
-async def run_remediation_on_startup() -> None:
-    """API 启动时补一轮历史遗留缺口，并把结果落盘；失败只记日志不影响启动。
-
-    触发点在 main lifespan（discover 扫描前）；discover 每轮末尾的补齐结果
-    则由 discover_scheduler 直接写进 discover-<时间戳>.json，不经过本函数。
-    """
-    started_at = datetime.now()
-    run_started = time.monotonic()
-    logger.info("%s startup round started", LOG_PREFIX)
-    try:
-        results = await run_remediations()
-        logger.info("%s startup round finished: %s", LOG_PREFIX, results)
-        _save_remediation_result_file(results, started_at, run_started)
-    except Exception:
-        logger.exception("%s startup round failed", LOG_PREFIX)
-
-
-def _save_remediation_result_file(
-    results: dict[str, Any], started_at: datetime, run_started: float
-) -> None:
-    """把一轮补齐结果写入 remediation-<时间戳>.json；失败不影响主流程。
-
-    结果目录与 discover 结果一致（resolve_discover_result_dir），
-    各任务统计字段补 <key>_note 说明（remediation_run_with_notes，与
-    discover 结果 JSON 中 remediation_run 同口径）。
-    """
-    try:
-        from src.skills.discover_result import (
-            remediation_run_with_notes,
-            save_discover_result_file,
-        )
-
-        path = save_discover_result_file(
-            {
-                "started_at": started_at.isoformat(timespec="seconds"),
-                "finished_at": datetime.now().isoformat(timespec="seconds"),
-                "total_seconds": round(time.monotonic() - run_started, 3),
-                "remediation_run": remediation_run_with_notes(results),
-            },
-            file_prefix="remediation",
-            log=False,
-        )
-        if path:
-            logger.info("%s result saved to %s", LOG_PREFIX, path)
-    except Exception:
-        logger.warning("%s failed to save result file", LOG_PREFIX, exc_info=True)

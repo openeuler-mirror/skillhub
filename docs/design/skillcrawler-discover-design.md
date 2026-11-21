@@ -487,7 +487,7 @@ error  = commit unchanged
 （`_retry_unscored_security_audits`，结果 `security_retried`）；现已抽离到
 统一补齐框架 [`src/jobs/remediation.py`](../../src/jobs/remediation.py)：
 安全补审计改为**全局扫描**所有 `risk_score` 缺口行（不限于本轮扫到且 commit
-未变的仓库），在 worker 启动补跑与每轮 discover 末尾执行，覆盖面更大、
+未变的仓库），在每轮 discover 末尾执行，覆盖面更大、
 且与 category / embedding 补齐同构。未评分记录的重试流程（还原 `SKILL.md`
 相对路径 → 重新提交 Jenkins → 更新 `extra_metadata.security_audit` →
 upsert `security_audits` → 保持 `risk_score=NULL` 等 collector 回填）不变，
@@ -1092,7 +1092,7 @@ security/category 的能力不可用返回带 `skipped` 字段的完整统计对
 |---|---|
 | `total` | skills 表 Skill 总数 |
 | `indexed` | 已建 embedding 的 Skill 数（不论是否已审计） |
-| `missing` | 已审计但 embedding 缺失的 Skill 数（**索引创建失败**，等下轮 discover 或 worker 启动补跑自愈） |
+| `missing` | 已审计但 embedding 缺失的 Skill 数（**索引创建失败**，等下轮 discover 补跑自愈） |
 | `not_required` | 未审计且未建索引（`risk_score` 与 `embedding` 均为空）的 Skill 数，暂不建索引属预期状态 |
 
 # 11. 删除与统计值重算
