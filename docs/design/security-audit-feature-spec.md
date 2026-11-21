@@ -1072,17 +1072,17 @@ SC4 模块实时查询 [OSV.dev](https://osv.dev) 检查依赖包已知 CVE：
 ### 12.5 站内文档页（安全评估说明）
 
 详情页「风险评估说明」浮层的「查看详情」不再跳报告页，而是打开站内文档页，展示
-`docs/skillhub-security-audit.md` 的正文（`SkillDetail.vue` 的 `goSecurityDoc()`，上报 `click_risk_guide`）。
+`docs/guides/skillhub-security-audit.md` 的正文（`SkillDetail.vue` 的 `goSecurityDoc()`，上报 `click_risk_guide`）。
 
 | 项 | 值 |
 |------|------|
 | 路由 | `/docs/:doc`（name: `docs`） |
 | 页面组件 | `web/src/pages/DocsPage.vue` |
-| 文档来源 | 仓库 `docs/*.md`，发布时同步一份到 `web/public/docs/`（web 镜像只打包 `web/` 目录），页面按 `fetch('/docs/{doc}.md')` 取原文渲染 |
+| 文档来源 | 仓库 `docs/guides/*.md`，发布时同步一份到 `web/public/docs/`（web 镜像只打包 `web/` 目录），页面按 `fetch('/docs/{doc}.md')` 取原文渲染 |
 | 已同步文档 | `skillhub-security-audit.md`（安全评估说明）、`skillhub-introduction.md`、`skillhub-publish-and-manage.md` |
 | 渲染规则 | `marked` 解析**整篇文档**（含 H1，标题与正文一体展示，不做拆分）；`title` 另从 H1 提取，用于面包屑末级与左侧目录；文档内相对 `./xxx.md` 链接改写为站内路由 `/docs/xxx`；`:doc` 参数仅允许字母/数字/连字符 |
 | 布局 | 左目录 + 右正文（间距 32px）：左侧 280px 便签式侧栏（`--o-color-fill2`、sticky 吸附 `top: 96px` = 72px 吸顶导航 + 24px 间距、标题「目录」）列出三篇文档标题（取各自 H1，当前项高亮 `--o-color-control2-light` + `--o-color-primary1`），并在当前文档下展开其**章节大纲**（h2 锚点，点击平滑滚动，`scroll-margin-top: 96px` 避开吸顶导航，不触发路由 hash 跳转）；右侧为承载整篇文档的正文卡片 |
 | 版式 | 复用详情页/报告页的顶部底纹与面包屑（SkillHub / 文档 / 当前文档名，面包屑通栏）；正文卡片 `--o-color-fill2` + 48px 内边距，卡片内自上而下依次是文档 H1（40px/56px SemiBold `info1`）、引用块与正文；h2 24px/32px、h3 20px/28px，正文 16px/26px `info2`，表格/引用/行内代码使用 `--o-color-control*` 与 `--o-font_family-code` |
 | 失败态 | 文档不存在或拉取失败时展示「文档不存在或加载失败」+ 返回首页链接 |
 
-> 维护提示：`docs/*.md` 为文档源，`web/public/docs/` 为发布副本，两者内容需保持一致。
+> 维护提示：`docs/guides/*.md` 为文档源，`web/public/docs/` 为发布副本，两者内容需保持一致。
