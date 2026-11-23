@@ -393,8 +393,8 @@ class SkillManager:
         修正三类漂移：skill 被删除后 contributors.skill_count /
         skill_repos.skill_num 的残留、多作者仓库只刷新单一 author 的
         contributors 行、以及手工直改 skills 表造成的偏差。统计口径
-        与扫描写入一致（contributors 走 risk_score 非空的可见口径，
-        skill_repos 走仓库下 skill 行数），因此不会与扫描互相翻转。
+        与扫描写入一致（contributors 走字段完备 is_complete 且未下架 is_removed=false
+        的可见口径，skill_repos 走仓库下 skill 行数），因此不会与扫描互相翻转。
         失败仅告警，不影响已提交的扫描结果。
         """
         try:
@@ -414,17 +414,18 @@ class SkillManager:
         except Exception as exc:
             _logger.warning('[Discover] Failed to reconcile skill statistics after scan: %s', exc)
 
-    async def delete_removed_catalog_repos(
+    async def hide_removed_catalog_repos(
         self, requests: list[SkillRepositoryRequest]
     ) -> int:
-        """同步删除 catalog 中已消失的仓库及其级联数据，返回删除的仓库数。
+        """同步隐藏 catalog 中已消失的仓库及其技能（软删除），返回隐藏的仓库数。
 
         按 (platform, author, repo_name) 求交集：数据库中在 catalog 期望集合
-        外的组合即已删除。author 口径与扫描写入 skill_repos.author 一致。
+        外的组合即已下架。author 口径与扫描写入 skill_repos.author 一致。
 
-        skill / skill_versions 走外键 CASCADE；security_audits / download_history
-        软关联由 ``delete_skill_repositories`` 清理；删除后重算 contributors
-        .skill_count 并清理名下已无 skill 的孤儿作者。
+        软隐藏下 skill / skill_versions 行全部保留，仅把名下 skills 与
+        skill_repos 的 ``is_removed`` 置 true（由 ``soft_delete_skill_repositories``
+        实现）；隐藏后自愈统计值（contributors.skill_count / skill_repos.skill_num），
+        孤儿作者不在此步物理清理。
         """
         # 保守守卫：catalog 存在解析失败（损坏/空/非 dict）的 skill.yaml 时，
         # 无法区分「真被删除」与「解析失败漏读」，跳过删除以免误删。
@@ -492,39 +493,32 @@ class SkillManager:
 
         removed_ids = [repo.id for repo in removed]
         _logger.info(
-            '[Discover] syncing catalog removals: deleting %d repo(s) %s',
+            '[Discover] syncing catalog removals: hiding %d repo(s) %s',
             len(removed_ids),
             [repo.repo_name for repo in removed],
         )
-        await self.skill_repo_repository.delete_skill_repositories(removed_ids)
+        await self.skill_repo_repository.soft_delete_skill_repositories(removed_ids)
 
-        # 删除后自愈统计值并清理孤儿作者；内部容错，失败仅告警不影响删除结果
+        # 隐藏后自愈统计值；软隐藏下 skill 行仍在，孤儿作者不在此步物理清理
         await self._reconcile_skill_statistics()
-        deleted_contributors = 0
-        if self.contributor_repository is not None:
-            deleted_contributors = (
-                await self.contributor_repository.delete_contributors_without_skills()
-            )
         _logger.info(
-            '[Discover] catalog removal sync done: repos_deleted=%d, '
-            'empty_contributors_deleted=%d',
+            '[Discover] catalog removal sync done: repos_hidden=%d',
             len(removed_ids),
-            deleted_contributors,
         )
         return len(removed_ids)
 
-    async def delete_removed_catalog_skills(
+    async def hide_removed_catalog_skills(
         self, requests: list[SkillRepositoryRequest]
     ) -> int:
-        """同步删除 catalog 中已撤销登记的单 Skill（URL / local_skills 条目移除）。
+        """同步隐藏（软删除） catalog 中已撤销登记的单 Skill（URL / local_skills 条目移除）。
 
         对每条「部分扫描」请求（``skill_paths`` 非空：``skills[].skill_url``
         单 Skill 与 ``local_skills`` 原文件方式），按同一口径推导该仓库期望
-        存在的 skill_id 集合，删除仓库下不属于集合的 skill（含 version 与
-        security_audits / download_history 软关联）。整仓移除由
-        ``delete_removed_catalog_repos`` 负责；整仓请求（skill_paths=None）
+        存在的 skill_id 集合，隐藏仓库下不属于集合的 skill（仅把 ``is_removed``
+        置 true，行与 version / security_audits / download_history 软关联均保留）。
+        整仓移除由 ``hide_removed_catalog_repos`` 负责；整仓请求（skill_paths=None）
         在这里跳过——它是全量扫描，store 的 diff 已覆盖。
-        返回删除的 skill 行数。
+        返回隐藏的 skill 行数。
         """
 
         # 保守守卫：catalog 存在解析失败的 skill.yaml 时跳过删除，避免因
@@ -539,7 +533,7 @@ class SkillManager:
                 )
                 return 0
 
-        deleted = 0
+        hidden = 0
         for request in requests:
             if not request.skill_paths:
                 continue
@@ -554,19 +548,19 @@ class SkillManager:
                 build_skill_id(source, owner_repo, path)
                 for path in normalized.skill_paths
             }
-            removed = await self.skill_repository.delete_skills_not_in_skill_ids(
+            removed = await self.skill_repository.soft_delete_skills_not_in_skill_ids(
                 repository.id, expected_skill_ids
             )
             if removed:
-                deleted += removed
+                hidden += removed
                 _logger.info(
-                    '[Discover] removed %d revoked skill(s) from %s',
+                    '[Discover] hidden %d revoked skill(s) from %s',
                     removed,
                     repo_name,
                 )
-        if deleted:
+        if hidden:
             await self._reconcile_skill_statistics()
-        return deleted
+        return hidden
 
     def _contributor_profile(self, platform: str | None, author: str) -> dict[str, Any]:
         """Lookup catalog profile fields (name/description/git_profile) for a contributor.
@@ -761,9 +755,9 @@ class SkillManager:
         必须迁移其 ``platform``/``source`` 字段，即使 git 提交未变化也是如此。
         否则技能列表会一直显示旧来源，直到仓库内容发生变化。
 
-        author 与 catalog 的差异不在此处原地迁移，统一交由同步删除阶段
-        （``delete_removed_catalog_repos``）处理：数据库有、catalog 无的
-        (platform, author, repo) 组合会被删除，之后重新扫描写入正确归属。
+        author 与 catalog 的差异不在此处原地迁移，统一交由同步隐藏阶段
+        （``hide_removed_catalog_repos``）处理：数据库有、catalog 无的
+        (platform, author, repo) 组合会被隐藏，之后重新扫描写入正确归属。
         """
         target_source: str | None = None
         try:
@@ -837,11 +831,18 @@ class SkillManager:
 
     @staticmethod
     def _count_unique_skills(skills: list[Skill]) -> int:
+        """统计可见（is_complete 且未下架 is_removed=false）的 unique skill 数。
+
+        与 ``SkillRepository.reconcile_skill_nums`` 的可见口径一致，避免扫描
+        写入值与自愈统计互相翻转。
+        """
         return len(
             {
                 str(skill.skill_id).strip()
                 for skill in skills
                 if getattr(skill, 'skill_id', None)
+                and getattr(skill, 'is_complete', False)
+                and not getattr(skill, 'is_removed', False)
             }
         )
 

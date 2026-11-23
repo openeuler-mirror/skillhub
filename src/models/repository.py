@@ -36,7 +36,9 @@ class SkillRepoRepository:
 
     async def list_skill_repositories(self) -> list[SkillRepoModel]:
         result = await self.session.execute(
-            select(SkillRepoModel).order_by(SkillRepoModel.created_at.desc())
+            select(SkillRepoModel)
+            .where(SkillRepoModel.is_removed.is_(False))
+            .order_by(SkillRepoModel.created_at.desc())
         )
         return list(result.scalars().all())
 
@@ -131,15 +133,20 @@ class SkillRepoRepository:
         return repository
 
     async def reconcile_skill_nums(self, commit: bool = True) -> int:
-        """按 skills 表实际行数重算全部 skill_repos.skill_num，返回修正行数。
+        """按可见口径重算全部 skill_repos.skill_num，返回修正行数。
 
-        口径与扫描写入的 ``unique_skill_count`` 一致（仓库下 skill 行数）。
-        仅更新当前值不等于实际值的行，天然幂等；用于扫描落库后的
-        统计自愈（手工删数据、历史漂移等）。
+        可见性规则与 ``count_skills`` / ``get_contributor_skills`` / 扫描写入的
+        ``unique_skill_count`` 一致（字段完备 is_complete 且未下架
+        is_removed=false），与扫描写入和贡献者统计同口径，不会在扫描与自愈
+        之间互相翻转。仅更新当前值不等于聚合值的行，天然幂等。
         """
         skill_count = (
             select(func.count(Skill.id))
-            .where(Skill.skill_repo_id == SkillRepoModel.id)
+            .where(
+                Skill.skill_repo_id == SkillRepoModel.id,
+                Skill.is_complete.is_(True),
+                Skill.is_removed.is_(False),
+            )
             .scalar_subquery()
         )
         result = await self.session.execute(
@@ -359,8 +366,9 @@ class SkillRepository:
         skill_id_prefix: str | None = None,
         security_level: list[str] | None = None,
     ):
-        # 全局规则：排除未检测（risk_score 为空）的 Skill，不进入列表
-        query = query.where(skill_model.risk_score.is_not(None))
+        # 全局规则：仅展示字段完备（is_complete=True）且未下架（is_removed=False）的 Skill
+        query = query.where(skill_model.is_complete.is_(True))
+        query = query.where(skill_model.is_removed.is_(False))
         if category:
             conditions = []
             normal_cats = []
@@ -408,8 +416,9 @@ class SkillRepository:
     def _latest_unique_skills_subquery(self):
         return (
             select(Skill)
-            # 全局规则：统计排除未检测（risk_score 为空）的 Skill，与列表保持一致
-            .where(Skill.risk_score.is_not(None))
+            # 统计排除脏数据，与列表保持一致（字段完备且未下架）
+            .where(Skill.is_complete.is_(True))
+            .where(Skill.is_removed.is_(False))
             .order_by(desc(Skill.updated_at), desc(Skill.created_at))
             .subquery()
         )
@@ -467,6 +476,34 @@ class SkillRepository:
             select(Skill)
             .options(selectinload(Skill.skill_repo))
             .where(Skill.skill_id == skill_id)
+        )
+        return result.scalar_one_or_none()
+
+    async def get_visible_by_skill_id(self, skill_id: str) -> Skill | None:
+        """仅返回字段完备（is_complete）且未下架（is_removed=false）的 Skill。
+
+        展示读路径（详情/版本/下载）使用；内部写路径（查重、计数、审计）
+        用无过滤的 ``get_by_skill_id``，避免把已下架行误判为不存在。
+        """
+        result = await self.session.execute(
+            select(Skill).where(
+                Skill.skill_id == skill_id,
+                Skill.is_complete.is_(True),
+                Skill.is_removed.is_(False),
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def get_visible_with_repository_by_skill_id(self, skill_id: str) -> Skill | None:
+        """同 :meth:`get_visible_by_skill_id`，额外预加载 ``skill_repo``。"""
+        result = await self.session.execute(
+            select(Skill)
+            .options(selectinload(Skill.skill_repo))
+            .where(
+                Skill.skill_id == skill_id,
+                Skill.is_complete.is_(True),
+                Skill.is_removed.is_(False),
+            )
         )
         return result.scalar_one_or_none()
 
@@ -951,7 +988,8 @@ class SkillRepository:
         base_filter = and_(
             Skill.source == source,
             Skill.author == author,
-            Skill.risk_score.is_not(None),
+            Skill.is_complete.is_(True),
+            Skill.is_removed.is_(False),
         )
 
         stats_result = await self.session.execute(
@@ -1423,14 +1461,16 @@ class ContributorRepository:
         """统计贡献者名下可见 skill 数（含同 author 的其他仓库）。
 
         可见性规则与 ``SkillRepository.get_contributor_skills`` 一致
-        （risk_score 已审计非空）。同一事务内可看到本次扫描未 commit 的写入，
-        因此扫描流程 store_skills_and_versions 之后调用即可拿到最新值。
+        （字段完备 is_complete 且未下架 is_removed=false）。同一事务内可看到
+        本次扫描未 commit 的写入，因此扫描流程 store_skills_and_versions
+        之后调用即可拿到最新值。
         """
         result = await self.session.execute(
             select(func.count(Skill.id)).where(
                 Skill.source == source,
                 Skill.author == author,
-                Skill.risk_score.is_not(None),
+                Skill.is_complete.is_(True),
+                Skill.is_removed.is_(False),
             )
         )
         return int(result.scalar() or 0)
@@ -1439,16 +1479,17 @@ class ContributorRepository:
         """按 skills 表可见口径重算全部 contributors.skill_count，返回修正行数。
 
         可见性规则与 ``count_skills`` / ``get_contributor_skills`` 一致
-        （risk_score 非空），与扫描 upsert 时的聚合口径相同，不会在
-        扫描与自愈之间来回翻转。仅更新当前值不等于聚合值的行，
-        天然幂等；用于扫描落库后的统计自愈（手工删数据、历史漂移等）。
+        （字段完备 is_complete 且未下架 is_removed=false），与扫描 upsert 时的
+        聚合口径相同，不会在扫描与自愈之间来回翻转。仅更新当前值不等于
+        聚合值的行，天然幂等；用于扫描落库后的统计自愈（手工删数据、历史漂移等）。
         """
         visible_count = (
             select(func.count(Skill.id))
             .where(
                 Skill.source == Contributor.source,
                 Skill.author == Contributor.author,
-                Skill.risk_score.is_not(None),
+                Skill.is_complete.is_(True),
+                Skill.is_removed.is_(False),
             )
             .scalar_subquery()
         )
@@ -1562,7 +1603,8 @@ class ContributorRepository:
             .where(
                 Skill.source == Contributor.source,
                 Skill.author == Contributor.author,
-                Skill.risk_score.is_not(None),
+                Skill.is_complete.is_(True),
+                Skill.is_removed.is_(False),
             )
             .correlate(Contributor)
             .scalar_subquery()

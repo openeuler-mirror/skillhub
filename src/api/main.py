@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
-from src.api.routes import agents, health, index, skills
+from src.api.routes import admin, agents, health, index, skills
 from src.api.middleware import install_response_wrapper
 from src.core.config import get_settings
 from src.core.logging import log_localtime
@@ -150,6 +150,7 @@ def create_app() -> FastAPI:
     app.include_router(skills.router, prefix="/api/v1/skills")
     app.include_router(agents.router, prefix="/api/v1/agents")
     app.include_router(index.router, prefix="/api/v1/index")
+    app.include_router(admin.router, prefix="/api/v1/admin")
 
     return app
 
