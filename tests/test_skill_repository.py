@@ -137,6 +137,7 @@ class TestSkillRepositoryUnit:
             tree_hash="old-tree",
             download_count=12,
             risk_score=77,
+            license_compliant=1,
         )
         scanned = SimpleNamespace(
             skill_repo_id=repo_id,
@@ -156,6 +157,7 @@ class TestSkillRepositoryUnit:
             extra_metadata={},
             content="# Updated",
             risk_score=10,
+            license_compliant=None,
             rating=None,
         )
         existing_result = MagicMock()
@@ -177,8 +179,11 @@ class TestSkillRepositoryUnit:
         assert "UPDATE skills SET" in str(compiled)
         assert "updated_at=" in str(compiled)
         assert compiled.params["download_count"] == 12
-        # 已审计的分数保留：不被新解析对象的 risk_score=10 覆盖
-        assert compiled.params["risk_score"] == 77
+        # 内容变化时写本次扫描实得分数（旧内容的 77 不能绑定到新 tree_hash）
+        assert compiled.params["risk_score"] == 10
+        # license_compliant 由 license 任务独占维护：discover 的 UPDATE 语句
+        # 不应包含该列，避免读-改-写覆盖 license 任务刚写入的新结论。
+        assert "license_compliant" not in str(compiled)
         session.add.assert_not_called()
 
     @pytest.mark.asyncio
@@ -331,6 +336,7 @@ class TestSkillRepositoryUnit:
             extra_metadata={},
             content=None,
             risk_score=10,
+            license_compliant=1,
             download_count=3,
             _period_downloads=None,
             rating=None,

@@ -71,8 +71,17 @@ class SearchService:
         tags: list[str] | None = None,
         security_level: list[str] | None = None,
     ):
-        # 全局规则：排除未检测（risk_score 为空）的 Skill，不进入搜索
+        # license 可见性规则与 SkillRepository._apply_skill_filters 保持一致：
+        # 只排除判定为 0 的 Skill；NULL（未检查）仍可见。
+        # SQL 三值逻辑下 `license_compliant != 0` 会把 NULL 一起排除，
+        # 因此必须显式 OR NULL 分支。
         query = query.where(Skill.risk_score.is_not(None))
+        query = query.where(
+            or_(
+                Skill.license_compliant.is_(None),
+                Skill.license_compliant == 1,
+            )
+        )
         if category:
             conditions = []
             normal_cats = []
@@ -555,6 +564,7 @@ class SearchService:
             Skill.tags,
             Skill.platform,
             Skill.risk_score,
+            Skill.license_compliant,
             Skill.download_count,
             Skill.rating,
             Skill.created_at,
@@ -612,6 +622,7 @@ class SearchService:
                 "tags": row["tags"] or [],
                 "platform": row["platform"],
                 "risk_score": row["risk_score"],
+                "license_compliant": row["license_compliant"],
                 "download_count": row["download_count"],
                 "rating": row["rating"],
                 "created_at": row["created_at"].isoformat() if row["created_at"] else None,
@@ -638,7 +649,13 @@ class SearchService:
     ) -> dict[str, Any]:
         embedding_str = "[" + ",".join(str(x) for x in embedding) + "]"
 
-        where_clauses = ["embedding IS NOT NULL", "risk_score IS NOT NULL"]
+        # 语义检索走原生 SQL，条件是 ORM 侧可见性规则的手工镜像：
+        # 新增/调整过滤条件时必须同步修改本列表，否则语义结果会绕过口径。
+        where_clauses = [
+            "embedding IS NOT NULL",
+            "risk_score IS NOT NULL",
+            "(license_compliant IS NULL OR license_compliant = 1)",
+        ]
         params: dict[str, Any] = {"limit": limit, "offset": offset, "embedding": embedding_str}
 
         if category:
@@ -684,7 +701,7 @@ class SearchService:
         sql = text(f"""
             SELECT id, skill_id, name, description, version, author, source,
                    source_url, category, tags, platform,
-                   risk_score, download_count, rating, created_at, updated_at,
+                   risk_score, license_compliant, download_count, rating, created_at, updated_at,
                    embedding <-> CAST(:embedding AS vector) AS distance
             FROM skills
             WHERE {where_sql}
@@ -718,6 +735,7 @@ class SearchService:
                 "tags": row.tags or [],
                 "platform": row.platform,
                 "risk_score": row.risk_score,
+                "license_compliant": row.license_compliant,
                 "download_count": row.download_count,
                 "rating": row.rating,
                 "created_at": row.created_at.isoformat() if row.created_at else None,

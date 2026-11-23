@@ -59,6 +59,12 @@ class SkillResponse(SkillBase):
     content: str | None = None
     category_label: str | None = None
     risk_score: int | None = None
+    # license 合规三态（由 license 定时任务维护）：
+    #   1    = 已检查且合规
+    #   0    = 已检查但不合规（默认不出现在列表/搜索结果中）
+    #   None = 尚未检查或检查失败（仍可见）
+    # 详情/审计/下载接口对 0 返回 404，因此正常响应里该字段通常为 1 或 None。
+    license_compliant: int | None = None
     download_count: int = 0
     period_downloads: int | None = None
     rating: str | None = None
