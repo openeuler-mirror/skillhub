@@ -52,9 +52,9 @@ SECURITY_AUDIT_NOTES: dict[str, str] = {
 }
 INDEX_CREATION_NOTES: dict[str, str] = {
     "total": "skills 表 Skill 总数",
-    "indexed": "已建 embedding 的 Skill 数（不论是否已审计）",
-    "missing": "已审计但 embedding 缺失的 Skill 数（索引创建失败，等下轮 discover 补跑自愈）",
-    "not_required": "未审计且未建索引（risk_score 与 embedding 均为空）的 Skill 数，暂不建索引属预期状态",
+    "indexed": "已建 embedding 的 Skill 数（不论字段是否完备或是否已下架）",
+    "missing": "字段完备且未下架但 embedding 缺失的 Skill 数（索引创建失败，等下轮 discover 补跑自愈）",
+    "not_required": "字段未完备或已下架且未建索引的 Skill 数，暂不建索引属预期状态",
 }
 SECURITY_BACKFILL_NOTES: dict[str, str] = {
     "total": "本轮扫描到的待补审计行数（risk_score 为空且无在途异步检测）",
@@ -148,7 +148,7 @@ async def collect_skill_stats(session: Any) -> dict[str, Any]:
     无报告）；「进行中」= 存在 skillspector_collected 为空的异步检测记录。
     查询失败由调用方兜底，不影响主流程。
     """
-    from sqlalchemy import case, func, select, text
+    from sqlalchemy import case, func, or_, select, text
 
     from src.models.orm import Skill
 
@@ -198,17 +198,21 @@ async def collect_skill_stats(session: Any) -> dict[str, Any]:
     ]
 
     # 3. 索引创建（embedding）：indexed / missing / not_required 为互斥三分法，
-    #    各项之和恒等于 total。只有已审计（risk_score 非空）的行才会建索引，
-    #    未审计且未建索引的 embedding 为空是预期状态，单列出来避免误判为失败。
+    #    各项之和恒等于 total。只有字段完备（is_complete）且未下架（is_removed=false）
+    #    的行才会建索引；字段未完备或已下架且未建索引的 embedding 为空是预期
+    #    状态，单列出来避免误判为失败。
     index_rows = await session.execute(
         select(
             func.count(),
             func.count().filter(Skill.embedding.is_not(None)),
             func.count().filter(
-                Skill.embedding.is_(None), Skill.risk_score.is_not(None)
+                Skill.embedding.is_(None),
+                Skill.is_complete.is_(True),
+                Skill.is_removed.is_(False),
             ),
             func.count().filter(
-                Skill.embedding.is_(None), Skill.risk_score.is_(None)
+                Skill.embedding.is_(None),
+                or_(Skill.is_complete.is_(False), Skill.is_removed.is_(True)),
             ),
         )
     )

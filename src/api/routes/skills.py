@@ -592,19 +592,15 @@ async def get_skill_versions(
     db: AsyncSession = Depends(get_db),
 ):
     skill_repo = SkillRepository(db)
-    latest_skill = await skill_repo.get_by_skill_id(skill_id)
-    tagged_versions = await skill_repo.get_versions_by_base_skill(None, skill_id)
-
-    if not latest_skill and not tagged_versions:
+    latest_skill = await skill_repo.get_visible_by_skill_id(skill_id)
+    if not latest_skill:
         raise HTTPException(status_code=404, detail="Skill not found")
+
+    tagged_versions = await skill_repo.get_versions_by_base_skill(None, skill_id)
 
     # 只返回 skill_versions 表的历史版本（Tag 版本），不包含 skills 表的 latest 行
     versions = list(tagged_versions) if tagged_versions else []
-    source_url = (
-        latest_skill.source_url
-        if latest_skill
-        else (versions[0].source_url if versions else "")
-    )
+    source_url = latest_skill.source_url
 
     return SkillVersionsResponse(
         source_url=source_url,
@@ -634,12 +630,15 @@ async def download_skill(
     repo = SkillRepository(db)
 
     if version:
+        # 版本可见性跟随其 base skill（skills 表同 skill_id 的最新行）
+        if not await repo.get_visible_by_skill_id(skill_id):
+            raise HTTPException(status_code=404, detail="Skill not found")
         skill = await repo.get_version_with_repository(skill_id, version)
         if not skill:
             raise HTTPException(status_code=404, detail="Skill version not found")
         resource_type = "skill_version"
     else:
-        skill = await repo.get_with_repository_by_skill_id(skill_id)
+        skill = await repo.get_visible_with_repository_by_skill_id(skill_id)
         if not skill:
             raise HTTPException(status_code=404, detail="Skill not found")
         resource_type = "skill"
@@ -684,7 +683,7 @@ async def download_skill(
 @router.get("/{skill_id:path}", response_model=SkillResponse | ErrorResponse)
 async def get_skill(skill_id: SkillIdPath, db: AsyncSession = Depends(get_db)):
     repo = SkillRepository(db)
-    skill = await repo.get_by_skill_id(skill_id)
+    skill = await repo.get_visible_by_skill_id(skill_id)
 
     if not skill:
         raise HTTPException(status_code=404, detail="Skill not found")

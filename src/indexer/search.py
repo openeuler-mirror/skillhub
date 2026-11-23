@@ -71,8 +71,9 @@ class SearchService:
         tags: list[str] | None = None,
         security_level: list[str] | None = None,
     ):
-        # 全局规则：排除未检测（risk_score 为空）的 Skill，不进入搜索
-        query = query.where(Skill.risk_score.is_not(None))
+        # 全局规则：仅搜索字段完备（is_complete=True）且未下架（is_removed=False）的 Skill
+        query = query.where(Skill.is_complete.is_(True))
+        query = query.where(Skill.is_removed.is_(False))
         if category:
             conditions = []
             normal_cats = []
@@ -638,7 +639,7 @@ class SearchService:
     ) -> dict[str, Any]:
         embedding_str = "[" + ",".join(str(x) for x in embedding) + "]"
 
-        where_clauses = ["embedding IS NOT NULL", "risk_score IS NOT NULL"]
+        where_clauses = ["embedding IS NOT NULL", "is_complete IS TRUE", "is_removed IS FALSE"]
         params: dict[str, Any] = {"limit": limit, "offset": offset, "embedding": embedding_str}
 
         if category:

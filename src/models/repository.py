@@ -20,6 +20,7 @@ from src.models.orm import (
     SkillRepoModel,
     SkillVersion,
 )
+from src.skills.skill_readiness import is_skill_complete
 
 logger = logging.getLogger(__name__)
 
@@ -207,6 +208,62 @@ class SkillRepoRepository:
             related_deleted,
         )
         return deleted
+
+    async def soft_delete_skill_repositories(
+        self, repository_ids: list[str | uuid.UUID],
+    ) -> int:
+        """软删除（隐藏）仓库及其技能，返回实际隐藏的仓库行数。幂等。
+
+        与 ``delete_skill_repositories`` 的硬删除不同：skill / skill_versions
+        行全部保留，仅把名下 skills 与 skill_repos 的 ``is_removed`` 置 true，
+        展示/统计读路径据此隐藏。只更新当前 is_removed=false 的行，已隐藏的
+        不计入 rowcount。
+        """
+        if not repository_ids:
+            return 0
+        repo_ids = [self._coerce_repository_id(item) for item in repository_ids]
+        logger.info(
+            "Batch soft-delete skill repos: repo_count=%d, repo_ids=%s",
+            len(repo_ids),
+            repo_ids,
+        )
+
+        # 1) 把名下 skills 的 is_removed 置 true
+        await self.session.execute(
+            update(Skill)
+            .where(
+                Skill.skill_repo_id.in_(repo_ids),
+                Skill.is_removed.is_(False),
+            )
+            .values(is_removed=True)
+        )
+        # 2) 把 skill_repos 的 is_removed 置 true
+        result = await self.session.execute(
+            update(SkillRepoModel)
+            .where(
+                SkillRepoModel.id.in_(repo_ids),
+                SkillRepoModel.is_removed.is_(False),
+            )
+            .values(is_removed=True)
+        )
+        await self.session.flush()
+        await self.session.commit()
+        hidden = int(result.rowcount or 0)
+        logger.info(
+            "Batch soft-delete skill repos done: skill_repos_hidden=%d",
+            hidden,
+        )
+        return hidden
+
+    async def purge_soft_deleted_skill_repositories(self) -> int:
+        """物理删除所有已软删除（is_removed=true）的仓库及其级联数据，返回删除仓库数。"""
+        result = await self.session.execute(
+            select(SkillRepoModel.id).where(SkillRepoModel.is_removed.is_(True))
+        )
+        repo_ids = [row[0] for row in result.all()]
+        if not repo_ids:
+            return 0
+        return await self.delete_skill_repositories(repo_ids)
 
     async def get_skill_repository_by_id(
         self,
@@ -608,13 +665,19 @@ class SkillRepository:
         scanned_ids = set(scanned_skills)
         existing_ids = set(existing_skills)
 
+        # 仓库内 skill 文件消失 → 软删除（is_removed=True），行与关联保留。
+        # 与 catalog 下架口径一致；重新出现时在下方循环恢复可见。只更新
+        # 当前未下架的行，已下架的不重复计入。
         removed_ids = existing_ids - scanned_ids
         if removed_ids:
             await self.session.execute(
-                delete(Skill).where(
+                update(Skill)
+                .where(
                     Skill.skill_repo_id == skill_repo_id,
                     Skill.skill_id.in_(removed_ids),
+                    Skill.is_removed.is_(False),
                 )
+                .values(is_removed=True)
             )
 
         for skill_id in scanned_ids:
@@ -626,6 +689,13 @@ class SkillRepository:
                 continue
             skill.id = existing_skill.id
             if self._is_content_unchanged(existing_skill, skill):
+                # 内容未变但此前被软删除（catalog 下架后重新出现），恢复可见
+                if existing_skill.is_removed:
+                    await self.session.execute(
+                        update(Skill)
+                        .where(Skill.id == existing_skill.id)
+                        .values(is_removed=False)
+                    )
                 continue
             await self.session.execute(
                 update(Skill)
@@ -716,7 +786,7 @@ class SkillRepository:
         稍后回填），同步或缓存命中则为新分。不复用旧内容的评分，避免旧分与
         新内容（新 tree_hash）误绑定。
         """
-        return {
+        values = {
             "skill_repo_id": representative.skill_repo_id,
             "skill_id": representative.skill_id,
             "name": representative.name,
@@ -740,6 +810,12 @@ class SkillRepository:
             "last_indexed_at": None,
             "embedding": None,
         }
+        # 仅 Skill 具备可见性标志；SkillVersion 无此二列。内容变化时按本次
+        # 扫描结果重算完备性、并复位下架标志（在 catalog 中即恢复可见）。
+        if isinstance(representative, Skill):
+            values["is_complete"] = is_skill_complete(representative)
+            values["is_removed"] = False
+        return values
 
     async def get_versions_by_base_skill(self, source_url: str | None, skill_id: str) -> list[SkillVersion]:
         query = select(SkillVersion)
@@ -1025,6 +1101,73 @@ class SkillRepository:
 
         # 清理 security_audits / download_history 软关联（无外键，不会级联）
         await self.delete_skill_related_records([*removed_uuids, *version_ids])
+        await self.session.commit()
+        return len(removed_uuids)
+
+    async def soft_delete_skills_not_in_skill_ids(
+        self, skill_repo_id: uuid.UUID, expected_skill_ids: set[str],
+    ) -> int:
+        """软删除（隐藏）仓库下 skill_id 不在期望集合内的 skill，返回隐藏行数。幂等。
+
+        与 ``delete_skills_not_in_skill_ids`` 同口径，但仅把匹配 skill 的
+        ``is_removed`` 置 true（不删除行，也不处理 skill_versions——其所属
+        base skill 已隐藏）。只更新当前 is_removed=false 的行，已隐藏的不计入。
+        """
+        if not expected_skill_ids:
+            return 0
+        removed_result = await self.session.execute(
+            select(Skill.id).where(
+                Skill.skill_repo_id == skill_repo_id,
+                Skill.skill_id.not_in(expected_skill_ids),
+                Skill.is_removed.is_(False),
+            )
+        )
+        removed_uuids = [row[0] for row in removed_result.all()]
+        if not removed_uuids:
+            return 0
+
+        await self.session.execute(
+            update(Skill)
+            .where(
+                Skill.id.in_(removed_uuids),
+                Skill.is_removed.is_(False),
+            )
+            .values(is_removed=True)
+        )
+        await self.session.flush()
+        await self.session.commit()
+        return len(removed_uuids)
+
+    async def purge_soft_deleted_skills(self) -> int:
+        """物理删除所有已软删除（is_removed=true）的 skill 及其版本与软关联，返回删除 skill 数。"""
+        rows = (
+            await self.session.execute(
+                select(Skill.id, Skill.skill_id, Skill.skill_repo_id).where(
+                    Skill.is_removed.is_(True)
+                )
+            )
+        ).all()
+        if not rows:
+            return 0
+        removed_uuids = [r[0] for r in rows]
+        skill_ids = [r[1] for r in rows]
+        repo_ids = {r[2] for r in rows}
+
+        version_result = await self.session.execute(
+            select(SkillVersion.id).where(
+                SkillVersion.skill_repo_id.in_(repo_ids),
+                SkillVersion.skill_id.in_(skill_ids),
+            )
+        )
+        version_uuids = [row[0] for row in version_result.all()]
+
+        await self.session.execute(delete(Skill).where(Skill.id.in_(removed_uuids)))
+        if version_uuids:
+            await self.session.execute(
+                delete(SkillVersion).where(SkillVersion.id.in_(version_uuids))
+            )
+        await self.session.flush()
+        await self.delete_skill_related_records([*removed_uuids, *version_uuids])
         await self.session.commit()
         return len(removed_uuids)
 
