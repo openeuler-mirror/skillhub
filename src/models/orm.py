@@ -4,6 +4,7 @@ from typing import Any
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
+    Boolean,
     DateTime,
     ForeignKey,
     Index,
@@ -12,6 +13,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     desc,
+    false,
     func,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
@@ -45,6 +47,7 @@ class SkillRepoModel(Base):
     )
 
     author: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    is_removed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=false())
     skills: Mapped[list["Skill"]] = relationship(
         back_populates="skill_repo",
         cascade="all, delete-orphan",
@@ -90,6 +93,8 @@ class Skill(Base):
     risk_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
     download_count: Mapped[int] = mapped_column(Integer, default=0)
     rating: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    is_complete: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=false())
+    is_removed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=false())
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()

@@ -19,6 +19,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.config import get_settings
+from src.skills.skill_readiness import is_skill_complete
 
 settings = get_settings()
 
@@ -973,6 +974,7 @@ class SkillspectorCollector:
             skill = await session.get(Skill, resource_id)
             if skill is not None:
                 skill.risk_score = score
+                skill.is_complete = is_skill_complete(skill)
                 score_write_target = "skills.risk_score"
             else:
                 skill_version = await session.get(SkillVersion, resource_id)

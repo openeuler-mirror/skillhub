@@ -28,6 +28,7 @@ from src.skills.skill_parser import (
 )
 from src.models.orm import Skill, SkillVersion
 from src.models.repository import SkillRepository
+from src.skills.skill_readiness import is_skill_complete
 
 from src.skills.skill_id import build_skill_id, extract_owner_repo
 
@@ -572,6 +573,13 @@ class SkillScanner:
             'created_at': datetime.now(timezone.utc),
             'updated_at': datetime.now(timezone.utc),
         }
+        if return_skill_model:
+            # 字段完备（risk_score + category 均非空）才对外可见；扫描中即在
+            # catalog，故同时复位下架标志（恢复可见）。
+            common['is_complete'] = is_skill_complete(
+                {'risk_score': security.risk_score, 'category': category}
+            )
+            common['is_removed'] = False
         model_class = Skill if return_skill_model else SkillVersion
         record = model_class(**common)
         setattr(record, '_security_audit_triggered', security.audit_triggered)
