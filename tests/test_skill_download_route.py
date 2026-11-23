@@ -35,7 +35,7 @@ async def test_download_skill_returns_file_and_commits_statistics(tmp_path):
     skill = SimpleNamespace(id=uuid.uuid4(), skill_repo=repository)
 
     skill_repository = MagicMock()
-    skill_repository.get_with_repository_by_skill_id = AsyncMock(return_value=skill)
+    skill_repository.get_visible_with_repository_by_skill_id = AsyncMock(return_value=skill)
     skill_repository.increment_download = AsyncMock(return_value=True)
     history_repository = MagicMock()
     history_repository.create = AsyncMock()
@@ -89,7 +89,7 @@ async def test_download_skill_returns_file_and_commits_statistics(tmp_path):
 async def test_download_skill_maps_archive_errors(archive_error, expected_status):
     skill = SimpleNamespace(id=uuid.uuid4(), skill_repo=SimpleNamespace())
     skill_repository = MagicMock()
-    skill_repository.get_with_repository_by_skill_id = AsyncMock(return_value=skill)
+    skill_repository.get_visible_with_repository_by_skill_id = AsyncMock(return_value=skill)
     manager = MagicMock()
     manager.create_skill_archive = AsyncMock(side_effect=archive_error)
     db = AsyncMock()
