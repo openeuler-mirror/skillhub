@@ -2,7 +2,7 @@
 """Embedding 重建脚本（独立进程，直接连库，无 HTTP 超时问题）。
 
 用法:
-    python scripts/reindex_embeddings.py [--batch-size 32] [--dry-run]
+    python scripts/reindex_embeddings.py [--batch-size 8] [--dry-run]
     python scripts/reindex_embeddings.py --skill-id <skill_id> [--dry-run]
 
 行为:
@@ -56,7 +56,7 @@ async def main() -> int:
         "--batch-size",
         type=batch_size,
         default=BATCH_SIZE,
-        help="全量模式每批处理行数，范围 1-1000（默认 32）",
+        help="全量模式每批处理行数，范围 1-1000（默认 8）",
     )
     parser.add_argument(
         "--dry-run", action="store_true", help="只显示配置，不执行重建"

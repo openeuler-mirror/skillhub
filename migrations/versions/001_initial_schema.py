@@ -1,4 +1,4 @@
-"""Create the initial WittyHub schema.
+"""Create the initial SkillHub schema.
 
 Revision ID: 001_initial_schema
 Revises:

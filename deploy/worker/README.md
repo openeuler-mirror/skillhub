@@ -15,10 +15,9 @@ worker:
 `api` 是无状态 Web 服务，不启动任何后台任务。本服务（单副本、`replicas: 1`）承载全部后台任务，按顺序执行：
 
 1. 一次性迁移 `run_migration`
-2. 启动补缺口 `run_remediation_on_startup`
-3. discover 定时调度器（含首轮扫描）
-4. LLM 审核调度器（等待 discover 首轮完成后启动）
-5. SkillSpector 安全采集 collector（`security.enable_audit` 开启时）
+2. discover 定时调度器（含首轮扫描）
+3. LLM 审核调度器（等待 license 清理首轮完成后启动）
+4. SkillSpector 安全采集 collector（`security.enable_audit` 开启时）
 
 时序约束：LLM 审核调度器必须等 discover 首轮扫描完成（`first_round_done` 事件）后再启动。
 

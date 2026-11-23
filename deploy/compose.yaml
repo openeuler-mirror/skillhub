@@ -98,7 +98,7 @@ services:
       start_period: 40s
     restart: unless-stopped
 
-  # 后台任务独立进程：一次性迁移、启动补缺口、discover 定时调度、LLM 审核、
+  # 后台任务独立进程：一次性迁移、discover 定时调度、LLM 审核、
   # Skillspector 采集器全部由此进程承载（单实例）。API 已不启动任何后台任务，
   # 可安全多副本扩展。
   worker:

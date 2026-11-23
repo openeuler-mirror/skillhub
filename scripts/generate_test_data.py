@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Generate test data for WittyHub
+Generate test data for SkillHub
 Creates 200 skills with multiple versions and realistic content
 
 Usage:
@@ -530,7 +530,7 @@ def insert_skills(conn, skills):
         audits.append((
             str(uuid.uuid4()), "skill", skill_id, None, None,
             "automated_scan", risk_level, psycopg2.extras.Json(signals),
-            psycopg2.extras.Json({"scanner": "WittyHub Security Scanner v1.0"}),
+            psycopg2.extras.Json({"scanner": "SkillHub Security Scanner v1.0"}),
             datetime.now() - timedelta(days=random.randint(0, 30))
         ))
 
@@ -548,7 +548,7 @@ def insert_skills(conn, skills):
     return len(skills)
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate test data for WittyHub")
+    parser = argparse.ArgumentParser(description="Generate test data for SkillHub")
     parser.add_argument("--count", type=int, default=200, help="Number of skills to generate")
     parser.add_argument("--host", default="localhost", help="Database host")
     parser.add_argument("--port", type=int, default=5432, help="Database port")

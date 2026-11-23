@@ -1,8 +1,8 @@
 # skillcrawler
 
-`skillcrawler` 是 WittyHub 的 Skill 仓库发现工具。它从一组明确的 Git 仓库完成 clone/fetch、扫描 `SKILL.md`、分类和入库。
+`skillcrawler` 是 SkillHub 的 Skill 仓库发现工具。它从一组明确的 Git 仓库完成 clone/fetch、扫描 `SKILL.md`、分类和入库。
 
-> 实现细节（总体流程、Git 同步策略、Tag 两阶段拉取、commit 去重、安全检测集成、数据库写入、错误处理）见 [`doc/design/skillcrawler-discover-design.md`](../doc/design/skillcrawler-discover-design.md)，建议从「§1 总体流程」开始阅读。
+> 实现细节（总体流程、Git 同步策略、Tag 两阶段拉取、commit 去重、安全检测集成、数据库写入、错误处理）见 [`docs/design/skillcrawler-discover-design.md`](../docs/design/skillcrawler-discover-design.md)，建议从「§1 总体流程」开始阅读。
 
 ---
 

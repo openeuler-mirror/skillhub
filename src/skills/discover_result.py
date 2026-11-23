@@ -53,7 +53,7 @@ SECURITY_AUDIT_NOTES: dict[str, str] = {
 INDEX_CREATION_NOTES: dict[str, str] = {
     "total": "skills 表 Skill 总数",
     "indexed": "已建 embedding 的 Skill 数（不论是否已审计）",
-    "missing": "已审计但 embedding 缺失的 Skill 数（索引创建失败，等下轮 discover 或 API 启动补跑自愈）",
+    "missing": "已审计但 embedding 缺失的 Skill 数（索引创建失败，等下轮 discover 补跑自愈）",
     "not_required": "未审计且未建索引（risk_score 与 embedding 均为空）的 Skill 数，暂不建索引属预期状态",
 }
 SECURITY_BACKFILL_NOTES: dict[str, str] = {

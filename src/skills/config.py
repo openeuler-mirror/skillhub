@@ -50,6 +50,32 @@ def _iter_catalog_entries(path: Path) -> Iterator[tuple[str, str, dict[str, Any]
                 yield platform, skill_file.parent.name, entry
 
 
+def count_malformed_catalog_files(repository_path: Path) -> int:
+    """统计 catalog 中解析失败被跳过的 skill.yaml 数量。
+
+    与 :func:`_iter_catalog_entries` 的 skip 口径对齐：YAML 损坏（YAMLError）、
+    解析结果非 dict（含空文件/仅注释）的 ``<platform>/<owner>/skill.yaml``
+    均计入 skipped。供删除层做保守守卫：skipped > 0 说明本轮 catalog 不完整，
+    存在「解析失败被当成已删除」的误删风险，应跳过删除。
+    """
+    path = Path(repository_path).expanduser()
+    skipped = 0
+    for platform in CATALOG_PLATFORMS:
+        root = path / platform
+        if not root.is_dir():
+            continue
+        for skill_file in sorted(root.glob("*/skill.yaml")):
+            try:
+                with skill_file.open("r", encoding="utf-8") as fh:
+                    entry = yaml.safe_load(fh)
+            except yaml.YAMLError:
+                skipped += 1
+                continue
+            if not isinstance(entry, dict):
+                skipped += 1
+    return skipped
+
+
 def normalize_dict_keys(data: Any) -> Any:
     if isinstance(data, dict):
         return {
@@ -127,26 +153,40 @@ def load_catalog_local_skill_entries(repository_path: Path | None = None) -> lis
     path = (repository_path or sync_openEuler_skills_repo()).expanduser()
     entries: list[dict[str, Any]] = []
     for platform, owner, entry in _iter_catalog_entries(path):
-        local_skills = entry.get("local_skills")
-        if not isinstance(local_skills, list):
+        entries.extend(load_local_skill_entries_from_entry(platform, owner, entry))
+    return entries
+
+
+def load_local_skill_entries_from_entry(
+    platform: str, owner: str, entry: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """从单个 skill.yaml 条目提取 ``local_skills`` 原文件贡献条目。
+
+    口径与 :func:`load_catalog_local_skill_entries` 一致（author：enterprise
+    取 ``organization`` 否则 owner，community/personal 取 owner），供
+    ``--url`` 单文件模式复用，避免与全量收集逻辑重复。
+    """
+    entries: list[dict[str, Any]] = []
+    local_skills = entry.get("local_skills")
+    if not isinstance(local_skills, list):
+        return entries
+    if platform == "enterprise":
+        author = _clean_optional_str(entry.get("organization")) or owner
+    else:
+        author = owner
+    for skill_name in local_skills:
+        if not isinstance(skill_name, str):
             continue
-        if platform == "enterprise":
-            author = _clean_optional_str(entry.get("organization")) or owner
-        else:
-            author = owner
-        for skill_name in local_skills:
-            if not isinstance(skill_name, str):
-                continue
-            name = skill_name.strip()
-            if not name:
-                continue
-            entries.append({
-                "platform": platform,
-                "owner": owner,
-                "author": author,
-                "skill_name": name,
-                "skill_path": f"skills/{name}/SKILL.md",
-            })
+        name = skill_name.strip()
+        if not name:
+            continue
+        entries.append({
+            "platform": platform,
+            "owner": owner,
+            "author": author,
+            "skill_name": name,
+            "skill_path": f"skills/{name}/SKILL.md",
+        })
     return entries
 
 

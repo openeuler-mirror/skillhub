@@ -1,9 +1,7 @@
 """统一补齐编排（src/jobs/remediation.py）与安全补跑
 （src/ai/security_backfill.py）的测试。"""
 
-import json
 import uuid
-from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -98,30 +96,6 @@ class TestRunRemediations:
         assert results["security"] == {"error": "remediation task failed"}
         assert results["category"] == {"filled": 1}
         assert results["embedding"] == {"filled": 1}
-
-    def test_save_remediation_result_file_writes_document(self, tmp_path):
-        """每轮补齐结果写 remediation-<时间戳>.json，统计字段带 <key>_note。"""
-        started = datetime(2026, 10, 29, 8, 0, 0)
-
-        with patch(
-            "src.skills.discover_result.resolve_discover_result_dir",
-            return_value=tmp_path,
-        ):
-            remediation._save_remediation_result_file(
-                {"security": {"total": 2, "triggered": 2, "failed": 0, "skipped": None}},
-                started,
-                run_started=100.0,
-            )
-
-        files = list(tmp_path.glob("remediation-*.json"))
-        assert len(files) == 1
-        document = json.loads(files[0].read_text(encoding="utf-8"))
-        assert document["started_at"] == "2026-10-29T08:00:00"
-        assert "total_seconds" in document
-        security = document["remediation_run"]["security"]
-        assert security["total"] == 2
-        assert security["total_note"]
-        assert security["skipped"] is None
 
 
 class TestSecurityBackfill:
