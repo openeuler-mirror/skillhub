@@ -1,4 +1,4 @@
-# Wittyhub — Agent 长期记忆
+# SkillHub — Agent 长期记忆
 
 > 本文件是所有 AI 编码工具在此仓库中工作的**唯一入口**和**长期记忆**，遵循 [agents.md](https://agents.md) 业界标准。
 
@@ -6,7 +6,7 @@
 
 ## 1. 项目速览
 
-**Wittyhub** 是一个 AI Agent Skills 检索与分发平台，基于 **FastAPI + Vue 3** 构建。
+**SkillHub** 是一个 AI Agent Skills 检索与分发平台，基于 **FastAPI + Vue 3** 构建。
 
 - 后端：Python FastAPI + PostgreSQL，Docker Compose 部署
 - 前端：**Vue 3 + Vite + Tailwind CSS**

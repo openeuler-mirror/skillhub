@@ -1,12 +1,13 @@
-# WittyHub 系统设计说明书
+# SkillHub 系统设计说明书
 
 ## 文档信息
 
 | 项目 | 内容 |
 |------|------|
-| 项目名称 | WittyHub - Agent/Skill 检索与下载平台 |
-| 文档版本 | v5.0 |
+| 项目名称 | SkillHub - Agent/Skill 检索与下载平台 |
+| 文档版本 | v6.0 |
 | 文档类型 | 系统设计说明书 |
+| 更新日期 | 2026-11-21 |
 
 ---
 
@@ -14,7 +15,7 @@
 
 ### 1.1 系统定位
 
-WittyHub 是一个去中心化的 Agent/Skill 检索与下载平台。平台本地只存储索引元数据，Skill 内容托管在 GitHub / AtomGit / Gitee 等外部仓库，通过 REST API、Web UI 和 CLI 三种方式对外提供服务。
+SkillHub 是一个去中心化的 Agent/Skill 检索与下载平台。平台本地只存储索引元数据，Skill 内容托管在 GitHub / AtomGit / Gitee 等外部仓库，通过 REST API、Web UI 和 CLI 三种方式对外提供服务。
 
 ### 1.2 核心设计原则
 
@@ -24,7 +25,7 @@ WittyHub 是一个去中心化的 Agent/Skill 检索与下载平台。平台本�
 | 单库多能力 | PostgreSQL 同时承担关系存储、全文检索（tsvector）、向量检索（pgvector） |
 | 搜索可降级 | Embedding 服务不可用时自动回退到全文搜索 |
 | 多源下载适配 | DownloadManager 基于 skillcrawler 本地克隆 `git archive` 打包，缓存复用 |
-| 安全优先 | 入库触发 Jenkins SkillSpector（NVIDIA）深度扫描，输出风险评分 |
+| 安全优先 | 入库触发 SkillSpector（NVIDIA）深度扫描，叠加 LLM 误报复核与 license 合规核查，输出风险评分 |
 
 ### 1.3 技术栈
 
@@ -34,8 +35,8 @@ WittyHub 是一个去中心化的 Agent/Skill 检索与下载平台。平台本�
 | 数据层 | PostgreSQL 16 + pgvector + tsvector (zhcfg) |
 | 语义检索 | BGE-base-zh-v1.5 Embedding 服务（OpenAI 兼容 API） |
 | 前端 | Vue 3 + TypeScript + Tailwind CSS + Vite |
-| CLI | Python Typer + httpx |
-| 部署 | Docker Compose（db / embedding / api / web） |
+| CLI | TypeScript（npm 包 `wittyhub`，独立仓库 skillhub-cli，ESM + bin/cli.mjs） |
+| 部署 | Docker Compose（db / embedding / api / worker / web / skillspector） |
 
 ---
 
@@ -50,8 +51,8 @@ graph LR
         SD[Skill Developer<br/>Skill 开发者]
     end
 
-    subgraph WittyHub 系统
-        SYS((WittyHub Platform))
+    subgraph SkillHub 系统
+        SYS((SkillHub Platform))
     end
 
     subgraph 外部系统
@@ -151,9 +152,14 @@ graph TB
 | REST API | `src/api/` | 路由编排、请求校验、响应序列化 |
 | SearchService | `src/indexer/search.py` | 全文检索、向量检索、RRF 混合排序 |
 | EmbeddingService | `src/ai/embedding.py` | 调用 BGE 模型生成查询/文档向量 |
-| DownloadManager | `src/storage/downloader.py` | 多平台下载 URL 格式化与本地存储 |
-| SecurityDetector | `src/security/detector.py` | 供应链安全检测与风险评分 |
+| LLM 能力 | `src/ai/llm.py`、`category_classifier.py`、`translation.py` | 分类、翻译等大模型调用 |
+| DownloadManager | `src/storage/downloader.py` | 基于本地克隆的 `git archive` 打包与缓存复用 |
+| SecurityDetector | `src/security/detector.py` | SkillSpector 扫描与风险评分 |
+| Security LLM 复核 | `src/security/audit_review/` | SkillSpector 风险项的 LLM 误报复核 |
 | Repository | `src/models/repository.py` | 数据库 CRUD 与统计查询 |
+| Core 基础设施 | `src/core/` | 配置、数据库、鉴权、限流、调度、日志 |
+| 背景任务 | `src/jobs/` | 独立 worker 承载的迁移、discover 调度、license 清理、LLM 复核 |
+| Skills 领域 | `src/skills/` | 仓库发现、skill 解析/管理、license 判定、热度 |
 | SkillCrawler | `skillcrawler/` | 技能仓库爬取、发现、分类 |
 
 ### 3.3 包依赖关系
@@ -267,7 +273,7 @@ erDiagram
 │  ┌─────────────┐   ┌─────────────┐   ┌─────────────┐           │
 │  │ 全文检索     │   │ 向量检索     │   │ RRF 融合     │           │
 │  │ tsvector    │   │ pgvector    │   │ k=60        │           │
-│  │ zhcfg       │   │ L2 distance │   │             │           │
+│  │ zhcfg       │   │ L2→余弦     │   │             │           │
 │  └─────────────┘   └─────────────┘   └─────────────┘           │
 │         │                  │                  │                 │
 │         └──────────────────┴──────────────────┘                 │
@@ -287,17 +293,21 @@ erDiagram
 #### 4.1.4 全文检索实现
 
 - **分词配置**：`zhcfg`（基于 `simple` + `unaccent`），适配中英文混合文本
-- **索引字段**：`name || description || content` 拼接后 `to_tsvector('zhcfg', ...)`
-- **查询方式**：`plainto_tsquery` + `ts_rank` 排序，辅以 `ILIKE` 模糊匹配兜底
+- **索引字段**：默认 `scope=summary` 仅拼接 `name || description`；`scope=full` 才额外加入 `content`。拼接后 `to_tsvector('zhcfg', ...)`
+- **查询方式**：`plainto_tsquery` + `ts_rank`，`name` 单独提权（×3.0）+ name 字面量命中加权；辅以 `ILIKE` 模糊匹配兜底
 - **二次排序**：相同 rank 时按 `download_count DESC` 打破平局
+- **结果后处理**：`name` 精确/前缀匹配置顶、镜像副本去重（同名+同描述合并）、相对差距截断去噪
+- **显式排序**：支持 `sort_by=relevance|updated_at|download_count` 与 `sort_period=week|month`
 
 #### 4.1.5 向量检索实现
 
 - **模型**：BAAI/bge-base-zh-v1.5，768 维
 - **文档向量**：`name + description + content` 拼接文本编码后存入 `skills.embedding`
 - **查询向量**：用户搜索词实时编码（不持久化）
-- **相似度计算**：`l2_distance(embedding, query_vector)`，转换为 `similarity = 1 / (1 + distance)`
-- **阈值过滤**：`min_similarity = 0.47`，过滤低相关结果
+- **向量归一化**：embedding 服务以 `normalize_embeddings=True` 编码，向量已归一化（norm=1）
+- **相似度计算**：`l2_distance`（`<->` 算子）；因向量归一化，按 `cos = 1 - d²/2` 精确换算余弦相似度（区分度高于旧的 `1/(1+d)`）
+- **阈值过滤**：`min_similarity = 0.35`（地板阈值，仅剔除完全不相关结果），真正去噪由相对差距截断完成
+- **索引加速**：`skills.embedding` 建 HNSW 索引（migration 014），`<->` 走近似最近邻
 
 #### 4.1.6 RRF 混合排序
 
@@ -307,7 +317,7 @@ Reciprocal Rank Fusion 将两路排序列表合并，无需分数归一化：
 RRF_score(d) = Σ  1 / (k + rank_i(d))     , k = 60
 ```
 
-实现位于 `src/indexer/search.py` 的 `reciprocal_rank_fusion()`，各路先取 `limit * 2` 候选再融合分页。
+实现位于 `src/indexer/search.py` 的 `reciprocal_rank_fusion()`，各路先取稳定候选池（`HYBRID_CANDIDATE_LIMIT = 200`）再融合分页，保证翻页时候选集与总数稳定。
 
 #### 4.1.7 索引构建与重索引
 
@@ -335,7 +345,7 @@ if embedding is None:
 
 #### 4.1.9 数据库扩展初始化
 
-数据库扩展与中文全文搜索配置由首个 Alembic 迁移脚本统一管理：
+数据库扩展与中文全文搜索配置由 Alembic 迁移链统一管理（当前 `migrations/versions/` 已演进到 014，追加 HNSW 向量索引、摘要搜索索引、仓库热度等）。首个迁移脚本中的扩展初始化如下：
 
 ```python
 # migrations/versions/001_initial_schema.py
@@ -386,7 +396,7 @@ graph LR
         CLI[CLI]
     end
 
-    subgraph WittyHub API
+    subgraph SkillHub API
         DL["GET /skills/{skill_id}/download"]
         DM[DownloadManager]
     end
@@ -482,7 +492,9 @@ graph TB
     subgraph Docker Compose : skillhub-network
         NG[web<br/>nginx:alpine<br/>:8080→8080]
         API[api<br/>FastAPI uvicorn<br/>:8081→8081]
+        WRK[worker<br/>后台任务进程<br/>无 HTTP 端口]
         EMB[embedding<br/>BGE 模型服务<br/>:8082→8082]
+        SPCTR[skillspector<br/>Jenkins 扫描器<br/>:8083→8083]
         DB[(db<br/>pgvector/pg16<br/>:5432)]
     end
 
@@ -492,15 +504,22 @@ graph TB
     NG -->|/* static| NG
     API --> DB
     API --> EMB
+    API -->|提交扫描| SPCTR
+    WRK --> DB
+    WRK --> EMB
+    WRK --> SPCTR
     API -->|下载链接| EXT[GitHub/AtomGit/Gitee]
 
     subgraph 持久化卷
         V1[(postgres-data)]
         V2[(/opt/wittyhub)]
+        V3[(jenkins-data)]
     end
 
     DB --- V1
     API --- V2
+    WRK --- V2
+    SPCTR --- V3
 ```
 
 #### 4.3.3 服务清单
@@ -508,9 +527,11 @@ graph TB
 | 服务 | 镜像/构建 | 端口 | 依赖 | 说明 |
 |------|-----------|------|------|------|
 | db | pgvector/pgvector:pg16 | 5432 | — | 初始化 Alembic 迁移（扩展 + 表结构） |
-| embedding | deploy/embedding/Dockerfile | 8082→8082 | — | BGE 模型，内存限制 4G，启动 ~120s |
-| api | deploy/api/Dockerfile | 8081→8081 | db ✓ | FastAPI，挂载根目录 config.yaml，并通过环境变量覆盖 Docker 差异 |
-| web | nginx:alpine | 8080→8080 | api | 静态 SPA + `/api/` 反向代理 |
+| embedding | deploy/embedding/Dockerfile | 8082→8082 | — | BGE 模型，向量归一化编码，内存限制 4G，启动 ~120s |
+| api | deploy/api/Dockerfile | 8081→8081 | db + embedding + skillspector | 无状态 FastAPI，挂载根目录 config.yaml，环境变量覆盖 Docker 差异 |
+| worker | deploy/api/Dockerfile（复用镜像，命令覆盖） | — | db + embedding | 独立后台进程：一次性迁移、discover 调度、license 清理、LLM 复核、SkillSpector 采集器 |
+| web | deploy/web/Dockerfile（nginx） | 8080→8080 | api | 静态 SPA + `/api/` 反向代理 |
+| skillspector | deploy/skillspector/Dockerfile | 8083→8083, 50000→50000 | — | 常驻 Jenkins 服务，执行 SkillSpector 深度扫描 |
 
 #### 4.3.4 Nginx 路由规则
 
@@ -524,7 +545,8 @@ graph TB
 
 ```yaml
 # 启动依赖链
-db (pg_isready) ──► api (HTTP /api/v1/health) ──► web
+db / embedding / skillspector（healthcheck）──► api（HTTP /api/v1/health）──► web
+worker 不参与 healthcheck 依赖链（自身不监听 HTTP，由 restart 兜底）
 ```
 
 | 服务 | 检查方式 | 间隔 | 启动宽限期 |
@@ -532,6 +554,8 @@ db (pg_isready) ──► api (HTTP /api/v1/health) ──► web
 | db | `pg_isready` | 10s | — |
 | embedding | `GET /health` | 30s | 120s |
 | api | `GET /api/v1/health` | 30s | 40s |
+| skillspector | `GET /login`（curl） | 30s | 120s |
+| worker | healthcheck 禁用（不监听 HTTP，由 `restart: unless-stopped` 兜底） | — | — |
 
 #### 4.3.6 配置管理
 
@@ -560,6 +584,8 @@ volumes:
 ```
 
 环境变量 `WITTYHUB_CONFIG` 指向配置文件路径；PostgreSQL、AI、模型、爬虫等配置均可通过 `SECTION__FIELD` 形式覆盖，例如 `POSTGRES__HOST=db`。
+
+此外，后台任务与 LLM/安全相关配置也集中在 `config.yaml`：`model.providers`（deepseek/siliconflow）供分类/翻译/LLM 复核调用，`discover_scheduler`、`audit_llm_review`、`license_audit`、`discover.license_check` 分别控制 worker 承载的定时任务。
 
 #### 4.3.7 一键部署
 
@@ -817,7 +843,7 @@ curl -X POST http://localhost:8081/api/v1/index/reindex
 │  │                              /opt/wittyhub                         │  │
 │  └────────────────────────────────────────────────────────────────────┘  │
 │                                                                          │
-│  External: GitHub / AtomGit / Gitee / SkillSpector                       │
+│  External: GitHub / AtomGit / Gitee（worker、skillspector 在网内，见 4.3.2） │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -828,6 +854,8 @@ curl -X POST http://localhost:8081/api/v1/index/reindex
 | 8080 | web (nginx) | Web UI 入口 |
 | 8081 | api (FastAPI) | REST API 直连（CLI / 调试） |
 | 8082 | embedding | Embedding 服务（通常仅内部访问） |
+| 8083 | skillspector (Jenkins) | SkillSpector 扫描服务 |
+| 50000 | skillspector (Jenkins agent) | Jenkins 构建节点通信 |
 | 5432 | db | PostgreSQL（开发调试） |
 
 ### 7.3 资源需求
@@ -835,17 +863,20 @@ curl -X POST http://localhost:8081/api/v1/index/reindex
 | 服务 | CPU | 内存 | 磁盘 |
 |------|-----|------|------|
 | db | 1 核 | 512MB+ | postgres-data 卷 |
-| embedding | 2 核+ | 4GB（限制） | 模型镜像 ~1.5GB |
+| embedding | 2 核+ | 4GB（限制） | huggingface-cache 模型卷 ~1.5GB |
 | api | 1 核 | 256MB+ | `/opt/wittyhub` |
+| worker | 1 核 | 256MB+ | `/opt/wittyhub` |
 | web | — | 64MB | web/dist 静态文件 |
+| skillspector | 1 核 | 1GB+ | jenkins-data 卷 |
 
 ### 7.4 部署验证清单
 
-- [ ] `docker compose up -d` 四服务均为 healthy
+- [ ] `docker compose up -d` db/embedding/api/web/skillspector 均为 healthy，worker 正常启动
 - [ ] `GET /api/v1/health` 返回 200
 - [ ] `GET /api/v1/index/search?q=测试&mode=hybrid` 返回结果
 - [ ] Web 首页 `http://localhost:8080` 可访问
 - [ ] PostgreSQL 扩展：`vector`, `pg_trgm`, `unaccent`, `zhcfg`
+- [ ] SkillSpector 控制台 `http://localhost:8083` 可登录
 - [ ] `wittyhub add vercel-labs/agent-skills --list` 正常列出 Skills
 
 ---
@@ -854,14 +885,33 @@ curl -X POST http://localhost:8081/api/v1/index/reindex
 
 ### 8.1 核心 API
 
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | `/api/v1/index/search` | 搜索（mode: text/semantic/hybrid） |
-| POST | `/api/v1/index/reindex` | 全量向量重索引 |
-| GET | `/api/v1/skills/{skill_id}/download` | 下载 Skill ZIP（`?version=` 指定 Tag 版本） |
-| GET | `/api/v1/skills/{skill_id}/audit` | 安全审计结果 |
-| GET | `/api/v1/skills/versions/{skill_id}` | 版本历史列表 |
-| GET | `/api/v1/health` | 健康检查 |
+所有端点前缀为 `/api/v1`，其中 `{skill_id}` 为含斜杠的完整路径（形如 `source:owner/repo/.../name`）；标"admin"的端点需 `X-Admin-Token` 鉴权。
+
+| 分组 | 方法 | 路径 | 说明 |
+|------|------|------|------|
+| 健康 | GET | `/api/v1/health` | 健康检查 |
+| 索引 | GET | `/api/v1/index/search` | 混合搜索（`mode`: text/semantic/hybrid，`scope`: summary/full，`sort_by`/`sort_period`） |
+| 索引 | GET | `/api/v1/index/stats` | 平台统计（总数/分类/平台/安全等级） |
+| 索引 | GET | `/api/v1/index/categories` | 分类列表 |
+| 技能 | GET | `/api/v1/skills/` | Skills 列表（分页/分类/平台/标签/安全等级/排序） |
+| 技能 | GET | `/api/v1/skills/telemetry` | CLI 安装遥测上报（10/min 限流，计入下载榜单） |
+| 技能 | GET | `/api/v1/skills/{skill_id}` | Skill 详情 |
+| 技能 | POST | `/api/v1/skills/` | 创建 Skill（admin） |
+| 技能 | DELETE | `/api/v1/skills/{skill_id}` | 删除 Skill（admin） |
+| 技能 | GET | `/api/v1/skills/{skill_id}/download` | 下载 Skill ZIP（`?version=` 指定版本） |
+| 技能 | GET | `/api/v1/skills/versions/{skill_id}` | 版本历史列表 |
+| 技能 | GET | `/api/v1/skills/{skill_id}/audit` | 安全审计结果 |
+| 技能 | GET | `/api/v1/skills/{skill_id}/audit-report` | 聚合风险报告（四类风险/严重度/逐项） |
+| 技能 | POST | `/api/v1/skills/{skill_id}/audit` | 触发安全审计（admin） |
+| 技能 | POST | `/api/v1/skills/audit-by-url` | 按 git URL 一次性审计、无需入库（admin，openEuler PR 门禁用） |
+| 技能 | GET | `/api/v1/skills/audit-by-url/result` | 轮询 URL 审计结果（admin） |
+| 技能 | GET | `/api/v1/skills/audit-by-url/report` | 下载 report.md（公开） |
+| 技能 | GET | `/api/v1/skills/contributors` | 贡献者列表 |
+| 技能 | GET | `/api/v1/skills/contributors/{source}/{author}` | 单个贡献者的 Skills |
+| Agent | GET | `/api/v1/agents/` | Agent 列表 |
+| Agent | GET | `/api/v1/agents/{agent_id}` | Agent 详情 |
+
+> 全量向量重索引不再通过 HTTP 端点暴露，由 worker/管理脚本承担（原 `POST /api/v1/index/reindex` 已移除）。
 
 ### 8.2 CLI 命令（`wittyhub` npm 包）
 
@@ -879,7 +929,7 @@ curl -X POST http://localhost:8081/api/v1/index/reindex
 
 | 命令 | 说明 |
 |------|------|
-| `discover` | 扫描配置仓库，发现 Skill、计算 tree hash、触发安全审计 |
+| `discover` | 扫描配置仓库（默认）或单个 skill.yaml（`--url`），发现 Skill、计算 tree hash、触发安全审计 |
 | `query` | 查询技能仓库状态 |
 | `delete` | 删除技能仓库记录 |
 | `popularity` | 更新仓库 stars/forks/watchers 等热度指标 |
@@ -890,9 +940,13 @@ curl -X POST http://localhost:8081/api/v1/index/reindex
 
 ### 9.1 已落地
 
-| 优先级 | 功能 | 说明 | 状态 |
-|--------|------|------|------|
-| P1 | 爬虫自动发现 | skillcrawler discover 扫描 GitHub/AtomGit/Gitee，自动入库 | 已实现 |
+| 优先级 | 功能 | 说明 |
+|--------|------|------|
+| P0 | 混合检索 | 全文 + 向量 + RRF，含归一化向量余弦相似度、HNSW 索引 |
+| P0 | 多级安全检测 | SkillSpector 深度扫描 + LLM 误报复核 + license 合规核查 |
+| P1 | 爬虫自动发现 | skillcrawler discover 扫描 GitHub/AtomGit/Gitee，自动入库 |
+| P1 | 独立后台进程 | worker 承载迁移、discover 调度、license 清理、LLM 复核 |
+| P2 | LLM 分类/翻译 | 模型 provider 驱动的分类与查询翻译 |
 
 ### 9.2 待实现
 
@@ -900,6 +954,7 @@ curl -X POST http://localhost:8081/api/v1/index/reindex
 |--------|------|------|
 | P2 | 标签页浏览 | `/tags` 端点 + 前端标签页 |
 | P2 | 开发者页 | 按 author 聚合 Skill 列表 |
+| P2 | 独立排行榜页 | 列表已支持下载量排序，独立 `/skills/leaderboard` 页待开发 |
 | P3 | CLI 离线索引 | 本地缓存索引，无网络时搜索 |
 
 ---
@@ -917,7 +972,8 @@ curl -X POST http://localhost:8081/api/v1/index/reindex
 | RRF | Reciprocal Rank Fusion，多路排序融合算法 |
 | zhcfg | 中英文混合全文搜索配置 |
 | BGE | BAAI General Embedding，中文语义向量模型 |
-| SkillSpector | NVIDIA 开源的 Agent Skills 供应链安全扫描器，通过 Jenkins Job 执行 |
+| HNSW | pgvector 的近似最近邻索引，加速向量检索 |
+| SkillSpector | NVIDIA 开源的 Agent Skills 供应链安全扫描器，由常驻 Jenkins 服务执行 |
 
 ### B. 关键源码索引
 
@@ -927,9 +983,15 @@ curl -X POST http://localhost:8081/api/v1/index/reindex
 | Embedding 编码 | `src/ai/embedding.py` |
 | 搜索 API + 重索引 | `src/api/routes/index.py` |
 | 下载 ZIP 打包 | `src/storage/downloader.py` |
+| LLM 分类/翻译 | `src/ai/llm.py`、`src/ai/category_classifier.py`、`src/ai/translation.py` |
 | 数据访问层 | `src/models/repository.py` |
 | ORM 模型 | `src/models/orm.py` |
+| 配置/DB/鉴权/限流 | `src/core/config.py`、`src/core/database.py`、`src/core/auth.py`、`src/core/rate_limit.py` |
+| 后台 worker | `src/jobs/worker.py`（含 discover 调度、license 清理、LLM 复核） |
+| Skill 领域 | `src/skills/skill_manager.py`、`src/skills/skill_scanner.py`、`src/skills/license/` |
+| 安全 LLM 复核 | `src/security/audit_review/` |
 | 技能爬取 | `skillcrawler/main.py` |
 | Docker 编排 | `deploy/compose.yaml`（生产）和 `deploy/compose.override.yaml`（默认开发覆盖） |
+| SkillSpector 镜像 | `deploy/skillspector/` |
 | Nginx 配置 | `deploy/web/nginx.conf` |
-| 数据库迁移 | `migrations/versions/` |
+| 数据库迁移 | `migrations/versions/`（001~014） |
