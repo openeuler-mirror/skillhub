@@ -12,7 +12,11 @@ from typing import TYPE_CHECKING, Any
 from pydantic import BaseModel
 from sqlalchemy import update
 
-from src.skills.config import CATALOG_PLATFORMS, load_contributor_profiles
+from src.skills.config import (
+    CATALOG_PLATFORMS,
+    count_malformed_catalog_files,
+    load_contributor_profiles,
+)
 from src.ai.category_classifier import (
     CategoryClassificationError,
     DeepSeekCategoryClassifier,
@@ -42,6 +46,12 @@ if TYPE_CHECKING:
 
 _logger = logging.getLogger(__name__)
 settings = get_settings()
+
+# catalog 同步删除的安全护栏：防止 catalog 解析异常（空/损坏）导致误删数据库。
+# - 期望仓库为空（catalog 可能被清空/损坏）时跳过删除；
+# - 拟删除数量超过绝对阈值或占比阈值时拒绝删除并要求人工确认。
+MAX_CATALOG_REMOVAL_COUNT = 10
+MAX_CATALOG_REMOVAL_RATIO = 0.5
 
 
 class SkillRepositoryRequest(BaseModel):
@@ -416,6 +426,19 @@ class SkillManager:
         软关联由 ``delete_skill_repositories`` 清理；删除后重算 contributors
         .skill_count 并清理名下已无 skill 的孤儿作者。
         """
+        # 保守守卫：catalog 存在解析失败（损坏/空/非 dict）的 skill.yaml 时，
+        # 无法区分「真被删除」与「解析失败漏读」，跳过删除以免误删。
+        if self.catalog_path is not None:
+            skipped_files = count_malformed_catalog_files(self.catalog_path)
+            if skipped_files > 0:
+                _logger.warning(
+                    '[Discover] catalog removal sync skipped: %d malformed/unparsable '
+                    'skill.yaml file(s) in catalog; refusing to delete repos to avoid '
+                    'false removal',
+                    skipped_files,
+                )
+                return 0
+
         expected_keys: set[tuple[str, str | None, str]] = set()
         for request in requests:
             if request.platform not in CATALOG_PLATFORMS:
@@ -429,6 +452,17 @@ class SkillManager:
                 )
             )
 
+        # 守卫 1：catalog 未解析出任何期望仓库时跳过删除。
+        # catalog 空/损坏（或 personal/ 目录整目录丢失）会把 requests 降级为空，
+        # 此时差集会把库中所有 catalog 仓库误判为「已消失」，必须拦下。
+        if not expected_keys:
+            _logger.warning(
+                '[Discover] catalog removal sync skipped: no catalog repos parsed '
+                '(requests=%d); catalog may be empty or corrupt, refusing to delete',
+                len(requests),
+            )
+            return 0
+
         repos = await self.skill_repo_repository.list_skill_repositories()
         removed = [
             repo for repo in repos
@@ -436,6 +470,24 @@ class SkillManager:
             and (repo.platform, repo.author, repo.repo_name) not in expected_keys
         ]
         if not removed:
+            return 0
+
+        # 守卫 2：拟删除数量超过绝对阈值或占比阈值时拒绝删除并要求人工确认，
+        # 防止 catalog 大面积骤降（解析异常）导致一次性误删大量仓库。
+        catalog_total = sum(1 for r in repos if r.platform in CATALOG_PLATFORMS)
+        removal_count = len(removed)
+        if removal_count > MAX_CATALOG_REMOVAL_COUNT or (
+            catalog_total > 0 and removal_count / catalog_total > MAX_CATALOG_REMOVAL_RATIO
+        ):
+            _logger.error(
+                '[Discover] catalog removal sync aborted: %d repo(s) exceed safety '
+                'threshold (max_count=%d, max_ratio=%.0f%%, catalog_total=%d); '
+                'refusing to delete, manual review required',
+                removal_count,
+                MAX_CATALOG_REMOVAL_COUNT,
+                MAX_CATALOG_REMOVAL_RATIO * 100,
+                catalog_total,
+            )
             return 0
 
         removed_ids = [repo.id for repo in removed]
@@ -474,6 +526,19 @@ class SkillManager:
         在这里跳过——它是全量扫描，store 的 diff 已覆盖。
         返回删除的 skill 行数。
         """
+
+        # 保守守卫：catalog 存在解析失败的 skill.yaml 时跳过删除，避免因
+        # 部分贡献条目漏读而误删仍应保留的单 Skill。
+        if self.catalog_path is not None:
+            skipped_files = count_malformed_catalog_files(self.catalog_path)
+            if skipped_files > 0:
+                _logger.warning(
+                    '[Discover] catalog removal sync skipped: %d malformed/unparsable '
+                    'skill.yaml file(s) in catalog; refusing to delete revoked skills',
+                    skipped_files,
+                )
+                return 0
+
         deleted = 0
         for request in requests:
             if not request.skill_paths:
