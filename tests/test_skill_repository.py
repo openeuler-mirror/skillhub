@@ -391,7 +391,7 @@ class TestSkillRepositoryUnit:
 
         _git(tmp_path, "init")
         _git(tmp_path, "config", "user.email", "tests@example.com")
-        _git(tmp_path, "config", "user.name", "WittyHub Tests")
+        _git(tmp_path, "config", "user.name", "SkillHub Tests")
         _git(tmp_path, "add", ".")
         _git(tmp_path, "commit", "-m", "add excluded skills")
 
@@ -409,7 +409,7 @@ class TestSkillRepositoryUnit:
 
         _git(tmp_path, "init")
         _git(tmp_path, "config", "user.email", "tests@example.com")
-        _git(tmp_path, "config", "user.name", "WittyHub Tests")
+        _git(tmp_path, "config", "user.name", "SkillHub Tests")
         _git(tmp_path, "add", ".")
         _git(tmp_path, "commit", "-m", "add skills")
 
@@ -436,7 +436,7 @@ class TestSkillRepositoryUnit:
 
         _git(tmp_path, "init")
         _git(tmp_path, "config", "user.email", "tests@example.com")
-        _git(tmp_path, "config", "user.name", "WittyHub Tests")
+        _git(tmp_path, "config", "user.name", "SkillHub Tests")
         _git(tmp_path, "add", ".")
         _git(tmp_path, "commit", "-m", "add skills")
 
@@ -702,7 +702,7 @@ repositories:
         repository.mkdir()
         _git(repository, "init")
         _git(repository, "config", "user.email", "tests@example.com")
-        _git(repository, "config", "user.name", "WittyHub Tests")
+        _git(repository, "config", "user.name", "SkillHub Tests")
 
         skill_dir = repository / "skills" / "a"
         skill_dir.mkdir(parents=True)
@@ -758,7 +758,7 @@ repositories:
         repository.mkdir()
         _git(repository, "init")
         _git(repository, "config", "user.email", "tests@example.com")
-        _git(repository, "config", "user.name", "WittyHub Tests")
+        _git(repository, "config", "user.name", "SkillHub Tests")
 
         tagged_dir = repository / "skill"
         tagged_dir.mkdir(parents=True)
@@ -834,7 +834,7 @@ repositories:
         repository.mkdir()
         _git(repository, "init")
         _git(repository, "config", "user.email", "tests@example.com")
-        _git(repository, "config", "user.name", "WittyHub Tests")
+        _git(repository, "config", "user.name", "SkillHub Tests")
 
         skill_dir = repository / "skills" / "skill-1"
         skill_dir.mkdir(parents=True)
@@ -895,7 +895,7 @@ repositories:
         repository.mkdir()
         _git(repository, "init")
         _git(repository, "config", "user.email", "tests@example.com")
-        _git(repository, "config", "user.name", "WittyHub Tests")
+        _git(repository, "config", "user.name", "SkillHub Tests")
 
         skill_dir = repository / "skills" / "skill-1"
         skill_dir.mkdir(parents=True)
@@ -972,7 +972,7 @@ repositories:
         repository.mkdir()
         _git(repository, "init")
         _git(repository, "config", "user.email", "tests@example.com")
-        _git(repository, "config", "user.name", "WittyHub Tests")
+        _git(repository, "config", "user.name", "SkillHub Tests")
 
         skill_dir = repository / "skills" / "skill-1"
         skill_dir.mkdir(parents=True)
@@ -1043,7 +1043,7 @@ repositories:
         repository.mkdir()
         _git(repository, "init")
         _git(repository, "config", "user.email", "tests@example.com")
-        _git(repository, "config", "user.name", "WittyHub Tests")
+        _git(repository, "config", "user.name", "SkillHub Tests")
 
         # commit 1: 仅 skill-1（无 version）
         skill1_dir = repository / "skills" / "skill-1"
@@ -1137,7 +1137,7 @@ repositories:
         repository.mkdir()
         _git(repository, "init")
         _git(repository, "config", "user.email", "tests@example.com")
-        _git(repository, "config", "user.name", "WittyHub Tests")
+        _git(repository, "config", "user.name", "SkillHub Tests")
 
         skill_dir = repository / "skills" / "my-skill"
         skill_dir.mkdir(parents=True)
@@ -1192,7 +1192,7 @@ repositories:
         repository.mkdir()
         _git(repository, "init")
         _git(repository, "config", "user.email", "tests@example.com")
-        _git(repository, "config", "user.name", "WittyHub Tests")
+        _git(repository, "config", "user.name", "SkillHub Tests")
 
         skill_dir = repository / "skills" / "my-skill"
         skill_dir.mkdir(parents=True)
@@ -1243,7 +1243,7 @@ repositories:
         repository.mkdir()
         _git(repository, "init")
         _git(repository, "config", "user.email", "tests@example.com")
-        _git(repository, "config", "user.name", "WittyHub Tests")
+        _git(repository, "config", "user.name", "SkillHub Tests")
 
         skill_dir = repository / "skills" / "production-skill"
         skill_dir.mkdir(parents=True)
@@ -1312,7 +1312,7 @@ repositories:
         repository.mkdir()
         _git(repository, "init")
         _git(repository, "config", "user.email", "tests@example.com")
-        _git(repository, "config", "user.name", "WittyHub Tests")
+        _git(repository, "config", "user.name", "SkillHub Tests")
 
         fixtures = {
             "with-both": (
@@ -2333,7 +2333,7 @@ class TestGitOperationsTags:
         path.mkdir(parents=True)
         _git(path, "init")
         _git(path, "config", "user.email", "tests@example.com")
-        _git(path, "config", "user.name", "WittyHub Tests")
+        _git(path, "config", "user.name", "SkillHub Tests")
 
     def test_tag_sort_key_orders_versions_naturally(self):
 
@@ -2615,7 +2615,7 @@ class TestGitOperationsMaterialize:
         path.mkdir(parents=True)
         _git(path, "init")
         _git(path, "config", "user.email", "tests@example.com")
-        _git(path, "config", "user.name", "WittyHub Tests")
+        _git(path, "config", "user.name", "SkillHub Tests")
 
     def test_materialize_skill_objects_fetches_missing_blobs(self, tmp_path):
 
@@ -3247,7 +3247,7 @@ class TestSkillUrlContribution:
         repository.mkdir()
         _git(repository, "init")
         _git(repository, "config", "user.email", "tests@example.com")
-        _git(repository, "config", "user.name", "WittyHub Tests")
+        _git(repository, "config", "user.name", "SkillHub Tests")
 
         for name in ("one", "two"):
             skill_dir = repository / "skills" / name

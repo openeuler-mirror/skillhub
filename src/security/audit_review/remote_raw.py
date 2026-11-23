@@ -1,6 +1,6 @@
-"""Remote raw-file adapters for the git hosts used by WittyHub.
+"""Remote raw-file adapters for the git hosts used by SkillHub.
 
-Only hosts that WittyHub actually stores are supported: GitHub, GitCode,
+Only hosts that SkillHub actually stores are supported: GitHub, GitCode,
 GitLab and Gitee.  Raw URLs are built from a validated :class:`RepoRef`
 instead of being taken from the database, so the request host is always one
 of a fixed allow-list.  Credentials, explicit ports, query strings and

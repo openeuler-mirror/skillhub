@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# WittyHub CLI 一键安装脚本
+# SkillHub CLI 一键安装脚本
 #
 # 用法:
 #   curl -fsSL https://skillhub.openeuler.org/install/install.sh | bash

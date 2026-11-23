@@ -9,7 +9,7 @@
 - 增量运行中，全量 fail-fast 提示稍后重试
 - 同一任务内部全量结束后的 NULL 尾扫复用已持有的锁
 
-批次三段式短事务（避免 embedding HTTP 120s 超时期间占用连接池）：
+批次三段式短事务（避免 embedding HTTP 200s 超时期间占用连接池）：
   ① 短会话读 (skill_id, 文本字段) → 关闭
   ② 无 DB 连接调 embedding 服务批量编码
   ③ 短会话按 skill_id 排序批量 UPDATE → commit → 关闭（排序写消除并发批间死锁）

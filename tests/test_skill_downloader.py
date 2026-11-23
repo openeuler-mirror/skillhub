@@ -29,7 +29,7 @@ def _create_git_repository(tmp_path: Path) -> tuple[Path, str]:
     repository.mkdir()
     _git(repository, "init")
     _git(repository, "config", "user.email", "tests@example.com")
-    _git(repository, "config", "user.name", "WittyHub Tests")
+    _git(repository, "config", "user.name", "SkillHub Tests")
 
     skill_directory = repository / "packages" / "skills" / "clean-code"
     references = skill_directory / "references"
