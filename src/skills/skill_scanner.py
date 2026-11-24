@@ -2,7 +2,7 @@
 
 扫描阶段除元数据、分类与安全审计外，还在 ``license_checker`` 可用时做一次
 license 预检，把 ``license`` / ``license_compliant`` 随记录一起交给仓储层；
-checker 不可用时跳过预检，由 license 定时任务后续兜底。
+checker 不可用时跳过预检，字段保持原值，等待下一轮扫描回填。
 """
 
 from __future__ import annotations
@@ -78,7 +78,7 @@ class SkillScanner:
         self.security_async_mode = security_async_mode
         # license 预检 checker：由 SkillManager 在一轮 discover 内复用。
         # - 为 None（清单不可用 / license_check 关闭 / 测试）时跳过预检，
-        #   两个 license 字段保持 NULL，由后续 license 定时任务兜底；
+        #   两个 license 字段保持原值，等待下一轮扫描回填；
         # - 同一 round 内复用可共享目录级 LICENSE 缓存和本地 clone 物化缓存。
         self.license_checker = license_checker
         # Per-scan security cache statistics (reset at the start of each scan_repo)
@@ -577,8 +577,7 @@ class SkillScanner:
         security_elapsed = time.perf_counter() - security_started_at
 
         # license 预检：在 discover 扫描阶段同步完成一次判定，使新入库/内容
-        # 变化的 skill 立即可见 license 类型与合规结论，而不必等当天的
-        # license 定时任务全量复核（后者仍会兜底修正/补齐）。
+        # 变化的 skill 立即带有 license 类型与合规结论。
         license_started_at = time.perf_counter()
         license_type, license_flag, license_checked = await self._resolve_license_result(
             repo=repo,
@@ -625,7 +624,7 @@ class SkillScanner:
         setattr(record, '_security_audit_attempted', security.audit_attempted)
         # 标记本轮是否真正得到确定结论：Repository 更新既有行时据此决定
         # 是否覆盖 license/license_compliant。未检查时保留数据库原值，
-        # 防止基础设施问题清空历史结论（与定时任务的口径一致）。
+        # 防止基础设施问题清空历史结论。
         setattr(record, '_license_checked', license_checked)
         assemble_elapsed = time.perf_counter() - assemble_started_at
         total_elapsed = time.perf_counter() - scan_started_at
@@ -670,16 +669,14 @@ class SkillScanner:
         - 判定成功：返回具体的 SPDX 表达式与三态结论，``checked=True``；
         - 单条判定异常：``(None, None, False)``，不写库、不误判为 0。
 
-        与 license 定时任务共用 ``LicenseChecker`` / ``verdict_to_flag`` /
-        ``verdict_to_license``，保证两条链路的判定口径完全一致。区别只在
-        调度：discover 只覆盖本轮扫描到的 skill，定时任务负责全量兜底。
+        与 license 运行时共用 ``LicenseChecker`` / ``verdict_to_flag`` /
+        ``verdict_to_license``，判定口径与后续其他入口保持一致。
 
         缓存：同一仓库内按 ``(skill_dir, 归一化 declared)`` 复用结论，
         避免同一 skill 的 latest 行与多个 tag 版本重复扫描目录。
 
         说明：``checker.check`` 使用仓库 HEAD 的 license 文件；tag 版本行的
-        ``declared`` 来自该 tag 的 SKILL.md。声明缺失时文件回退以 HEAD 为准，
-        这与 license 定时任务当前的文件树口径一致。
+        ``declared`` 来自该 tag 的 SKILL.md。声明缺失时文件回退以 HEAD 为准。
         """
         if self.license_checker is None:
             return None, None, False
@@ -706,7 +703,7 @@ class SkillScanner:
             license_type = verdict_to_license(result.verdict)
             flag = verdict_to_flag(result.verdict.status)
         except Exception:
-            # 单条预检失败不影响 skill 入库：保持 NULL/原值，交给定时任务重试
+            # 单条预检失败不影响 skill 入库：保持 NULL/原值，等待下一轮重试
             _logger.warning(
                 '[Discover] license pre-check failed: skill_dir=%s repo=%s',
                 skill_dir,

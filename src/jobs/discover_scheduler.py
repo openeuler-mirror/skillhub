@@ -57,11 +57,6 @@ class DiscoverScheduler:
         self._tz = resolve_timezone(config.timezone)
         # 首轮扫描结束信号：供依赖 discover 首轮完成的后台任务（如 LLM 审核）等待。
         self.first_round_done = asyncio.Event()
-        # 轮次序号 + 条件变量：供“每轮 discover 完成后都要触发”的下游任务
-        # （如 license 全量复核）消费。相比 asyncio.Event，序号可以区分
-        # “首轮完成”和“又完成了一轮”，不会因事件已置位而漏掉后续轮次。
-        self.round_seq = 0
-        self._round_condition = asyncio.Condition()
 
     def _now(self) -> datetime:
         """当前时刻（带配置时区），触发点计算统一走这里。"""
@@ -93,7 +88,7 @@ class DiscoverScheduler:
         """停止调度循环并等待后台任务退出。
 
         取消可能落在 ``run_discover_once`` 或两轮之间的 sleep 上；无论哪种，
-        ``_loop`` 的 finally 都会释放等待方并推进轮次序号，下游不会被挂起。
+        ``_loop`` 的 finally 都会置位首轮完成信号，等待方不会被挂起。
         """
         self._running = False
         if self._task is not None:
@@ -120,13 +115,8 @@ class DiscoverScheduler:
                 logger.exception("%s round failed", LOG_PREFIX)
             finally:
                 # 首轮（无论成功/异常/被取消）一旦结束即释放等待者；
-                # Event.set 幂等，后续每轮重复设置无副作用。先置位再通知
-                # 轮次，保证即使任务在通知期间被取消，首轮等待方也不会挂起。
+                # Event.set 幂等，后续每轮重复设置无副作用。
                 self.first_round_done.set()
-                # 无论本轮成功/异常，都要推进轮次序号并唤醒等待者：
-                # license 复核等下游任务只关心“扫描已结束、本地 clone 已就绪”，
-                # 不应因单轮扫描失败而永久阻塞。
-                await self._notify_round_finished()
             if not self._running:
                 return
 
@@ -146,33 +136,6 @@ class DiscoverScheduler:
                 await asyncio.sleep(wait_seconds)
             except asyncio.CancelledError:
                 return
-
-    async def _notify_round_finished(self) -> None:
-        """推进轮次序号并唤醒所有等待下一轮的下游任务。"""
-        async with self._round_condition:
-            self.round_seq += 1
-            self._round_condition.notify_all()
-
-    async def wait_for_new_round(self, last_seq: int = -1) -> int:
-        """等待“比 ``last_seq`` 更新的一轮 discover”完成，返回新的轮次序号。
-
-        供 license 复核等下游任务串行消费：
-
-        - 启动时若已有轮次完成（例如 worker 先等 ``first_round_done`` 再启动
-          license），``round_seq >= 1`` 会立即返回，不会错过首轮；
-        - 消费后再次调用需要传入刚返回的序号，从而阻塞到下一轮结束，
-          天然实现“license 在 discover 之后执行”。
-
-        使用 ``asyncio.Condition`` 而不是 Event：Event 只有置位/清除两态，
-        多轮之间会合并信号或出现清除竞态；条件变量按序号判断，语义明确。
-        """
-        async with self._round_condition:
-            # 0 表示“还没有任何轮次完成”，不能因为 -1 < 0 就提前返回；
-            # 因此下界取 max(last_seq, 0)，至少等到第一轮真正结束。
-            await self._round_condition.wait_for(
-                lambda: self.round_seq > max(last_seq, 0)
-            )
-            return self.round_seq
 
     async def run_discover_once(self) -> dict[str, int]:
         """执行一轮 discover（全部配置仓库），返回分类统计。

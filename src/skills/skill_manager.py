@@ -102,7 +102,7 @@ class SkillManager:
         default=None, init=False, repr=False
     )
     # 是否已经尝试过初始化（无论成功与否）：避免每个仓库都重复拉取准入
-    # 清单；初始化失败也置 True，本轮统一跳过预检，等 license 任务兜底。
+    # 清单；初始化失败也置 True，本轮统一跳过预检，等下一轮扫描回填。
     _license_checker_ready: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -153,7 +153,7 @@ class SkillManager:
         - **每轮复用**：checker 内部有目录级 LICENSE 缓存与本地 clone 物化
           缓存，跨仓库/跨 skill 复用可以显著降低大仓库的重复 I/O。
         - **失败降级**：清单不可用（网络抖动）时返回 None，扫描照常入库，
-          license 字段保持 NULL，由后续 license 定时任务补齐；不能让 license
+          license 字段保持 NULL，等待下一轮扫描回填；不能让 license
           预检失败阻断 discover 主流程。
         """
         if self._license_checker_ready:
@@ -367,7 +367,7 @@ class SkillManager:
     ) -> SkillRepoModel:
         author = author or self._resolve_skill_author(repo.platform, repo_name)
         # 本轮 discover 第一次扫描仓库前构建/复用 license checker；不可用时
-        # 返回 None，SkillScanner 自动跳过预检（字段留空，定时任务兜底）。
+        # 返回 None，SkillScanner 自动跳过预检（字段留空，等待下一轮扫描回填）。
         self._scanner.license_checker = await self._ensure_license_checker()
         latest_skills, tagged_skills, repository_commit_id = await self._discover_skills(
             repo,

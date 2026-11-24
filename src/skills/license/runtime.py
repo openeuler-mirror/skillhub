@@ -4,7 +4,7 @@
 
 1. ``build_checker`` 读取 ``Settings.license_check``，加载准入清单并创建
    ``LicenseChecker``。清单不可用时按 ``required`` 决定抛错还是返回 None；
-   定时任务使用 ``required=False``，此时本轮跳过、不写 0。
+   discover 扫描内的预检使用 ``required=False``，此时本轮跳过、不写 0。
 2. ``verdict_to_flag`` 把引擎状态映射为 ``license_compliant`` 三态：
 
    ============================  ==============
@@ -55,14 +55,14 @@ def _default_cache_path(settings: Settings) -> str:
 def build_checker(settings: Settings | None = None, *, required: bool = True) -> LicenseChecker | None:
     """按当前配置构建 checker。
 
-    :param settings: 显式传入配置（测试/任务），默认使用进程级 ``get_settings()``
+    :param settings: 显式传入配置（测试等），默认使用进程级 ``get_settings()``
     :param required:
         - ``True``：清单不可用时抛 ``LicenseListUnavailableError``；
         - ``False``：清单不可用时返回 ``None``，由调用方跳过本轮。
-          定时任务必须用 ``False``，否则网络波动会导致整轮任务失败。
+          discover 预检必须用 ``False``，否则网络波动会导致整轮扫描失败。
     :return: 可复用的 ``LicenseChecker`` 或 ``None``
 
-    注意：checker 内部持有目录级 license 文件缓存，应在**一轮任务**内复用，
+    注意：checker 内部持有目录级 license 文件缓存，应在**一轮扫描**内复用，
     不要跨轮长期持有（否则仓库更新后可能读到过期缓存）。
     """
     settings = settings or get_settings()

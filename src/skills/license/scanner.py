@@ -124,7 +124,7 @@ class LicenseChecker:
       这样既不用为判定触发完整 checkout，也避免把“工作树为空”误判为
       missing（否则所有无 SKILL.md 声明的 skill 都会被写成 0）。
 
-    线程安全：判定逻辑只读共享的准入清单与缓存字典，定时任务通过
+    线程安全：判定逻辑只读共享的准入清单与缓存字典，discover 通过
     ``asyncio.to_thread`` 并发调用是安全的（缓存命中/写入均为单次 dict
     操作，最坏情况是重复计算一次）。
     """

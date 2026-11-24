@@ -302,19 +302,10 @@ class SkillRepository:
         skill_id_prefix: str | None = None,
         security_level: list[str] | None = None,
     ):
-        # license 可见性规则（与详情/搜索/下载/统计保持一致）：
-        #   1    -> 对外可见
-        #   0    -> 不合规，默认从列表过滤
-        #   NULL -> 未检查，仍对外可见（未检查不等于不合规）
-        # 注意不能直接写 license_compliant != 0：SQL 三值逻辑会把 NULL
-        # 一并排除，必须显式 OR NULL 分支。
+        # 列表可见口径：只排除尚未完成安全审计（risk_score 为空）的 Skill。
+        # license / license_compliant 目前仅作为字段记录，不参与可见性过滤，
+        # 可见性限制策略后续统一规划。
         query = query.where(skill_model.risk_score.is_not(None))
-        query = query.where(
-            or_(
-                skill_model.license_compliant.is_(None),
-                skill_model.license_compliant == 1,
-            )
-        )
         if category:
             conditions = []
             normal_cats = []
@@ -362,15 +353,8 @@ class SkillRepository:
     def _latest_unique_skills_subquery(self):
         return (
             select(Skill)
-            # 统计口径与列表保持一致：排除未检测（risk_score 为空）和
-            # license 判定不合规（0）的 Skill；NULL 未检查仍计入。
+            # 统计口径与列表保持一致：只排除未检测（risk_score 为空）的 Skill。
             .where(Skill.risk_score.is_not(None))
-            .where(
-                or_(
-                    Skill.license_compliant.is_(None),
-                    Skill.license_compliant == 1,
-                )
-            )
             .order_by(desc(Skill.updated_at), desc(Skill.created_at))
             .subquery()
         )
@@ -738,11 +722,11 @@ class SkillRepository:
         稍后回填），同步或缓存命中则为新分。不复用旧内容的评分，避免旧分与
         新内容（新 tree_hash）误绑定。
 
-        ``license`` / ``license_compliant`` 由 discover 预检与 license 定时任务
-        共同维护，但 **只有本轮确实完成了检查时才写入**：``SkillScanner``
+        ``license`` / ``license_compliant`` 由 discover 扫描时的 license 预检
+        维护，但 **只有本轮确实完成了检查时才写入**：``SkillScanner``
         会在记录上标记 ``_license_checked``，未完成检查（准入清单不可用、
         仓库不可读等）时保留数据库原值，避免把基础设施问题写成“无 license /
-        不合规”，也避免定时任务刚写入的结论被空值覆盖。
+        不合规”。
 
         其余字段（名称、描述、版本、tree_hash、内容等）都是本次扫描的结果，
         直接使用 ``representative`` 上的新值。
@@ -779,16 +763,9 @@ class SkillRepository:
         return values
 
     async def get_versions_by_base_skill(self, source_url: str | None, skill_id: str) -> list[SkillVersion]:
+        # 版本列表不做 license 可见性过滤：license / license_compliant 仅记录。
         query = select(SkillVersion)
         query = query.where(SkillVersion.skill_id == skill_id)
-        # 版本列表与 latest 使用同一可见口径：只排除 license 判定为 0 的版本，
-        # NULL（未检查）仍返回，避免迁移后历史版本整体消失。
-        query = query.where(
-            or_(
-                SkillVersion.license_compliant.is_(None),
-                SkillVersion.license_compliant == 1,
-            )
-        )
         if source_url:
             query = query.where(SkillVersion.source_url == source_url)
         query = query.order_by(desc(SkillVersion.updated_at), desc(SkillVersion.created_at))
@@ -921,12 +898,6 @@ class SkillRepository:
             Skill.source == source,
             Skill.author == author,
             Skill.risk_score.is_not(None),
-            # contributor 列表可见口径与 Skill 列表一致：过滤 license=0，
-            # 未检查（NULL）仍计入
-            or_(
-                Skill.license_compliant.is_(None),
-                Skill.license_compliant == 1,
-            ),
         )
 
         stats_result = await self.session.execute(
@@ -1331,8 +1302,8 @@ class ContributorRepository:
         """统计贡献者名下可见 skill 数（含同 author 的其他仓库）。
 
         可见性规则与 ``SkillRepository.get_contributor_skills`` 一致：
-        ``risk_score`` 已审计非空，且 ``license_compliant`` 不为 0
-        （NULL 未检查仍计入）。同一事务内可看到本次扫描未 commit 的写入，
+        ``risk_score`` 已审计非空。license / license_compliant 仅记录，
+        不参与可见性过滤。同一事务内可看到本次扫描未 commit 的写入，
         因此扫描流程 store_skills_and_versions 之后调用即可拿到最新值。
         """
         result = await self.session.execute(
@@ -1340,10 +1311,6 @@ class ContributorRepository:
                 Skill.source == source,
                 Skill.author == author,
                 Skill.risk_score.is_not(None),
-                or_(
-                    Skill.license_compliant.is_(None),
-                    Skill.license_compliant == 1,
-                ),
             )
         )
         return int(result.scalar() or 0)
@@ -1352,11 +1319,9 @@ class ContributorRepository:
         """按 skills 表可见口径重算全部 contributors.skill_count，返回修正行数。
 
         可见性规则与 ``count_skills`` / ``get_contributor_skills`` 一致
-        （risk_score 非空、license_compliant 不为 0），与扫描 upsert 时的
-        聚合口径相同，不会在扫描与自愈之间来回翻转。license 定时任务改写
-        0/1 后也会调用本方法，避免 contributor 计数滞后于可见性变化。
-        仅更新当前值不等于聚合值的行，天然幂等；用于扫描落库后的统计自愈
-        （手工删数据、历史漂移等）。
+        （risk_score 非空），与扫描 upsert 时的聚合口径相同，不会在扫描与
+        自愈之间来回翻转。仅更新当前值不等于聚合值的行，天然幂等；用于
+        扫描落库后的统计自愈（手工删数据、历史漂移等）。
         """
         visible_count = (
             select(func.count(Skill.id))
@@ -1364,10 +1329,6 @@ class ContributorRepository:
                 Skill.source == Contributor.source,
                 Skill.author == Contributor.author,
                 Skill.risk_score.is_not(None),
-                or_(
-                    Skill.license_compliant.is_(None),
-                    Skill.license_compliant == 1,
-                ),
             )
             .scalar_subquery()
         )
@@ -1476,17 +1437,13 @@ class ContributorRepository:
                 platform_counts[p] = int(c)
 
         # Correlated subquery: total downloads across the contributor's skills
-        # 口径与 contributor 可见性一致（risk_score 非空且 license 不为 0）
+        # 口径与 contributor 可见性一致（risk_score 非空）
         downloads_sq = (
             select(func.coalesce(func.sum(Skill.download_count), 0))
             .where(
                 Skill.source == Contributor.source,
                 Skill.author == Contributor.author,
                 Skill.risk_score.is_not(None),
-                or_(
-                    Skill.license_compliant.is_(None),
-                    Skill.license_compliant == 1,
-                ),
             )
             .correlate(Contributor)
             .scalar_subquery()

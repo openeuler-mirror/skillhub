@@ -157,8 +157,8 @@ async def receive_telemetry(
 def skill_to_response(skill) -> SkillResponse:
     """把 ORM ``Skill`` 映射为 API 响应。
 
-    ``license`` / ``license_compliant`` 原样透出：服务端已在列表、详情等入口
-    按三态完成可见性过滤，这里不再二次判断，保证前端拿到的是同一份结论。
+    ``license`` / ``license_compliant`` 原样透出：两字段目前仅作为元数据记录，
+    不参与可见性过滤（可见性限制策略后续统一规划）。
     """
     return SkillResponse(
         id=str(skill.id),
@@ -247,11 +247,6 @@ async def audit_skill(
     if not skill:
         raise HTTPException(status_code=404, detail="Skill not found")
 
-    # license 可见性：与详情接口保持一致，0 返回 404；NULL 未检查仍可见。
-    # 审计接口同样不应暴露已隐藏 skill 的安全信息。
-    if skill.license_compliant == 0:
-        raise HTTPException(status_code=404, detail="Skill not found")
-
     security_service = SecurityService(db)
     audit_repo = security_service.audit_repo
     latest_audit = await audit_repo.get_latest_by_resource("skill", skill.id)
@@ -294,10 +289,6 @@ async def get_skill_audit_report(
     skill = await repo.get_by_skill_id(skill_id)
 
     if not skill:
-        raise HTTPException(status_code=404, detail="Skill not found")
-
-    # license 可见性：与详情接口保持一致，0 返回 404；NULL 未检查仍可见。
-    if skill.license_compliant == 0:
         raise HTTPException(status_code=404, detail="Skill not found")
 
     security_service = SecurityService(db)
@@ -614,14 +605,6 @@ async def get_skill_versions(
     if not latest_skill and not tagged_versions:
         raise HTTPException(status_code=404, detail="Skill not found")
 
-    # license 可见性：版本列表按每个 skill_versions 行自己的结论过滤
-    # （在 get_versions_by_base_skill 内完成）；latest 为 0 不影响历史
-    # 版本列表，避免合规的旧版本被最新版本的问题连带隐藏。
-    # 但若 latest 不合规且没有任何可见版本，与详情保持一致返回 404，
-    # 不向调用方暴露“该 skill 存在但被 license 全部拦截”。
-    if not tagged_versions and latest_skill is not None and latest_skill.license_compliant == 0:
-        raise HTTPException(status_code=404, detail="Skill not found")
-
     # 只返回 skill_versions 表的历史版本（Tag 版本），不包含 skills 表的 latest 行
     versions = list(tagged_versions) if tagged_versions else []
     source_url = (
@@ -668,12 +651,6 @@ async def download_skill(
             raise HTTPException(status_code=404, detail="Skill not found")
         resource_type = "skill"
 
-    # license 可见性：latest 与指定版本共用同一规则，只有判定为 0 才拦截；
-    # NULL 未检查仍允许下载。必须在打包/写下载记录之前判断，避免产生
-    # 不合规资源的下载计数。
-    if skill.license_compliant == 0:
-        raise HTTPException(status_code=404, detail="Skill not found")
-
     if not skill.skill_repo:
         raise HTTPException(status_code=409, detail="Skill repository metadata is missing")
 
@@ -717,12 +694,6 @@ async def get_skill(skill_id: SkillIdPath, db: AsyncSession = Depends(get_db)):
     skill = await repo.get_by_skill_id(skill_id)
 
     if not skill:
-        raise HTTPException(status_code=404, detail="Skill not found")
-
-    # license 可见性（严格模式）：只有“已检查且不合规（0）”才隐藏；
-    # NULL 表示尚未检查，不能等同于不合规，因此仍允许查看详情。
-    # 返回 404 而不是 403：不向调用方暴露“该 skill 存在但被 license 拦截”。
-    if skill.license_compliant == 0:
         raise HTTPException(status_code=404, detail="Skill not found")
 
     return skill_to_response(skill)
