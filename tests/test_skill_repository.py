@@ -181,10 +181,70 @@ class TestSkillRepositoryUnit:
         assert compiled.params["download_count"] == 12
         # 内容变化时写本次扫描实得分数（旧内容的 77 不能绑定到新 tree_hash）
         assert compiled.params["risk_score"] == 10
-        # license_compliant 由 license 任务独占维护：discover 的 UPDATE 语句
-        # 不应包含该列，避免读-改-写覆盖 license 任务刚写入的新结论。
+        # 本轮未完成 license 预检（没有 _license_checked 标记）时，UPDATE
+        # 不触碰 license 两列，保留数据库已有结论。
         assert "license_compliant" not in str(compiled)
         session.add.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_store_skills_updates_license_when_precheck_succeeded(self):
+        """discover 预检得到确定结论时，license 两列随内容更新一起落库。"""
+        repo_id = uuid.uuid4()
+        skill_id = "github:acme/example/example-skill"
+        existing = SimpleNamespace(
+            id=uuid.uuid4(),
+            skill_repo_id=repo_id,
+            skill_id=skill_id,
+            commit_id="old-commit",
+            tree_hash="old-tree",
+            download_count=12,
+            risk_score=77,
+            license="Apache-2.0",
+            license_compliant=0,
+        )
+        scanned = SimpleNamespace(
+            skill_repo_id=repo_id,
+            skill_id=skill_id,
+            name="example-skill",
+            description="Updated description",
+            version=None,
+            commit_id="new-commit",
+            tree_hash="new-tree",
+            author="acme",
+            source="github",
+            source_url="https://github.com/acme/example",
+            repo_url="https://github.com/acme/example",
+            category="Development",
+            tags=["example"],
+            platform="personal",
+            extra_metadata={},
+            content="# Updated",
+            risk_score=10,
+            license="MIT",
+            license_compliant=1,
+            rating=None,
+        )
+        # SkillScanner 在预检成功时设置的标记
+        setattr(scanned, "_license_checked", True)
+
+        existing_result = MagicMock()
+        existing_result.scalars.return_value.all.return_value = [existing]
+        versions_result = MagicMock()
+        versions_result.scalars.return_value.all.return_value = []
+        session = AsyncMock()
+        session.execute.side_effect = [existing_result, MagicMock(), versions_result]
+
+        await SkillRepository(session).store_skills_and_versions(
+            repo_id,
+            [scanned],
+            [],
+            commit=False,
+        )
+
+        update_statement = session.execute.await_args_list[1].args[0]
+        compiled = update_statement.compile(dialect=postgresql.dialect())
+        assert compiled.params["license"] == "MIT"
+        assert compiled.params["license_compliant"] == 1
 
     @pytest.mark.asyncio
     async def test_store_skills_skips_unchanged_existing_skill(self):
@@ -336,6 +396,7 @@ class TestSkillRepositoryUnit:
             extra_metadata={},
             content=None,
             risk_score=10,
+            license="MIT",
             license_compliant=1,
             download_count=3,
             _period_downloads=None,
@@ -2335,6 +2396,30 @@ class TestExtractDeclaredTags:
 
 
 class TestGitOperationsTags:
+    @pytest.mark.parametrize(
+        ("version_text", "expected"),
+        [
+            ("git version 2.32.1 (Apple Git-133)", False),
+            ("git version 2.35.9", False),
+            ("git version 2.36.0", True),
+            ("git version 2.43.0.windows.1", True),
+        ],
+    )
+    def test_fetch_refetch_version_gate(self, monkeypatch, version_text, expected):
+        """--refetch 只在 Git >= 2.36 时启用，旧版本走兼容路径。"""
+        from src.utils import git_operations
+
+        git_operations._git_supports_fetch_refetch.cache_clear()
+        monkeypatch.setattr(
+            git_operations.subprocess,
+            "run",
+            lambda *args, **kwargs: SimpleNamespace(stdout=version_text),
+        )
+        try:
+            assert git_operations._git_supports_fetch_refetch() is expected
+        finally:
+            git_operations._git_supports_fetch_refetch.cache_clear()
+
     def _init_repository(self, path: Path) -> None:
         path.mkdir(parents=True)
         _git(path, "init")
@@ -2651,23 +2736,24 @@ class TestGitOperationsMaterialize:
              f"origin", f"{older_commit}")
 
         def blobs_missing(repo: Path, ref: str, path: str) -> bool:
-            objects = _git(
-                repo, "ls-tree", "-r",
-                "--format=%(objectname) %(objecttype)", ref, "--", path,
-            ).splitlines()
-            shas = [line.split()[0] for line in objects if line.split()[1] == "blob"]
-            # Query existence without triggering a lazy fetch.
-            result = subprocess.run(
-                ["git", "-C", str(repo), "cat-file", "--batch-check"],
-                input="\n".join(shas) + "\n",
-                capture_output=True, text=True,
-                env={
-                    **os.environ,
-                    "GIT_TERMINAL_PROMPT": "0",
-                    "GIT_NO_LAZY_FETCH": "1",
-                },
-            )
-            return " missing" in result.stdout
+            objects = _git(repo, "ls-tree", "-r", ref, "--", path).splitlines()
+            shas = [
+                parts[2]
+                for line in objects
+                if len(parts := line.split("\t", 1)[0].split()) >= 3
+                and parts[1] == "blob"
+            ]
+            # ``--batch-all-objects`` 只枚举本地对象库，不会触发 promisor
+            # 懒拉取；比依赖 GIT_NO_LAZY_FETCH（Git 2.41+ 才支持）更兼容旧版本。
+            local = subprocess.run(
+                ["git", "-C", str(repo), "cat-file", "--batch-check", "--batch-all-objects"],
+                capture_output=True,
+                text=True,
+                check=True,
+                env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+            ).stdout
+            present = {line.split()[0] for line in local.splitlines() if line.strip()}
+            return any(sha not in present for sha in shas)
 
         assert blobs_missing(clone_dir, older_commit, ".agents/skills/demo")
 
@@ -2687,7 +2773,7 @@ class TestGitOperationsMaterialize:
         (tmp_path / ".git").mkdir()
         git_ops = GitOperations(github_token=None)
 
-        listing = "aaa111 blob 3\nbbb222 blob 4\nccc333 tree 1\n"
+        listing = "100644 blob aaa111\tone.md\n100644 blob bbb222\ttwo.md\n040000 tree ccc333\tsub\n"
         failure = subprocess.CalledProcessError(
             128, ["git", "cat-file", "--batch-check"],
             output="", stderr="OpenSSL SSL_connect: SSL_ERROR_SYSCALL",
@@ -2696,7 +2782,6 @@ class TestGitOperationsMaterialize:
             args=[], returncode=0,
             stdout="aaa111 blob 3\nbbb222 blob 4\n", stderr="",
         )
-
         caplog.set_level(logging.WARNING, logger="src.utils.git_operations")
         with (
             # 首次调用为 cat-file -e 存在性检查，其后为 ls-tree 列举

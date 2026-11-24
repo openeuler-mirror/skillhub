@@ -342,6 +342,7 @@ sequenceDiagram
         API->>DB: 查询 Skill + SkillRepo (skill_id)
         DB-->>API: skill, skill_repo
     end
+    API->>API: license_compliant == 0 ? 直接 404<br/>（NULL 未检查仍允许下载）
     API->>DM: create_skill_archive(skill_or_version, repository)
     DM->>DM: 从 source_url 解析 Skill 相对路径
     DM->>Git: cat-file -e commit
@@ -403,6 +404,7 @@ flowchart TD
 |------|------------|------|
 | Skill 不存在 | `404` | `skill_id` 没有对应记录 |
 | 指定版本不存在 | `404` | `skill_id` + `version` 在 `skill_versions` 表无记录 |
+| license 判定不合规 | `404` | `license_compliant == 0`，与详情/列表口径一致；`NULL`（未检查）仍允许下载 |
 | SkillRepo 缺失 | `409` | Skill 没有关联仓库信息 |
 | `local_path` 为空或不存在 | `409` | 本地仓库不可用 |
 | `local_path` 不是 Git 仓库 | `409` | 本地仓库无效 |

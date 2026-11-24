@@ -16,10 +16,18 @@ worker:
 
 1. 一次性迁移 `run_migration`
 2. discover 定时调度器（含首轮扫描）
-3. LLM 审核调度器（等待 license 清理首轮完成后启动）
+3. 下游任务：license 复核调度器与 LLM 审核调度器
 4. SkillSpector 安全采集 collector（`security.enable_audit` 开启时）
 
-时序约束：LLM 审核调度器必须等 discover 首轮扫描完成（`first_round_done` 事件）后再启动。
+时序约束：
+
+- license 复核与 LLM 审核都等待 discover 首轮扫描完成（`first_round_done`
+  事件）后再启动，两者互不依赖、并行运行；
+- license 复核此后跟随每一轮 discover：扫描结束后触发一轮全量复核，
+  避免与 discover 并发读取正在更新的本地 clone；discover 未启用时退化为
+  `license_check.start_time` 每日触发；
+- discover 扫描新入库/内容变化的 skill 时会同步完成一次 license 预检，
+  新数据的 `license` / `license_compliant` 立即可用。
 
 ## 运行
 

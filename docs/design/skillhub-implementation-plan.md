@@ -25,7 +25,7 @@ SkillHub 是一个去中心化的 Agent/Skill 检索与下载平台。平台本�
 | 单库多能力 | PostgreSQL 同时承担关系存储、全文检索（tsvector）、向量检索（pgvector） |
 | 搜索可降级 | Embedding 服务不可用时自动回退到全文搜索 |
 | 多源下载适配 | DownloadManager 基于 skillcrawler 本地克隆 `git archive` 打包，缓存复用 |
-| 安全优先 | 入库触发 SkillSpector（NVIDIA）深度扫描，叠加 LLM 误报复核与 license 合规核查，输出风险评分 |
+| 安全优先 | 入库触发 SkillSpector（NVIDIA）深度扫描，叠加 LLM 误报复核与 license 类型/三态标记，输出风险评分 |
 
 ### 1.3 技术栈
 
@@ -158,7 +158,7 @@ graph TB
 | Security LLM 复核 | `src/security/audit_review/` | SkillSpector 风险项的 LLM 误报复核 |
 | Repository | `src/models/repository.py` | 数据库 CRUD 与统计查询 |
 | Core 基础设施 | `src/core/` | 配置、数据库、鉴权、限流、调度、日志 |
-| 背景任务 | `src/jobs/` | 独立 worker 承载的迁移、discover 调度、license 清理、LLM 复核 |
+| 背景任务 | `src/jobs/` | 独立 worker 承载的迁移、discover 调度、license 复核、LLM 复核 |
 | Skills 领域 | `src/skills/` | 仓库发现、skill 解析/管理、license 判定、热度 |
 | SkillCrawler | `skillcrawler/` | 技能仓库爬取、发现、分类 |
 
@@ -209,6 +209,8 @@ erDiagram
         array tags
         vector embedding
         int risk_score
+        text license
+        smallint license_compliant
         int download_count
     }
 
@@ -235,6 +237,10 @@ erDiagram
         timestamp downloaded_at
     }
 ```
+
+`skills` 与 `skill_versions` 都包含 `license`（归一化 SPDX 表达式，可空）与
+`license_compliant`（`1` 合规 / `0` 不合规 / `NULL` 未检查）两个字段，由
+discover 预检与 license 全量复核任务共同维护。
 
 ---
 
@@ -529,7 +535,7 @@ graph TB
 | db | pgvector/pgvector:pg16 | 5432 | — | 初始化 Alembic 迁移（扩展 + 表结构） |
 | embedding | deploy/embedding/Dockerfile | 8082→8082 | — | BGE 模型，向量归一化编码，内存限制 4G，启动 ~120s |
 | api | deploy/api/Dockerfile | 8081→8081 | db + embedding + skillspector | 无状态 FastAPI，挂载根目录 config.yaml，环境变量覆盖 Docker 差异 |
-| worker | deploy/api/Dockerfile（复用镜像，命令覆盖） | — | db + embedding | 独立后台进程：一次性迁移、discover 调度、license 清理、LLM 复核、SkillSpector 采集器 |
+| worker | deploy/api/Dockerfile（复用镜像，命令覆盖） | — | db + embedding | 独立后台进程：一次性迁移、discover 调度、license 复核、LLM 复核、SkillSpector 采集器 |
 | web | deploy/web/Dockerfile（nginx） | 8080→8080 | api | 静态 SPA + `/api/` 反向代理 |
 | skillspector | deploy/skillspector/Dockerfile | 8083→8083, 50000→50000 | — | 常驻 Jenkins 服务，执行 SkillSpector 深度扫描 |
 
@@ -579,13 +585,26 @@ volumes:
 ```text
 /opt/wittyhub/
 ├── skill-repositories/      # clone 后的 Git 仓库
+├── license/                 # license 准入清单缓存
+├── license-repos/           # license 判定用的远程仓库/_local 物化缓存
 ├── download-cache/          # Skill ZIP 缓存
 └── logs/                    # skillcrawler 日志
 ```
 
 环境变量 `WITTYHUB_CONFIG` 指向配置文件路径；PostgreSQL、AI、模型、爬虫等配置均可通过 `SECTION__FIELD` 形式覆盖，例如 `POSTGRES__HOST=db`。
 
-此外，后台任务与 LLM/安全相关配置也集中在 `config.yaml`：`model.providers`（deepseek/siliconflow）供分类/翻译/LLM 复核调用，`discover_scheduler`、`audit_llm_review`、`license_audit`、`discover.license_check` 分别控制 worker 承载的定时任务。
+此外，后台任务与 LLM/安全相关配置也集中在 `config.yaml`：`model.providers`（deepseek/siliconflow）供分类/翻译/LLM 复核调用，`discover_scheduler`、`audit_llm_review`、`license_check` 分别控制 worker 承载的定时任务。
+
+license 相关说明：
+
+- discover 扫描新入库/内容变化的 skill 时会同步执行一次 license 预检，写入
+  `skills` / `skill_versions` 的 `license`（SPDX 表达式）与
+  `license_compliant`（1/0/NULL）字段；
+- license 全量复核任务在每轮 discover 结束后触发，负责补齐历史 NULL、跟随准入
+  清单更新结论与回收缓存，只标记不删除；
+- API 可见性：`license_compliant=0` 从列表/搜索/下载/详情中过滤，`NULL`
+  （未检查）仍可见；
+- `license_check.start_time` 仅在 `discover_scheduler.enabled=false` 时生效。
 
 #### 4.3.7 一键部署
 
@@ -943,9 +962,9 @@ curl -X POST http://localhost:8081/api/v1/index/reindex
 | 优先级 | 功能 | 说明 |
 |--------|------|------|
 | P0 | 混合检索 | 全文 + 向量 + RRF，含归一化向量余弦相似度、HNSW 索引 |
-| P0 | 多级安全检测 | SkillSpector 深度扫描 + LLM 误报复核 + license 合规核查 |
-| P1 | 爬虫自动发现 | skillcrawler discover 扫描 GitHub/AtomGit/Gitee，自动入库 |
-| P1 | 独立后台进程 | worker 承载迁移、discover 调度、license 清理、LLM 复核 |
+| P0 | 多级安全检测 | SkillSpector 深度扫描 + LLM 误报复核 + license 类型/三态标记（只标记不删除） |
+| P1 | 爬虫自动发现 | skillcrawler discover 扫描 GitHub/AtomGit/Gitee，自动入库并同步 license 预检 |
+| P1 | 独立后台进程 | worker 承载迁移、discover 调度、license 复核、LLM 复核 |
 | P2 | LLM 分类/翻译 | 模型 provider 驱动的分类与查询翻译 |
 
 ### 9.2 待实现
@@ -987,11 +1006,11 @@ curl -X POST http://localhost:8081/api/v1/index/reindex
 | 数据访问层 | `src/models/repository.py` |
 | ORM 模型 | `src/models/orm.py` |
 | 配置/DB/鉴权/限流 | `src/core/config.py`、`src/core/database.py`、`src/core/auth.py`、`src/core/rate_limit.py` |
-| 后台 worker | `src/jobs/worker.py`（含 discover 调度、license 清理、LLM 复核） |
+| 后台 worker | `src/jobs/worker.py`（含 discover 调度、license 复核、LLM 复核） |
 | Skill 领域 | `src/skills/skill_manager.py`、`src/skills/skill_scanner.py`、`src/skills/license/` |
 | 安全 LLM 复核 | `src/security/audit_review/` |
 | 技能爬取 | `skillcrawler/main.py` |
 | Docker 编排 | `deploy/compose.yaml`（生产）和 `deploy/compose.override.yaml`（默认开发覆盖） |
 | SkillSpector 镜像 | `deploy/skillspector/` |
 | Nginx 配置 | `deploy/web/nginx.conf` |
-| 数据库迁移 | `migrations/versions/`（001~014） |
+| 数据库迁移 | `migrations/versions/`（001~016） |
