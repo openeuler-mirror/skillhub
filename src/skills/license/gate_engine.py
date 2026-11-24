@@ -706,7 +706,7 @@ class LicenseScanner:
 
         缓存 key 为 ``(repo_root, directory)``，负结果（空元组）也缓存，
         避免同一仓库多个 skill 向上查找时反复 iterdir 大父目录。
-        缓存生命周期与 LicenseScanner 实例一致（discover 每轮新建）。
+        缓存生命周期与 LicenseScanner 实例一致（定时任务每轮新建）。
         """
         key = (str(repo_root), str(directory))
         cached = self._license_files_cache.get(key)
