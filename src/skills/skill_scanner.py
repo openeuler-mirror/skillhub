@@ -1,4 +1,9 @@
-"""Skill scanning logic: version scan, current state scan, and record building."""
+"""Skill scanning logic: version scan, current state scan, and record building.
+
+扫描阶段除元数据、分类与安全审计外，还在 ``license_checker`` 可用时做一次
+license 预检，把 ``license`` / ``license_compliant`` 随记录一起交给仓储层；
+checker 不可用时跳过预检，由 license 定时任务后续兜底。
+"""
 
 from __future__ import annotations
 
@@ -30,9 +35,12 @@ from src.models.orm import Skill, SkillVersion
 from src.models.repository import SkillRepository
 
 from src.skills.skill_id import build_skill_id, extract_owner_repo
+from src.skills.license.gate_engine import normalize_expression
+from src.skills.license.runtime import verdict_to_flag, verdict_to_license
 
 if TYPE_CHECKING:
     from src.models.orm import SkillRepoModel
+    from src.skills.license.scanner import LicenseChecker
 
 _logger = logging.getLogger(__name__)
 
@@ -47,7 +55,12 @@ class SecurityResolution:
 
 
 class SkillScanner:
-    """Scans repositories for skills and builds skill records."""
+    """Scans repositories for skills and builds skill records.
+
+    职责：从本地 clone 读取 SKILL.md，组装 ``Skill`` / ``SkillVersion`` 记录，
+    并完成分类、安全审计与 license 预检。license 预检只是“让新数据立即可用”
+    的加速路径，不负责全量复核，也不删除任何 skill。
+    """
 
     def __init__(
         self,
@@ -56,16 +69,28 @@ class SkillScanner:
         category_classifier: DeepSeekCategoryClassifier | None = None,
         security_detector: SecurityDetector | None = None,
         security_async_mode: bool = False,
+        license_checker: LicenseChecker | None = None,
     ) -> None:
         self.git_ops = git_ops
         self.skill_repository = skill_repository
         self.category_classifier = category_classifier
         self.security_detector = security_detector
         self.security_async_mode = security_async_mode
+        # license 预检 checker：由 SkillManager 在一轮 discover 内复用。
+        # - 为 None（清单不可用 / license_check 关闭 / 测试）时跳过预检，
+        #   两个 license 字段保持 NULL，由后续 license 定时任务兜底；
+        # - 同一 round 内复用可共享目录级 LICENSE 缓存和本地 clone 物化缓存。
+        self.license_checker = license_checker
         # Per-scan security cache statistics (reset at the start of each scan_repo)
         self._security_cache_hits: int = 0
         self._security_audit_submitted: int = 0
         self._security_audit_pending: int = 0
+        # license 预检的“技能级结论复用”缓存（每次 start_scan 重置）：
+        # key=(skill_dir, 归一化 declared)，value=(license, flag, checked)。
+        # 同一 skill 的 latest 行与多个 tag 版本通常共享目录与声明，只判定一次。
+        self._license_cache: dict[
+            tuple[str, str], tuple[str | None, int | None, bool]
+        ] = {}
 
     # ── Version snapshots ──────────────────────────────────────────
 
@@ -111,6 +136,9 @@ class SkillScanner:
         self._security_cache_hits = 0
         self._security_audit_submitted = 0
         self._security_audit_pending = 0
+        # 每轮仓库扫描重新计算 license 预检结论，避免复用上一轮仓库内容变化
+        # 之前的旧结论（checker 内部的目录缓存同样只在本轮内有效）。
+        self._license_cache = {}
         if not repo_root.exists():
             raise ValueError(
                 f'Repository root does not exist for repository {repo.id}: {repo_root}'
@@ -548,6 +576,20 @@ class SkillScanner:
             merged_metadata['security_audit'] = security.audit_details
         security_elapsed = time.perf_counter() - security_started_at
 
+        # license 预检：在 discover 扫描阶段同步完成一次判定，使新入库/内容
+        # 变化的 skill 立即可见 license 类型与合规结论，而不必等当天的
+        # license 定时任务全量复核（后者仍会兜底修正/补齐）。
+        license_started_at = time.perf_counter()
+        license_type, license_flag, license_checked = await self._resolve_license_result(
+            repo=repo,
+            repo_root=repo_root,
+            relative_path=relative_path,
+            # metadata 来自 SKILL.md frontmatter，license 可能是字符串、列表
+            # 或 None；原样交给 checker，由其统一归一化与判定。
+            declared=metadata.get('license'),
+        )
+        license_elapsed = time.perf_counter() - license_started_at
+
         assemble_started_at = time.perf_counter()
         common = {
             'skill_repo_id': repo.id,
@@ -569,6 +611,11 @@ class SkillScanner:
             'extra_metadata': merged_metadata,
             'content': content or None,
             'risk_score': security.risk_score,
+            # license 字段为 None 有两种含义：本轮未完成检查（此时 flag 也为
+            # None），或已检查但未识别出具体 license（如 missing，flag=0）。
+            # 是否覆盖数据库原值由 _license_checked 决定，见下方 setattr。
+            'license': license_type,
+            'license_compliant': license_flag,
             'created_at': datetime.now(timezone.utc),
             'updated_at': datetime.now(timezone.utc),
         }
@@ -576,6 +623,10 @@ class SkillScanner:
         record = model_class(**common)
         setattr(record, '_security_audit_triggered', security.audit_triggered)
         setattr(record, '_security_audit_attempted', security.audit_attempted)
+        # 标记本轮是否真正得到确定结论：Repository 更新既有行时据此决定
+        # 是否覆盖 license/license_compliant。未检查时保留数据库原值，
+        # 防止基础设施问题清空历史结论（与定时任务的口径一致）。
+        setattr(record, '_license_checked', license_checked)
         assemble_elapsed = time.perf_counter() - assemble_started_at
         total_elapsed = time.perf_counter() - scan_started_at
         accounted_elapsed = (
@@ -583,11 +634,12 @@ class SkillScanner:
             + prepare_elapsed
             + category_elapsed
             + security_elapsed
+            + license_elapsed
             + assemble_elapsed
         )
         _logger.debug(
             '[Discover] Skill timing: skill_id=%s version=%s input=%.3fs prepare=%.3fs '
-            'category=%.3fs security=%.3fs assemble=%.3fs '
+            'category=%.3fs security=%.3fs license=%.3fs assemble=%.3fs '
             'other=%.3fs total=%.3fs',
             skill_id,
             version or 'latest',
@@ -595,11 +647,80 @@ class SkillScanner:
             prepare_elapsed,
             category_elapsed,
             security_elapsed,
+            license_elapsed,
             assemble_elapsed,
             max(0.0, total_elapsed - accounted_elapsed),
             total_elapsed,
         )
         return record
+
+    async def _resolve_license_result(
+        self,
+        *,
+        repo: SkillRepoModel,
+        repo_root: Path,
+        relative_path: str,
+        declared: Any,
+    ) -> tuple[str | None, int | None, bool]:
+        """在 discover 扫描阶段做一次 license 预检。
+
+        返回 ``(license 类型, license_compliant, 是否完成检查)``：
+
+        - checker 不可用（清单拉取失败 / 功能关闭）：``(None, None, False)``；
+        - 判定成功：返回具体的 SPDX 表达式与三态结论，``checked=True``；
+        - 单条判定异常：``(None, None, False)``，不写库、不误判为 0。
+
+        与 license 定时任务共用 ``LicenseChecker`` / ``verdict_to_flag`` /
+        ``verdict_to_license``，保证两条链路的判定口径完全一致。区别只在
+        调度：discover 只覆盖本轮扫描到的 skill，定时任务负责全量兜底。
+
+        缓存：同一仓库内按 ``(skill_dir, 归一化 declared)`` 复用结论，
+        避免同一 skill 的 latest 行与多个 tag 版本重复扫描目录。
+
+        说明：``checker.check`` 使用仓库 HEAD 的 license 文件；tag 版本行的
+        ``declared`` 来自该 tag 的 SKILL.md。声明缺失时文件回退以 HEAD 为准，
+        这与 license 定时任务当前的文件树口径一致。
+        """
+        if self.license_checker is None:
+            return None, None, False
+
+        # skill_dir 是相对仓库根的目录（SKILL.md 的父目录）；根目录下为 ""。
+        skill_dir = relative_path.rsplit('/', 1)[0] if '/' in relative_path else ''
+        # declared 可能是 str / list / None：先归一化为可哈希、跨版本稳定的
+        # SPDX 字符串，既避免 list 无法作为缓存 key，也避免大小写/空格差异
+        # 导致同一份声明被重复判定。
+        cache_key = (skill_dir, normalize_expression(declared))
+        cached = self._license_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        try:
+            # git/文件读取是阻塞调用，放线程池，避免拖慢事件循环。
+            result = await asyncio.to_thread(
+                self.license_checker.check,
+                repo.url or '',
+                str(repo_root),
+                skill_dir,
+                declared,
+            )
+            license_type = verdict_to_license(result.verdict)
+            flag = verdict_to_flag(result.verdict.status)
+        except Exception:
+            # 单条预检失败不影响 skill 入库：保持 NULL/原值，交给定时任务重试
+            _logger.warning(
+                '[Discover] license pre-check failed: skill_dir=%s repo=%s',
+                skill_dir,
+                repo.url,
+                exc_info=True,
+            )
+            return None, None, False
+
+        # 只缓存确定结论；异常结果不缓存，让其他版本/下一轮可以重试。
+        checked = flag is not None
+        resolved = (license_type, flag, checked)
+        if checked:
+            self._license_cache[cache_key] = resolved
+        return resolved
 
     async def _resolve_security_result(
         self,

@@ -4,8 +4,9 @@
 让 API 变成无状态、可多副本的纯 Web 服务：
 
 - 一次性迁移 (run_migration)
-- discover 定时调度器（含首轮扫描，audit 会等待其首轮完成）
-- LLM 审核调度器（等待 discover 首轮完成后启动）
+- discover 定时调度器（含首轮扫描）
+- license 复核调度器与 LLM 审核调度器：同属 discover 下游任务，首轮完成后
+  并行启动；license 之后跟随每轮 discover 结束自动复核
 - Skillspector 采集器（security.enable_audit 时）
 
 启用开关与异常处理与原本挂在 API lifespan 时保持一致：单任务异常只记录日志
@@ -24,6 +25,7 @@ import logging.handlers
 import signal
 import sys
 from pathlib import Path
+from typing import Any
 
 from src.ai.embedding import close_embedding_service
 from src.ai.translation import close_translation_service
@@ -133,37 +135,58 @@ async def _run_background_tasks():
     else:
         logger.info("discover_scheduler disabled, skipping discover")
 
-    # license 复核：依赖 discover 首轮完成（本地仓库已同步），启动后先全量复核
-    # 一轮，之后每天定时复核；不删除任何 skill。
+    # license 复核与 LLM 审核都是 discover 的下游任务：
+    # - 首轮扫描结束后本地 clone 与入库数据才就绪，两者都应在此之后启动；
+    # - 两者互不依赖，用 gather 并行启动，避免 license 首轮阻塞 LLM 审核
+    #   （反之亦然）。license 之后会跟随每一轮 discover 结束自动触发；
+    # - license 不删除任何 skill，只更新 license / license_compliant。
+    # 下游任务表：(显示名, 零参工厂)。license 工厂用闭包捕获 discover_scheduler，
+    # 以便后续跟随每一轮 discover 触发；audit 工厂不需要参数。
+    downstream: list[tuple[str, Any]] = []
     if settings.license_check.enabled:
-        logger.info("starting license check scheduler (waiting for discover first round)")
-        try:
-            if discover_scheduler is not None:
-                await discover_scheduler.first_round_done.wait()
-            license_scheduler = await start_license_check_scheduler()
-            logger.info("license check scheduler started")
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("license check scheduler start failed")
+        downstream.append(
+            (
+                "license check",
+                lambda: start_license_check_scheduler(discover_scheduler),
+            )
+        )
     else:
         logger.info("license_check disabled, skipping license check scheduler")
-
-    # LLM 审核调度器：依赖 migration 与 discover 首轮扫描完成后启动，
-    # 避免审核与首轮扫描并发争抢资源。
     if settings.audit_llm_review.enabled:
-        logger.info("starting audit llm review scheduler (waiting for discover first round)")
-        try:
-            if discover_scheduler is not None:
-                await discover_scheduler.first_round_done.wait()
-            audit_scheduler = await start_audit_llm_review_scheduler()
-            logger.info("audit llm review scheduler started")
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("audit llm review scheduler start failed")
+        downstream.append(
+            ("audit llm review", start_audit_llm_review_scheduler)
+        )
     else:
         logger.info("audit_llm_review disabled, skipping audit llm review scheduler")
+
+    if downstream:
+        if discover_scheduler is not None:
+            logger.info(
+                "starting downstream schedulers after discover first round: %s",
+                ", ".join(name for name, _ in downstream),
+            )
+            await discover_scheduler.first_round_done.wait()
+        # discover 未启用或启动失败时没有首轮信号可等，下游直接启动：
+        # license 会退化为“启动即跑一轮 + 每日 start_time 触发”。
+        # return_exceptions=True：单个调度器启动失败不影响另一个；CancelledError
+        # 需要单独向上抛出，保证 worker 能干净停机。
+        # gather 保持传入顺序，结果与 downstream 一一对应；按名称分派回
+        # worker 持有的引用，供 shutdown 阶段逆序停止。
+        results = await asyncio.gather(
+            *(factory() for _, factory in downstream),
+            return_exceptions=True,
+        )
+        for (name, _), result in zip(downstream, results, strict=True):
+            if isinstance(result, asyncio.CancelledError):
+                raise result
+            if isinstance(result, BaseException):
+                logger.error("%s scheduler start failed: %s", name, result)
+                continue
+            if name == "license check":
+                license_scheduler = result
+            else:
+                audit_scheduler = result
+            logger.info("%s scheduler started", name)
 
     return collector, discover_scheduler, license_scheduler, audit_scheduler
 

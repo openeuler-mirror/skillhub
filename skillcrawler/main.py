@@ -757,14 +757,19 @@ async def _main() -> int:
             catalog_path=(Path(args.repository_path).expanduser() if getattr(args, "repository_path", None) else None),
         )
 
-        if args.action == "query":
-            return await _run_query(manager, args)
-        if args.action == "discover":
-            return await _run_discover(manager, args)
-        if args.action == "delete":
-            return await _run_delete(manager, args)
-        if args.action == "popularity":
-            return await _run_popularity(manager, args)
+        try:
+            if args.action == "query":
+                return await _run_query(manager, args)
+            if args.action == "discover":
+                return await _run_discover(manager, args)
+            if args.action == "delete":
+                return await _run_delete(manager, args)
+            if args.action == "popularity":
+                return await _run_popularity(manager, args)
+        finally:
+            # discover 可能构建了 license 预检 checker（本地 clone 物化缓存），
+            # 命令结束统一释放；其他 action 未构建时 close 为空操作。
+            await manager.close()
     raise ValueError(f"Unsupported action: {args.action}")
 
 

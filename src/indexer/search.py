@@ -564,6 +564,9 @@ class SearchService:
             Skill.tags,
             Skill.platform,
             Skill.risk_score,
+            # license 类型仅用于响应展示；可见性仍由 _apply_skill_filters
+            # 按 license_compliant 三态过滤，不在 SQL 层按 license 过滤。
+            Skill.license,
             Skill.license_compliant,
             Skill.download_count,
             Skill.rating,
@@ -622,6 +625,7 @@ class SearchService:
                 "tags": row["tags"] or [],
                 "platform": row["platform"],
                 "risk_score": row["risk_score"],
+                "license": row["license"],
                 "license_compliant": row["license_compliant"],
                 "download_count": row["download_count"],
                 "rating": row["rating"],
@@ -698,10 +702,13 @@ class SearchService:
 
         where_sql = " AND ".join(where_clauses)
 
+        # 原生 SQL 分支自行列出返回列：新增字段必须与上面的 ORM 分支保持
+        # 一致，否则混合检索在不同分支返回的 SkillResponse 字段会不同。
         sql = text(f"""
             SELECT id, skill_id, name, description, version, author, source,
                    source_url, category, tags, platform,
-                   risk_score, license_compliant, download_count, rating, created_at, updated_at,
+                   risk_score, license, license_compliant, download_count, rating,
+                   created_at, updated_at,
                    embedding <-> CAST(:embedding AS vector) AS distance
             FROM skills
             WHERE {where_sql}
@@ -735,6 +742,7 @@ class SearchService:
                 "tags": row.tags or [],
                 "platform": row.platform,
                 "risk_score": row.risk_score,
+                "license": row.license,
                 "license_compliant": row.license_compliant,
                 "download_count": row.download_count,
                 "rating": row.rating,

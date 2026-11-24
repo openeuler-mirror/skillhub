@@ -1,16 +1,26 @@
-"""license 三态标记定时任务（唯一负责 license 检查与写值的入口）。
+"""license 复核定时任务（全量兜底检查与写值入口）。
 
 业务规则
 --------
-``skills`` / ``skill_versions`` 的 ``license_compliant`` 三态：
+本任务同时维护两个字段：
 
-- ``1``：已检查且合规（判定状态 allowed）
-- ``0``：已检查但不合规（restricted/black/missing/unknown）
-- ``NULL``：尚未检查，或本轮判定失败（清单不可用、仓库不可读等）
+- ``license``：本次判定得到的**具体 license 类型**（归一化 SPDX 表达式）；
+- ``license_compliant`` 三态：
+  - ``1``：已检查且合规（判定状态 allowed）
+  - ``0``：已检查但不合规（restricted/black/missing/unknown）
+  - ``NULL``：尚未检查；判定失败（清单不可用、仓库不可读等）时
+    **保留原值**（可能仍是 1/0/NULL），不会把失败写成 NULL
 
 判定以 SKILL.md 声明为准；声明缺失，或声明是无法解析的描述性占位时才
-回退 LICENSE 文件。本任务**只标记、不删除**任何数据；discover 不参与
-检查与写值。
+回退 LICENSE 文件。本任务**只标记、不删除**任何数据。
+
+与 discover 的分工
+------------------
+discover 在扫描新入库/内容变化的 skill 时会做一次内联 license 预检并写入
+两个字段，使新数据立即可用；本任务则在**每轮 discover 完成后**全量复核，
+负责：补齐历史存量、修正准入清单更新后的结论、回收缓存。两边共用同一套
+判定引擎，结论口径一致。调度上本任务排在 discover 之后，避免与扫描并发
+读取正在更新的本地 clone，也避免写-写互相覆盖。
 
 每轮流程
 --------
@@ -19,16 +29,17 @@
 3. 一次性加载全库 skills / skill_versions（含 repo 的 url/local_path）；
 4. 按仓库分组并发判定：同仓库内按 ``(skill_dir, declared)`` 复用结论，
    同一个 skill 的多个 tag 版本只判定一次；
-5. 只把结论变化的行写回（1/0），判定失败的行保持原值；
+5. 只把结论变化的行写回（license + license_compliant），失败的行保持原值；
 6. 可见性变化后重算 contributor.skill_count（口径与列表一致）；
 7. 按 ``repo.remote_cache_keep_days`` 回收本轮未使用的远程/_local 缓存。
 
 调度
 ----
-worker 在 discover 首轮完成后创建调度器：启动即跑一轮（覆盖存量/新入库
-数据），之后每天 ``license_check.start_time``（按 timezone 解释）触发。
-本任务没有固定的结束时间窗口，跑完为止；耗时主要取决于唯一 skill 目录数
-和缺失本地 clone 的仓库数量。
+worker 在 discover 首轮完成后创建调度器：启动即跑一轮，之后**跟随 discover
+轮次触发**——每轮 discover（无论成功/失败）结束后启动一轮全量复核。这样
+license 与 LLM 审核同属 discover 的下游任务，可以并行执行，又不会与扫描
+争抢同一批本地 clone。discover 调度器未启用时退化为每天
+``license_check.start_time`` 触发。本任务没有固定的结束时间窗口，跑完为止。
 """
 
 from __future__ import annotations
@@ -36,8 +47,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import select, text, update
 
@@ -47,28 +59,67 @@ from src.core.scheduling import next_daily, now_in, parse_hhmm, resolve_timezone
 from src.models.orm import Skill, SkillRepoModel, SkillVersion
 from src.models.repository import ContributorRepository
 from src.skills.license.gate_engine import normalize_expression
-from src.skills.license.runtime import build_checker, verdict_to_flag
+from src.skills.license.runtime import build_checker, verdict_to_flag, verdict_to_license
 from src.skills.license.scanner import LicenseChecker, derive_skill_dir, normalize_repo_key
+
+if TYPE_CHECKING:
+    # 仅用于类型标注：运行时通过构造参数传入，避免 jobs 模块之间形成硬依赖
+    from src.jobs.discover_scheduler import DiscoverScheduler
 
 logger = logging.getLogger(__name__)
 LOG_PREFIX = "[LicenseCheck]"
 _LOCK_KEY = 761124002
 
 
+@dataclass(slots=True)
+class LicenseRowResult:
+    """单行的判定输出。
+
+    把 ``license`` 与 ``license_compliant`` 放在同一条结果里，保证两个字段
+    来自**同一次判定**，不会出现“类型是 A、结论按 B 算出来”的错配。
+
+    :ivar row: 原始行（用于回写主键/表名与“值未变化”判断）
+    :ivar flag: license_compliant 三态；``None`` 表示本轮未完成检查
+    :ivar license: 具体 license 类型（SPDX 表达式）；无则 ``None``
+
+    不变量：``flag is None`` 时 ``license`` 必为 ``None``；调用方必须整体
+    跳过写库，不能只更新其中一个字段，否则会出现类型与结论错配。
+    """
+
+    row: dict[str, Any]
+    flag: int | None
+    license: str | None
+
+
 class LicenseCheckScheduler:
-    """license 全量复核调度器（启动即跑一轮，之后每日触发）。
+    """license 全量复核调度器（跟随 discover 轮次，或每日触发）。
 
     生命周期由 worker 管理：
 
     - ``start_license_check_scheduler`` 在 discover 首轮完成后调用 ``start``；
     - worker 关闭时调用 ``stop`` 取消后台任务。
 
-    ``first_round_done`` 在本轮（无论成功/失败）结束后置位，便于需要
-    “license 结论先就绪”的后续任务等待，但当前 worker 未阻塞 LLM 复核。
+    触发方式：
+
+    - 传入 ``discover_scheduler``（生产路径）：先等 discover 的一轮结束，
+      再执行本轮复核；之后持续等待下一轮 discover 结束。这样 license 与
+      LLM 审核等 discover 下游任务可以并行，又不会和扫描抢同一批本地 clone；
+    - 未传入（discover 关闭/单独运行）：保持旧的“启动即跑一轮 + 每日
+      ``start_time`` 触发”。
+
+    ``first_round_done`` 在每轮（无论成功/失败）结束后置位，便于需要
+    “license 结论先就绪”的后续任务等待；当前 worker 未阻塞 LLM 复核。
     """
 
-    def __init__(self, config: LicenseCheckConfig):
+    def __init__(
+        self,
+        config: LicenseCheckConfig,
+        discover_scheduler: DiscoverScheduler | None = None,
+    ):
         self._config = config
+        # discover 轮次触发器：非 None 时 license 不再按固定时钟触发，
+        # 而是每轮 discover 结束后触发一次（见 _loop）。
+        self._discover_scheduler = discover_scheduler
         # 所有定时计算都使用配置时区，避免依赖容器 TZ（线上容器通常为 UTC）
         self._tz = resolve_timezone(config.timezone)
         self._running = False
@@ -85,16 +136,23 @@ class LicenseCheckScheduler:
         return parse_hhmm(self._config.start_time)
 
     async def start(self) -> None:
-        """启动后台循环；重复调用幂等。"""
+        """启动后台循环；重复调用幂等。
+
+        跟随 discover 时 ``start_time`` 不参与调度，因此也不校验它：
+        避免一个已失效的配置（例如手工改成非法值）阻断 license 复核启动。
+        """
         if self._running:
             return
-        self._check_start_args()
+        if self._discover_scheduler is None:
+            self._check_start_args()
         self._running = True
         self._task = asyncio.create_task(self._loop())
         logger.info(
-            "%s scheduler started (start_time=%s timezone=%s)",
+            "%s scheduler started (trigger=%s timezone=%s)",
             LOG_PREFIX,
-            self._config.start_time,
+            "after each discover round"
+            if self._discover_scheduler is not None
+            else f"daily at {self._config.start_time}",
             self._config.timezone,
         )
 
@@ -111,10 +169,31 @@ class LicenseCheckScheduler:
         logger.info("%s scheduler stopped", LOG_PREFIX)
 
     async def _loop(self) -> None:
-        """先立即执行一轮，之后每天在 start_time 触发。"""
-        start = self._check_start_args()
+        """按触发方式执行复核轮次。
+
+        - 跟随 discover：``wait_for_new_round`` 返回即代表又完成了一轮扫描，
+          立即执行复核；执行完后继续等待下一轮。启动时若 discover 首轮已经
+          结束（worker 正是先等首轮再启动本调度器），序号已推进，因此会
+          立刻执行一轮，覆盖存量与本次新入库数据；
+        - 未跟随 discover：启动立即执行一轮，之后每天 ``start_time`` 触发。
+        """
+        # 只有独立运行时才需要 start_time；跟随 discover 时该值不参与调度，
+        # 用 (0, 0) 占位只为保持下面 next_daily 调用的类型一致。
+        start = (
+            self._check_start_args() if self._discover_scheduler is None else (0, 0)
+        )
+        # 已消费到的 discover 轮次序号；-1 表示还没有消费过任何一轮。
+        last_round = -1
         while self._running:
             try:
+                if self._discover_scheduler is not None:
+                    # 阻塞等待“新一轮 discover 完成”；每轮结束都会推进序号，
+                    # 因此这里天然实现“license 在 discover 之后启动”。
+                    last_round = await self._discover_scheduler.wait_for_new_round(
+                        last_round
+                    )
+                    # 先消费轮次序号再执行：若本轮复核异常，下一轮会等待
+                    # 更新的 discover 轮次，不会对同一轮立即重试形成紧循环。
                 await self.run_once()
             except asyncio.CancelledError:
                 raise
@@ -126,6 +205,10 @@ class LicenseCheckScheduler:
                 self.first_round_done.set()
             if not self._running:
                 return
+            if self._discover_scheduler is not None:
+                # 下一轮触发点是“下一次 discover 结束”，继续回到循环顶部等待，
+                # 不再按固定时钟计算；等待期间与 LLM 审核等下游任务并行。
+                continue
             now = self._now()
             next_run = next_daily(now, start)
             wait_seconds = (next_run - now).total_seconds()
@@ -239,7 +322,7 @@ class LicenseCheckScheduler:
         - ``skill_id``：仅用于日志定位（版本行的业务 ID）；
         - ``source_url``：经 ``derive_skill_dir`` 推导 skill 相对目录；
         - ``extra_metadata``：读 ``license`` 声明（SKILL.md frontmatter 解析结果）；
-        - ``license_compliant``：当前值，用于“结论未变化则不写库”；
+        - ``license`` / ``license_compliant``：当前值，用于“结论未变化则不写库”；
         - ``url`` / ``local_path``：仓库分组键与本地 clone 定位。
 
         注意：这里刻意 **不** 过滤 ``license_compliant IS NULL``。每日全量
@@ -256,6 +339,7 @@ class LicenseCheckScheduler:
                     Skill.skill_id,
                     Skill.source_url,
                     Skill.extra_metadata,
+                    Skill.license,
                     Skill.license_compliant,
                     SkillRepoModel.url,
                     SkillRepoModel.local_path,
@@ -271,6 +355,7 @@ class LicenseCheckScheduler:
                     SkillVersion.skill_id,
                     SkillVersion.source_url,
                     SkillVersion.extra_metadata,
+                    SkillVersion.license,
                     SkillVersion.license_compliant,
                     SkillRepoModel.url,
                     SkillRepoModel.local_path,
@@ -285,8 +370,8 @@ class LicenseCheckScheduler:
         self,
         checker: LicenseChecker,
         rows: list[dict[str, Any]],
-    ) -> list[tuple[dict[str, Any], int | None]]:
-        """按仓库聚合并并发判定；返回 ``(原始行, flag)`` 列表。
+    ) -> list[LicenseRowResult]:
+        """按仓库聚合并并发判定；返回带 license 类型与三态的结果列表。
 
         三级缓存/并发策略（全量复核的主要性能来源）：
 
@@ -294,13 +379,13 @@ class LicenseCheckScheduler:
            由 ``remote_concurrency`` 信号量限流。同一个仓库内串行，既避免
            同一 repo 并发 clone 冲突，也复用 checker 内的目录级 LICENSE 缓存；
         2. **技能级结论复用**：同仓库内以 ``(skill_dir, declared)`` 为键缓存
-           flag。同一 skill 的多个 tag 版本（skill_versions 多行）通常共享
-           同一目录与声明，只判定一次；
+           ``(flag, license)``。同一 skill 的多个 tag 版本（skill_versions
+           多行）通常共享同一目录与声明，只判定一次；
         3. **目录级文件缓存**：由 ``LicenseScanner`` 内部按目录缓存 LICENSE
            文件列表（含负结果），消除同仓库多 skill 反复 listing 父目录的开销。
 
-        异常处理：单条判定抛出异常时记 ``None``（未检查），调用方保持数据库
-        原值；不写 0，避免把基础设施问题误判为 license 不合规。
+        异常处理：单条判定抛出异常时结果记为 ``flag=None``（未检查），调用方
+        保持数据库原值；不写 0，避免把基础设施问题误判为 license 不合规。
         """
         # 按仓库分组：url 相同但 local_path 不同也应视为不同来源（例如本地
         # clone 更换目录后，旧行仍指向老路径），所以两者一起作为 key。
@@ -315,10 +400,11 @@ class LicenseCheckScheduler:
         async def check_group(key: tuple[str, str], items: list[dict[str, Any]]):
             """判定单个仓库内的所有行；semaphore 覆盖整个仓库的处理。"""
             repo_url, local_path = key
-            # 仓库内局部缓存：key=(skill_dir, 归一化 declared)，value=1/0/None
-            flags: dict[tuple[str, str], int | None] = {}
+            # 仓库内局部缓存：key=(skill_dir, 归一化 declared)，
+            # value=(flag, license)；两个字段必须来自同一次判定。
+            verdicts: dict[tuple[str, str], tuple[int | None, str | None]] = {}
             async with semaphore:
-                results = []
+                results: list[LicenseRowResult] = []
                 for item in items:
                     # SKILL.md frontmatter 的 license 声明（discover 解析后存
                     # 在 extra_metadata.license）。YAML 允许 list 写法
@@ -331,9 +417,10 @@ class LicenseCheckScheduler:
                     )
                     skill_dir = derive_skill_dir(item.get("source_url") or "")
                     cache_key = (skill_dir, normalize_expression(declared))
-                    if cache_key in flags:
+                    if cache_key in verdicts:
                         # 同一 skill 的其他版本/同名声明直接复用结论
-                        results.append((item, flags[cache_key]))
+                        flag, license_type = verdicts[cache_key]
+                        results.append(LicenseRowResult(item, flag, license_type))
                         continue
                     try:
                         # git/文件读取是阻塞调用，放线程池；checker 内部缓存
@@ -342,6 +429,7 @@ class LicenseCheckScheduler:
                             checker.check, repo_url, local_path, skill_dir, declared,
                         )
                         flag = verdict_to_flag(result.verdict.status)
+                        license_type = verdict_to_license(result.verdict)
                     except Exception:
                         # 未预期异常：按未检查处理（保持原值），不中断整轮
                         logger.exception(
@@ -350,12 +438,14 @@ class LicenseCheckScheduler:
                             item["skill_id"],
                             repo_url,
                         )
-                        flag = None
-                    flags[cache_key] = flag
-                    results.append((item, flag))
+                        flag, license_type = None, None
+                    # 失败结果也写入缓存：同一 (目录, 声明) 在本轮内重复检查
+                    # 通常仍会失败，缓存 None 可避免对坏仓库反复触发 git 超时。
+                    verdicts[cache_key] = (flag, license_type)
+                    results.append(LicenseRowResult(item, flag, license_type))
                 return results
 
-        results: list[tuple[dict[str, Any], int | None]] = []
+        results: list[LicenseRowResult] = []
         # asyncio.gather 保持传入顺序返回，便于结果与分组稳定对应
         groups_result = await asyncio.gather(
             *(check_group(key, items) for key, items in groups.items())
@@ -366,45 +456,54 @@ class LicenseCheckScheduler:
 
     async def _persist(
         self,
-        results: list[tuple[dict[str, Any], int | None]],
+        results: list[LicenseRowResult],
     ) -> dict[str, int]:
-        """把判定结论写回数据库；只写 1/0，None 与未变化值跳过。
+        """把判定结论写回数据库；只写有确定结论且发生变化的行。
 
         写入策略：
 
-        - ``flag is None``：判定失败，**不写库**（保留原值，可能是 1/0/NULL）；
-        - ``flag == 当前值``：跳过，减少每日全量复核的 WAL/锁开销；
-        - 其余按 ``(表, flag)`` 聚合后分批 ``UPDATE ... WHERE id IN (...)``，
-          每批独立 commit，避免长事务持有大量行锁。
+        - ``flag is None``：判定失败，**不写库**（license 与三态都保留原值，
+          可能是 1/0/NULL）；
+        - ``(flag, license) 与当前值相同``：跳过，减少每日全量复核的 WAL/锁开销；
+        - 其余按 ``(表, flag, license)`` 聚合后分批
+          ``UPDATE ... WHERE id IN (...)``，每批独立 commit，避免长事务持有
+          大量行锁。license 类型通常只有几十种取值，聚合后语句数量可控。
 
         contributor 统计自愈：``license_compliant`` 从 1 变 0 会让该 skill 从
         可见集合消失，``contributor.skill_count`` 需要同步下调；反向变化同理。
         写库完成后调用 ``reconcile_skill_counts`` 做一次全量对账（幂等）。
         """
         counters = {"compliant": 0, "non_compliant": 0, "errors": 0}
-        # pending: (表名, 目标flag) -> [主键id]
-        pending: dict[tuple[str, int], list[Any]] = {}
-        for item, flag in results:
+        # pending: (表名, 目标flag, 目标license) -> [主键id]
+        pending: dict[tuple[str, int, str | None], list[Any]] = {}
+        for result in results:
+            item, flag, license_type = result.row, result.flag, result.license
             if flag is None:
                 # 判定失败：不计入 checked，也不改库
                 counters["errors"] += 1
                 continue
             counters["compliant" if flag == 1 else "non_compliant"] += 1
-            # 结论未变化时不重复写库，降低每日全量复核的写入量
-            if item.get("license_compliant") == flag:
+            # 两个字段都未变化时才跳过：即便合规结论不变，license 类型也可能
+            # 因声明修正/文件识别改进而变化，需要同步更新。
+            if item.get("license_compliant") == flag and item.get("license") == license_type:
                 continue
-            pending.setdefault((item["table"], flag), []).append(item["id"])
+            pending.setdefault((item["table"], flag, license_type), []).append(item["id"])
 
         batch_size = max(1, self._config.batch_size)
         async with AsyncSessionLocal() as session:
-            for (table, flag), ids in pending.items():
+            for (table, flag, license_type), ids in pending.items():
                 model = Skill if table == "skills" else SkillVersion
                 for start in range(0, len(ids), batch_size):
                     chunk = ids[start:start + batch_size]
                     await session.execute(
                         update(model)
                         .where(model.id.in_(chunk))
-                        .values(license_compliant=flag)
+                        .values(
+                            license_compliant=flag,
+                            # 与三态同一次判定得到。NULL 表示已检查但未识别出
+                            # 具体 license（如 missing）；error 不会进入待写集合。
+                            license=license_type,
+                        )
                     )
                     # 每批提交：某批失败会中断后续批次，但前面已提交的保留
                     await session.commit()
@@ -463,17 +562,21 @@ class LicenseCheckScheduler:
             )
 
 
-async def start_license_check_scheduler() -> LicenseCheckScheduler | None:
+async def start_license_check_scheduler(
+    discover_scheduler: DiscoverScheduler | None = None,
+) -> LicenseCheckScheduler | None:
     """按配置创建并启动 license 复核调度器；未启用时返回 None。
 
     由 worker 在 discover 首轮完成后调用：此时新入库数据已就绪，启动即跑
-    的一轮可以覆盖存量与新数据。返回的调度器由 worker 持有，关闭时调用
-    ``stop``。
+    的一轮可以覆盖存量与新数据。传入 ``discover_scheduler`` 时，后续每轮
+    discover 完成后都会自动触发一次全量复核（与 LLM 审核等下游任务并行）；
+    不传则退化为每日 ``start_time`` 触发。返回的调度器由 worker 持有，
+    关闭时调用 ``stop``。
     """
     config = get_settings().license_check
     if not config.enabled:
         logger.info("%s disabled (license_check.enabled=false)", LOG_PREFIX)
         return None
-    scheduler = LicenseCheckScheduler(config)
+    scheduler = LicenseCheckScheduler(config, discover_scheduler=discover_scheduler)
     await scheduler.start()
     return scheduler

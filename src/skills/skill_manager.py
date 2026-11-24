@@ -31,6 +31,7 @@ from src.skills.skill_parser import (
 )
 from src.skills.skill_scanner import SkillScanner
 from src.skills.skill_id import build_skill_id, extract_owner_repo
+from src.skills.license.runtime import build_checker
 from src.core.config import get_settings
 from src.models.orm import Skill, SkillVersion
 from src.models.repository import (
@@ -43,6 +44,7 @@ from src.security.detector import SecurityDetector
 
 if TYPE_CHECKING:
     from src.models.orm import SkillRepoModel
+    from src.skills.license.scanner import LicenseChecker
 
 _logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -94,6 +96,14 @@ class SkillManager:
         init=False,
         repr=False,
     )
+    # license 预检 checker：同一轮 discover 内复用（目录缓存/本地 clone 物化
+    # 缓存跨仓库共享）；由 _ensure_license_checker 惰性构建，close() 释放。
+    _license_checker: LicenseChecker | None = field(
+        default=None, init=False, repr=False
+    )
+    # 是否已经尝试过初始化（无论成功与否）：避免每个仓库都重复拉取准入
+    # 清单；初始化失败也置 True，本轮统一跳过预检，等 license 任务兜底。
+    _license_checker_ready: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.workspace_base is None:
@@ -132,6 +142,56 @@ class SkillManager:
     async def rollback(self) -> None:
         """Restore the shared database session after a failed repository scan."""
         await self.skill_repository.session.rollback()
+
+    async def _ensure_license_checker(self) -> LicenseChecker | None:
+        """惰性构建本轮 discover 复用的 license checker。
+
+        设计取舍：
+
+        - **惰性**：不在 ``__post_init__`` 里构建，避免在事件循环中执行准入
+          清单的网络拉取；第一次真正扫描仓库时才在线程池里加载。
+        - **每轮复用**：checker 内部有目录级 LICENSE 缓存与本地 clone 物化
+          缓存，跨仓库/跨 skill 复用可以显著降低大仓库的重复 I/O。
+        - **失败降级**：清单不可用（网络抖动）时返回 None，扫描照常入库，
+          license 字段保持 NULL，由后续 license 定时任务补齐；不能让 license
+          预检失败阻断 discover 主流程。
+        """
+        if self._license_checker_ready:
+            return self._license_checker
+        # license_check.enabled=false 表示关闭 license 能力：discover 不做
+        # 预检，也不加载准入清单（避免产生网络请求）。
+        if not settings.license_check.enabled:
+            self._license_checker_ready = True
+            self._license_checker = None
+            return None
+        try:
+            self._license_checker = await asyncio.to_thread(
+                build_checker, None, required=False
+            )
+        except Exception:
+            # build_checker(required=False) 正常不会抛错；这里兜底防止实现
+            # 变化或未知异常把整个 discover 轮次打断。
+            _logger.warning(
+                '[Discover] license checker init failed; license pre-check skipped',
+                exc_info=True,
+            )
+            self._license_checker = None
+        self._license_checker_ready = True
+        return self._license_checker
+
+    async def close(self) -> None:
+        """释放本轮 discover 持有的 license 资源（临时物化目录等）。
+
+        由调度器/CLI 在一轮扫描结束时调用；失败只告警，不影响已完成的入库。
+        """
+        checker, self._license_checker = self._license_checker, None
+        self._license_checker_ready = False
+        self._scanner.license_checker = None
+        if checker is not None:
+            try:
+                await asyncio.to_thread(checker.close)
+            except Exception:
+                _logger.warning('[Discover] failed to close license checker', exc_info=True)
 
     async def create_skill_repository(
         self, normalized_request: SkillRepositoryRequest, repo_name: str,
@@ -306,6 +366,9 @@ class SkillManager:
         skill_platforms: dict[str, str] | None = None,
     ) -> SkillRepoModel:
         author = author or self._resolve_skill_author(repo.platform, repo_name)
+        # 本轮 discover 第一次扫描仓库前构建/复用 license checker；不可用时
+        # 返回 None，SkillScanner 自动跳过预检（字段留空，定时任务兜底）。
+        self._scanner.license_checker = await self._ensure_license_checker()
         latest_skills, tagged_skills, repository_commit_id = await self._discover_skills(
             repo,
             clone_dir=clone_dir,

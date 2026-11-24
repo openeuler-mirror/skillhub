@@ -738,15 +738,16 @@ class SkillRepository:
         稍后回填），同步或缓存命中则为新分。不复用旧内容的评分，避免旧分与
         新内容（新 tree_hash）误绑定。
 
-        ``license_compliant`` 由 license 定时任务独占维护，**刻意不出现在
-        更新字典中**：UPDATE 语句不触碰该列，天然保留数据库当前值。这样
-        即使 discover 读取记录后、提交更新前 license 任务刚好写入了新结论，
-        也不会被 discover 用读取时的旧值覆盖（避免读-改-写竞态）。
+        ``license`` / ``license_compliant`` 由 discover 预检与 license 定时任务
+        共同维护，但 **只有本轮确实完成了检查时才写入**：``SkillScanner``
+        会在记录上标记 ``_license_checked``，未完成检查（准入清单不可用、
+        仓库不可读等）时保留数据库原值，避免把基础设施问题写成“无 license /
+        不合规”，也避免定时任务刚写入的结论被空值覆盖。
 
         其余字段（名称、描述、版本、tree_hash、内容等）都是本次扫描的结果，
         直接使用 ``representative`` 上的新值。
         """
-        return {
+        values = {
             "skill_repo_id": representative.skill_repo_id,
             "skill_id": representative.skill_id,
             "name": representative.name,
@@ -770,6 +771,12 @@ class SkillRepository:
             "last_indexed_at": None,
             "embedding": None,
         }
+        # 只有拿到确定结论才覆盖 license 两列；两个字段必须成对写入，
+        # 避免出现“新类型 + 旧结论”的错配。
+        if getattr(representative, "_license_checked", False):
+            values["license"] = representative.license
+            values["license_compliant"] = representative.license_compliant
+        return values
 
     async def get_versions_by_base_skill(self, source_url: str | None, skill_id: str) -> list[SkillVersion]:
         query = select(SkillVersion)

@@ -59,7 +59,11 @@ class SkillResponse(SkillBase):
     content: str | None = None
     category_label: str | None = None
     risk_score: int | None = None
-    # license 合规三态（由 license 定时任务维护）：
+    # 当前 skill 实际使用的 license 类型（归一化 SPDX 表达式，如 ``MIT`` /
+    # ``MIT AND Apache-2.0``）。由 discover 预检与 license 定时任务共同维护；
+    # None 表示尚未检查或未识别出具体 license。
+    license: str | None = None
+    # license 合规三态（由 discover 预检与 license 定时任务维护）：
     #   1    = 已检查且合规
     #   0    = 已检查但不合规（默认不出现在列表/搜索结果中）
     #   None = 尚未检查或检查失败（仍可见）

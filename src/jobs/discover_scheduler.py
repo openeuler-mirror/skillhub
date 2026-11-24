@@ -57,6 +57,11 @@ class DiscoverScheduler:
         self._tz = resolve_timezone(config.timezone)
         # 首轮扫描结束信号：供依赖 discover 首轮完成的后台任务（如 LLM 审核）等待。
         self.first_round_done = asyncio.Event()
+        # 轮次序号 + 条件变量：供“每轮 discover 完成后都要触发”的下游任务
+        # （如 license 全量复核）消费。相比 asyncio.Event，序号可以区分
+        # “首轮完成”和“又完成了一轮”，不会因事件已置位而漏掉后续轮次。
+        self.round_seq = 0
+        self._round_condition = asyncio.Condition()
 
     def _now(self) -> datetime:
         """当前时刻（带配置时区），触发点计算统一走这里。"""
@@ -67,6 +72,11 @@ class DiscoverScheduler:
         return parse_hhmm(self._config.start_time)
 
     async def start(self) -> None:
+        """启动后台调度循环；重复调用幂等。
+
+        启动时会先校验 ``start_time`` 合法，再创建后台任务；首轮扫描由
+        ``_loop`` 立即执行，不等待当日触发点。
+        """
         if self._running:
             return
         self._check_start_args()
@@ -80,6 +90,11 @@ class DiscoverScheduler:
         )
 
     async def stop(self) -> None:
+        """停止调度循环并等待后台任务退出。
+
+        取消可能落在 ``run_discover_once`` 或两轮之间的 sleep 上；无论哪种，
+        ``_loop`` 的 finally 都会释放等待方并推进轮次序号，下游不会被挂起。
+        """
         self._running = False
         if self._task is not None:
             self._task.cancel()
@@ -105,8 +120,13 @@ class DiscoverScheduler:
                 logger.exception("%s round failed", LOG_PREFIX)
             finally:
                 # 首轮（无论成功/异常/被取消）一旦结束即释放等待者；
-                # Event.set 幂等，后续每轮重复设置无副作用。
+                # Event.set 幂等，后续每轮重复设置无副作用。先置位再通知
+                # 轮次，保证即使任务在通知期间被取消，首轮等待方也不会挂起。
                 self.first_round_done.set()
+                # 无论本轮成功/异常，都要推进轮次序号并唤醒等待者：
+                # license 复核等下游任务只关心“扫描已结束、本地 clone 已就绪”，
+                # 不应因单轮扫描失败而永久阻塞。
+                await self._notify_round_finished()
             if not self._running:
                 return
 
@@ -127,12 +147,43 @@ class DiscoverScheduler:
             except asyncio.CancelledError:
                 return
 
+    async def _notify_round_finished(self) -> None:
+        """推进轮次序号并唤醒所有等待下一轮的下游任务。"""
+        async with self._round_condition:
+            self.round_seq += 1
+            self._round_condition.notify_all()
+
+    async def wait_for_new_round(self, last_seq: int = -1) -> int:
+        """等待“比 ``last_seq`` 更新的一轮 discover”完成，返回新的轮次序号。
+
+        供 license 复核等下游任务串行消费：
+
+        - 启动时若已有轮次完成（例如 worker 先等 ``first_round_done`` 再启动
+          license），``round_seq >= 1`` 会立即返回，不会错过首轮；
+        - 消费后再次调用需要传入刚返回的序号，从而阻塞到下一轮结束，
+          天然实现“license 在 discover 之后执行”。
+
+        使用 ``asyncio.Condition`` 而不是 Event：Event 只有置位/清除两态，
+        多轮之间会合并信号或出现清除竞态；条件变量按序号判断，语义明确。
+        """
+        async with self._round_condition:
+            # 0 表示“还没有任何轮次完成”，不能因为 -1 < 0 就提前返回；
+            # 因此下界取 max(last_seq, 0)，至少等到第一轮真正结束。
+            await self._round_condition.wait_for(
+                lambda: self.round_seq > max(last_seq, 0)
+            )
+            return self.round_seq
+
     async def run_discover_once(self) -> dict[str, int]:
         """执行一轮 discover（全部配置仓库），返回分类统计。
 
         每轮记录开始/结束日志与总耗时；每个仓库记录处理耗时，
         结束时汇总平均耗时与最慢的仓库，便于排查慢仓库。
         每轮结果（含每仓明细）写入 result_dir 下的 JSON 文件。
+
+        扫描仓库期间复用同一个 ``SkillManager``（内含 license 预检 checker），
+        在 ``finally`` 中统一 ``close``，确保本轮物化的临时 license 目录不会
+        跨轮残留；单个仓库失败只计入 counters，不中断其余仓库。
         """
         # catalog 同步是 git 操作、请求构建是全量 YAML 解析，均放线程池执行，
         # 网络挂起或 catalog 较大时不阻塞事件循环（API / 健康检查保持可用）
@@ -187,61 +238,67 @@ class DiscoverScheduler:
                 ", ".join(config_keys),
                 repository_path,
             )
-            for index, request in enumerate(requests, start=1):
-                label = request.url or "<missing-url>"
-                logger.info("%s [%d/%d] scanning %s", LOG_PREFIX, index, total, label)
-                repo_started = time.monotonic()
-                try:
-                    result = await manager.discover_configured_skill_repository(request)
-                except Exception as exc:
+            try:
+                for index, request in enumerate(requests, start=1):
+                    label = request.url or "<missing-url>"
+                    logger.info("%s [%d/%d] scanning %s", LOG_PREFIX, index, total, label)
+                    repo_started = time.monotonic()
+                    try:
+                        result = await manager.discover_configured_skill_repository(request)
+                    except Exception as exc:
+                        elapsed = time.monotonic() - repo_started
+                        repo_durations.append((label, elapsed))
+                        counters["failed"] += 1
+                        repo_details.append(
+                            {
+                                "url": label,
+                                "outcome": "failed",
+                                "skill_num": 0,
+                                "duration_seconds": round(elapsed, 3),
+                                "error": str(exc),
+                            }
+                        )
+                        logger.exception(
+                            "%s failed for %s after %.1fs", LOG_PREFIX, label, elapsed
+                        )
+                        continue
+
                     elapsed = time.monotonic() - repo_started
                     repo_durations.append((label, elapsed))
-                    counters["failed"] += 1
+                    outcome = classify_discover_result(result)
+                    counters[outcome] += 1
                     repo_details.append(
                         {
                             "url": label,
-                            "outcome": "failed",
-                            "skill_num": 0,
+                            "outcome": outcome,
+                            "skill_num": getattr(result, "skill_num", 0),
                             "duration_seconds": round(elapsed, 3),
-                            "error": str(exc),
                         }
                     )
-                    logger.exception(
-                        "%s failed for %s after %.1fs", LOG_PREFIX, label, elapsed
+                    logger.info(
+                        "%s [%d/%d] %s: %s (%d skills, took %.1fs)",
+                        LOG_PREFIX,
+                        index,
+                        total,
+                        outcome,
+                        label,
+                        getattr(result, "skill_num", 0),
+                        elapsed,
                     )
-                    continue
 
-                elapsed = time.monotonic() - repo_started
-                repo_durations.append((label, elapsed))
-                outcome = classify_discover_result(result)
-                counters[outcome] += 1
-                repo_details.append(
-                    {
-                        "url": label,
-                        "outcome": outcome,
-                        "skill_num": getattr(result, "skill_num", 0),
-                        "duration_seconds": round(elapsed, 3),
-                    }
-                )
+                # 扫描结束后同步 catalog 各 platform 的贡献者信息（name/description/
+                # git_profile）：覆盖 commit 未变被跳过的仓库，以及已登记但尚未
+                # 扫描出 skill 的组织；skill_count 始终以扫描结果为准
+                profile_count = await self._sync_contributor_profiles(session, repository_path)
                 logger.info(
-                    "%s [%d/%d] %s: %s (%d skills, took %.1fs)",
-                    LOG_PREFIX,
-                    index,
-                    total,
-                    outcome,
-                    label,
-                    getattr(result, "skill_num", 0),
-                    elapsed,
+                    "%s contributor profiles synced from catalog: %d entries",
+                    LOG_PREFIX, profile_count,
                 )
-
-            # 扫描结束后同步 catalog 各 platform 的贡献者信息（name/description/
-            # git_profile）：覆盖 commit 未变被跳过的仓库，以及已登记但尚未
-            # 扫描出 skill 的组织；skill_count 始终以扫描结果为准
-            profile_count = await self._sync_contributor_profiles(session, repository_path)
-            logger.info(
-                "%s contributor profiles synced from catalog: %d entries",
-                LOG_PREFIX, profile_count,
-            )
+            finally:
+                # license 预检 checker 只在“扫描仓库”期间需要；一轮结束即释放
+                # 本地 clone 物化出的临时目录，避免跨轮持有过期缓存/残留磁盘。
+                # close 内部已容错，不影响已提交的扫描结果。
+                await manager.close()
 
         # 补跑衍生字段缺口（security 风险分 / category 分类 / embedding 向量）：
         # 本轮新入库或中断留下的缺口行在此补齐，使其立即可用；

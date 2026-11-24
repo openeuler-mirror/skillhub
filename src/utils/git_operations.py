@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import threading
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -45,6 +46,32 @@ GIT_NON_INTERACTIVE_ENV = {
 # clone 进行中的目录会被误判为残留并 rmtree，或第二个 clone 撞上 "File exists"。
 # 跨进程并发（CLI 与 API 同时跑）不在此锁范围，属同一操作的幂等重试场景。
 _CATALOG_SYNC_LOCK = threading.Lock()
+
+
+@lru_cache(maxsize=1)
+def _git_supports_fetch_refetch() -> bool:
+    """本机 Git 是否支持 ``fetch --refetch``（Git >= 2.36）。
+
+    老版本 Git（如 Apple Git 2.32）遇到 ``--refetch`` 会直接以
+    ``unknown option`` 退出，导致 tag 列表为空。这里按版本选择命令：
+    不支持时省略该选项，tag ref 仍会被创建，缺失的 tree/blob 由
+    promisor remote 在读取时懒拉取补齐。
+    """
+    try:
+        result = subprocess.run(
+            ["git", "version"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+    match = re.search(r"git version (\d+)\.(\d+)", result.stdout)
+    if not match:
+        return False
+    return (int(match.group(1)), int(match.group(2))) >= (2, 36)
 
 
 class GitCommandError(subprocess.CalledProcessError):
@@ -344,9 +371,12 @@ class GitOperations:
                 )
                 return False
 
+        # 使用 ls-tree 的经典输出（<mode> <type> <object>\t<path>）而不是
+        # ``--format``：后者要求 Git >= 2.36，较旧的发行版/CI 镜像会直接
+        # 报 unknown option。这里只需要 objectname 与 objecttype，经典格式
+        # 在所有支持 partial clone 的 Git 版本上都可以稳定解析。
         ls_command = [
-            'git', '-C', str(repo_root), 'ls-tree', '-r',
-            '--format=%(objectname) %(objecttype)', ref, '--', pathspec,
+            'git', '-C', str(repo_root), 'ls-tree', '-r', ref, '--', pathspec,
         ]
         try:
             listing = self._run_git_command(ls_command)
@@ -357,11 +387,13 @@ class GitOperations:
             )
             return False
 
-        blob_shas = [
-            line.split()[0]
-            for line in listing.splitlines()
-            if line.split()[1:2] == ['blob']
-        ]
+        blob_shas: list[str] = []
+        for line in listing.splitlines():
+            # 元数据固定为 "<mode> <type> <object>"，以 TAB 与路径分隔；
+            # 只取 TAB 前的部分，避免文件名中的空格/TAB 干扰解析。
+            metadata = line.split('\t', 1)[0].split()
+            if len(metadata) >= 3 and metadata[1] == 'blob':
+                blob_shas.append(metadata[2])
         if not blob_shas:
             return True
 
@@ -533,13 +565,17 @@ class GitOperations:
             return []
 
         # The metadata pass uses tree:0, so force a second fetch for the
-        # selected tags with blob:none.  --refetch avoids negotiation deciding
-        # that the already-present commit is sufficient while its tree is
-        # still intentionally missing.
+        # selected tags with blob:none.  ``--refetch`` avoids negotiation
+        # deciding that the already-present commit is sufficient while its
+        # tree is still intentionally missing.  Git < 2.36 has no --refetch:
+        # omit it and rely on promisor lazy fetch when tag content is read.
         fetch_tags_command = [
             'git', '-C', str(clone_dir), 'fetch',
-            '--force', '--no-tags', '--refetch', '--filter=blob:none', 'origin',
+            '--force', '--no-tags',
         ]
+        if _git_supports_fetch_refetch():
+            fetch_tags_command.append('--refetch')
+        fetch_tags_command.extend(['--filter=blob:none', 'origin'])
         fetch_tags_command.extend(
             f'refs/tags/{tag}:refs/tags/{tag}' for tag in latest_tags
         )

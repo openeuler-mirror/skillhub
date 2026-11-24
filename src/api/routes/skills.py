@@ -155,6 +155,11 @@ async def receive_telemetry(
 
 
 def skill_to_response(skill) -> SkillResponse:
+    """把 ORM ``Skill`` 映射为 API 响应。
+
+    ``license`` / ``license_compliant`` 原样透出：服务端已在列表、详情等入口
+    按三态完成可见性过滤，这里不再二次判断，保证前端拿到的是同一份结论。
+    """
     return SkillResponse(
         id=str(skill.id),
         skill_id=skill.skill_id,
@@ -173,6 +178,7 @@ def skill_to_response(skill) -> SkillResponse:
         metadata=skill.extra_metadata,
         content=skill.content,
         risk_score=skill.risk_score,
+        license=skill.license,
         license_compliant=skill.license_compliant,
         download_count=skill.download_count,
         period_downloads=getattr(skill, "_period_downloads", None),

@@ -103,13 +103,18 @@ discover_scheduler:
   timezone: "Asia/Shanghai"  # 触发时刻时区（与容器 TZ 无关）
   result_dir: ""             # 每轮结果 JSON 保存目录；留空则用 storage.local_path/logs
 
-# license 合规三态标记：skills/skill_versions.license_compliant
-# 1=已检查且合规，0=已检查不合规，NULL=未检查（默认过滤 0，NULL 仍可见）
-# 每日定时任务统一判定并回填，discover 不参与检查/写值，不删除任何 skill。
+# license 合规标记：skills/skill_versions 的 license + license_compliant
+# - license：具体 license 类型（归一化 SPDX 表达式，如 MIT / MIT AND Apache-2.0）
+# - license_compliant：1=已检查且合规，0=已检查不合规，NULL=未检查
+#   （默认过滤 0，NULL 仍可见）
+# discover 扫描新入库/内容变化的 skill 时同步做一次预检并写入两个字段；
+# license 复核任务在每轮 discover 完成后全量兜底复核（与 LLM 审核并行），
+# 不删除任何 skill。discover 未启用时才按 start_time 每日触发。
 # 环境变量覆盖示例：LICENSE_CHECK__ENABLED=true、LICENSE_CHECK__START_TIME=02:00
 license_check:
   enabled: true
-  start_time: "02:00"          # 每日全量复核触发时刻（HH:MM，按 timezone 解释）
+  # 仅在 discover_scheduler.enabled=false 时生效；discover 开启时跟随其轮次
+  start_time: "02:00"
   timezone: "Asia/Shanghai"
   batch_size: 200              # 每批提交的行数
   gate:

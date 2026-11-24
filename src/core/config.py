@@ -282,20 +282,26 @@ class LicenseRepoConfig(BaseModel):
 
 
 class LicenseCheckConfig(BaseModel):
-    """license 三态标记任务配置。
+    """license 复核任务配置。
 
-    任务每天 ``start_time``（按 ``timezone`` 解释）触发一轮**全量**复核：
-    判定 skills / skill_versions 的 license 合规性，写回 ``license_compliant``
-    （1/0；失败保持原值）。判定与写值全部由该任务负责，discover 不参与。
+    任务判定 skills / skill_versions 的 license 合规性，写回：
+    - ``license``：具体 license 类型（归一化 SPDX 表达式）；
+    - ``license_compliant``：三态 1/0/NULL（失败保持原值）。
 
-    调度器启动后（worker 已完成 discover 首轮）会先立即执行一轮，之后按
-    ``start_time`` 每日触发；同一时刻通过 PostgreSQL advisory lock 保证
-    多副本下只有一个实例执行。
+    discover 在扫描新入库/内容变化的 skill 时会做一次内联预检并写入两个
+    字段；本任务负责全量兜底复核（补齐存量、跟随准入清单更新结论、回收
+    缓存）。调度上默认跟随 discover：每轮 discover 完成后触发一轮，与 LLM
+    审核等下游任务并行；``start_time`` 仅在 discover 调度器未启用时生效。
+
+    同一时刻通过 PostgreSQL advisory lock 保证多副本下只有一个实例执行。
     """
 
-    # 是否启用定时任务；关闭后 license_compliant 不再更新（已有值保留）
+    # 是否启用 license 检查；关闭后 discover 不做预检、定时任务不更新，
+    # license / license_compliant 均保留数据库已有值
     enabled: bool = True
-    # 每日触发时刻（HH:MM），按 timezone 解释
+    # 每日触发时刻（HH:MM），按 timezone 解释。
+    # 仅在 discover_scheduler.enabled=false 时生效；discover 开启时改为
+    # “每轮 discover 扫描完成后”触发，保证读取到最新的本地 clone。
     start_time: str = "02:00"
     # 触发时刻时区；与容器 TZ 解耦，默认北京时间
     timezone: str = "Asia/Shanghai"
