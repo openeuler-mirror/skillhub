@@ -37,7 +37,7 @@ class SkillRepoRepository:
     async def list_skill_repositories(self) -> list[SkillRepoModel]:
         result = await self.session.execute(
             select(SkillRepoModel)
-            .where(SkillRepoModel.is_removed.is_(False))
+            .where(SkillRepoModel.is_soft_deleted.is_(False))
             .order_by(SkillRepoModel.created_at.desc())
         )
         return list(result.scalars().all())
@@ -137,7 +137,7 @@ class SkillRepoRepository:
 
         可见性规则与 ``count_skills`` / ``get_contributor_skills`` / 扫描写入的
         ``unique_skill_count`` 一致（字段完备 is_complete 且未下架
-        is_removed=false），与扫描写入和贡献者统计同口径，不会在扫描与自愈
+        is_soft_deleted=false），与扫描写入和贡献者统计同口径，不会在扫描与自愈
         之间互相翻转。仅更新当前值不等于聚合值的行，天然幂等。
         """
         skill_count = (
@@ -145,7 +145,7 @@ class SkillRepoRepository:
             .where(
                 Skill.skill_repo_id == SkillRepoModel.id,
                 Skill.is_complete.is_(True),
-                Skill.is_removed.is_(False),
+                Skill.is_soft_deleted.is_(False),
             )
             .scalar_subquery()
         )
@@ -222,8 +222,8 @@ class SkillRepoRepository:
         """软删除（隐藏）仓库及其技能，返回实际隐藏的仓库行数。幂等。
 
         与 ``delete_skill_repositories`` 的硬删除不同：skill / skill_versions
-        行全部保留，仅把名下 skills 与 skill_repos 的 ``is_removed`` 置 true，
-        展示/统计读路径据此隐藏。只更新当前 is_removed=false 的行，已隐藏的
+        行全部保留，仅把名下 skills 与 skill_repos 的 ``is_soft_deleted`` 置 true，
+        展示/统计读路径据此隐藏。只更新当前 is_soft_deleted=false 的行，已隐藏的
         不计入 rowcount。
         """
         if not repository_ids:
@@ -235,23 +235,23 @@ class SkillRepoRepository:
             repo_ids,
         )
 
-        # 1) 把名下 skills 的 is_removed 置 true
+        # 1) 把名下 skills 的 is_soft_deleted 置 true
         await self.session.execute(
             update(Skill)
             .where(
                 Skill.skill_repo_id.in_(repo_ids),
-                Skill.is_removed.is_(False),
+                Skill.is_soft_deleted.is_(False),
             )
-            .values(is_removed=True)
+            .values(is_soft_deleted=True)
         )
-        # 2) 把 skill_repos 的 is_removed 置 true
+        # 2) 把 skill_repos 的 is_soft_deleted 置 true
         result = await self.session.execute(
             update(SkillRepoModel)
             .where(
                 SkillRepoModel.id.in_(repo_ids),
-                SkillRepoModel.is_removed.is_(False),
+                SkillRepoModel.is_soft_deleted.is_(False),
             )
-            .values(is_removed=True)
+            .values(is_soft_deleted=True)
         )
         await self.session.flush()
         await self.session.commit()
@@ -263,9 +263,9 @@ class SkillRepoRepository:
         return hidden
 
     async def purge_soft_deleted_skill_repositories(self) -> int:
-        """物理删除所有已软删除（is_removed=true）的仓库及其级联数据，返回删除仓库数。"""
+        """物理删除所有已软删除（is_soft_deleted=true）的仓库及其级联数据，返回删除仓库数。"""
         result = await self.session.execute(
-            select(SkillRepoModel.id).where(SkillRepoModel.is_removed.is_(True))
+            select(SkillRepoModel.id).where(SkillRepoModel.is_soft_deleted.is_(True))
         )
         repo_ids = [row[0] for row in result.all()]
         if not repo_ids:
@@ -366,9 +366,9 @@ class SkillRepository:
         skill_id_prefix: str | None = None,
         security_level: list[str] | None = None,
     ):
-        # 全局规则：仅展示字段完备（is_complete=True）且未下架（is_removed=False）的 Skill
+        # 全局规则：仅展示字段完备（is_complete=True）且未下架（is_soft_deleted=False）的 Skill
         query = query.where(skill_model.is_complete.is_(True))
-        query = query.where(skill_model.is_removed.is_(False))
+        query = query.where(skill_model.is_soft_deleted.is_(False))
         if category:
             conditions = []
             normal_cats = []
@@ -418,7 +418,7 @@ class SkillRepository:
             select(Skill)
             # 统计排除脏数据，与列表保持一致（字段完备且未下架）
             .where(Skill.is_complete.is_(True))
-            .where(Skill.is_removed.is_(False))
+            .where(Skill.is_soft_deleted.is_(False))
             .order_by(desc(Skill.updated_at), desc(Skill.created_at))
             .subquery()
         )
@@ -480,7 +480,7 @@ class SkillRepository:
         return result.scalar_one_or_none()
 
     async def get_visible_by_skill_id(self, skill_id: str) -> Skill | None:
-        """仅返回字段完备（is_complete）且未下架（is_removed=false）的 Skill。
+        """仅返回字段完备（is_complete）且未下架（is_soft_deleted=false）的 Skill。
 
         展示读路径（详情/版本/下载）使用；内部写路径（查重、计数、审计）
         用无过滤的 ``get_by_skill_id``，避免把已下架行误判为不存在。
@@ -489,7 +489,7 @@ class SkillRepository:
             select(Skill).where(
                 Skill.skill_id == skill_id,
                 Skill.is_complete.is_(True),
-                Skill.is_removed.is_(False),
+                Skill.is_soft_deleted.is_(False),
             )
         )
         return result.scalar_one_or_none()
@@ -502,7 +502,7 @@ class SkillRepository:
             .where(
                 Skill.skill_id == skill_id,
                 Skill.is_complete.is_(True),
-                Skill.is_removed.is_(False),
+                Skill.is_soft_deleted.is_(False),
             )
         )
         return result.scalar_one_or_none()
@@ -702,7 +702,7 @@ class SkillRepository:
         scanned_ids = set(scanned_skills)
         existing_ids = set(existing_skills)
 
-        # 仓库内 skill 文件消失 → 软删除（is_removed=True），行与关联保留。
+        # 仓库内 skill 文件消失 → 软删除（is_soft_deleted=True），行与关联保留。
         # 与 catalog 下架口径一致；重新出现时在下方循环恢复可见。只更新
         # 当前未下架的行，已下架的不重复计入。
         removed_ids = existing_ids - scanned_ids
@@ -712,9 +712,9 @@ class SkillRepository:
                 .where(
                     Skill.skill_repo_id == skill_repo_id,
                     Skill.skill_id.in_(removed_ids),
-                    Skill.is_removed.is_(False),
+                    Skill.is_soft_deleted.is_(False),
                 )
-                .values(is_removed=True)
+                .values(is_soft_deleted=True)
             )
 
         for skill_id in scanned_ids:
@@ -727,11 +727,11 @@ class SkillRepository:
             skill.id = existing_skill.id
             if self._is_content_unchanged(existing_skill, skill):
                 # 内容未变但此前被软删除（catalog 下架后重新出现），恢复可见
-                if existing_skill.is_removed:
+                if existing_skill.is_soft_deleted:
                     await self.session.execute(
                         update(Skill)
                         .where(Skill.id == existing_skill.id)
-                        .values(is_removed=False)
+                        .values(is_soft_deleted=False)
                     )
                 continue
             await self.session.execute(
@@ -851,7 +851,7 @@ class SkillRepository:
         # 扫描结果重算完备性、并复位下架标志（在 catalog 中即恢复可见）。
         if isinstance(representative, Skill):
             values["is_complete"] = is_skill_complete(representative)
-            values["is_removed"] = False
+            values["is_soft_deleted"] = False
         return values
 
     async def get_versions_by_base_skill(self, source_url: str | None, skill_id: str) -> list[SkillVersion]:
@@ -989,7 +989,7 @@ class SkillRepository:
             Skill.source == source,
             Skill.author == author,
             Skill.is_complete.is_(True),
-            Skill.is_removed.is_(False),
+            Skill.is_soft_deleted.is_(False),
         )
 
         stats_result = await self.session.execute(
@@ -1148,8 +1148,8 @@ class SkillRepository:
         """软删除（隐藏）仓库下 skill_id 不在期望集合内的 skill，返回隐藏行数。幂等。
 
         与 ``delete_skills_not_in_skill_ids`` 同口径，但仅把匹配 skill 的
-        ``is_removed`` 置 true（不删除行，也不处理 skill_versions——其所属
-        base skill 已隐藏）。只更新当前 is_removed=false 的行，已隐藏的不计入。
+        ``is_soft_deleted`` 置 true（不删除行，也不处理 skill_versions——其所属
+        base skill 已隐藏）。只更新当前 is_soft_deleted=false 的行，已隐藏的不计入。
         """
         if not expected_skill_ids:
             return 0
@@ -1157,7 +1157,7 @@ class SkillRepository:
             select(Skill.id).where(
                 Skill.skill_repo_id == skill_repo_id,
                 Skill.skill_id.not_in(expected_skill_ids),
-                Skill.is_removed.is_(False),
+                Skill.is_soft_deleted.is_(False),
             )
         )
         removed_uuids = [row[0] for row in removed_result.all()]
@@ -1168,20 +1168,20 @@ class SkillRepository:
             update(Skill)
             .where(
                 Skill.id.in_(removed_uuids),
-                Skill.is_removed.is_(False),
+                Skill.is_soft_deleted.is_(False),
             )
-            .values(is_removed=True)
+            .values(is_soft_deleted=True)
         )
         await self.session.flush()
         await self.session.commit()
         return len(removed_uuids)
 
     async def purge_soft_deleted_skills(self) -> int:
-        """物理删除所有已软删除（is_removed=true）的 skill 及其版本与软关联，返回删除 skill 数。"""
+        """物理删除所有已软删除（is_soft_deleted=true）的 skill 及其版本与软关联，返回删除 skill 数。"""
         rows = (
             await self.session.execute(
                 select(Skill.id, Skill.skill_id, Skill.skill_repo_id).where(
-                    Skill.is_removed.is_(True)
+                    Skill.is_soft_deleted.is_(True)
                 )
             )
         ).all()
@@ -1461,7 +1461,7 @@ class ContributorRepository:
         """统计贡献者名下可见 skill 数（含同 author 的其他仓库）。
 
         可见性规则与 ``SkillRepository.get_contributor_skills`` 一致
-        （字段完备 is_complete 且未下架 is_removed=false）。同一事务内可看到
+        （字段完备 is_complete 且未下架 is_soft_deleted=false）。同一事务内可看到
         本次扫描未 commit 的写入，因此扫描流程 store_skills_and_versions
         之后调用即可拿到最新值。
         """
@@ -1470,7 +1470,7 @@ class ContributorRepository:
                 Skill.source == source,
                 Skill.author == author,
                 Skill.is_complete.is_(True),
-                Skill.is_removed.is_(False),
+                Skill.is_soft_deleted.is_(False),
             )
         )
         return int(result.scalar() or 0)
@@ -1479,7 +1479,7 @@ class ContributorRepository:
         """按 skills 表可见口径重算全部 contributors.skill_count，返回修正行数。
 
         可见性规则与 ``count_skills`` / ``get_contributor_skills`` 一致
-        （字段完备 is_complete 且未下架 is_removed=false），与扫描 upsert 时的
+        （字段完备 is_complete 且未下架 is_soft_deleted=false），与扫描 upsert 时的
         聚合口径相同，不会在扫描与自愈之间来回翻转。仅更新当前值不等于
         聚合值的行，天然幂等；用于扫描落库后的统计自愈（手工删数据、历史漂移等）。
         """
@@ -1489,7 +1489,7 @@ class ContributorRepository:
                 Skill.source == Contributor.source,
                 Skill.author == Contributor.author,
                 Skill.is_complete.is_(True),
-                Skill.is_removed.is_(False),
+                Skill.is_soft_deleted.is_(False),
             )
             .scalar_subquery()
         )
@@ -1604,7 +1604,7 @@ class ContributorRepository:
                 Skill.source == Contributor.source,
                 Skill.author == Contributor.author,
                 Skill.is_complete.is_(True),
-                Skill.is_removed.is_(False),
+                Skill.is_soft_deleted.is_(False),
             )
             .correlate(Contributor)
             .scalar_subquery()

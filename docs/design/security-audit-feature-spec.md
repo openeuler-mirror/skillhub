@@ -1017,7 +1017,7 @@ SC4 模块实时查询 [OSV.dev](https://osv.dev) 检查依赖包已知 CVE：
 | 7 | **内容寻址复用** | 以目录级 tree hash 为 key：跨轮次（DB 记录）和同轮扫描内（security_cache）复用审计结果，内容未变的版本不重复提交 Jenkins |
 | 8 | **失败自愈** | 未拿到评分（risk_score=NULL）的记录由统一补齐（`src/jobs/remediation.py`）全局扫描重提审计：每轮 discover 末尾与 API 侧低频补齐循环（启动即补、每小时一轮）各补一轮，不再受限于"仓库 commit 未变"分支；失败的审计结果不进缓存，避免失败被继承；缓存复用产生的多行 pending 按各自 audit.id 独立回填（见 3.1/3.2） |
 | 9 | **容器只读解耦** | 爬虫宿主机负责 blob 物化（partial clone 懒拉取），skillspector 容器只读挂载缓存、无网络依赖，两侧职责隔离 |
-| 10 | **未评分不曝光** | 字段未完备（`is_complete` 为 false，如 `risk_score` 或 `category` 缺失）或已下架（`is_removed` 为 true）的技能在搜索/列表查询中全局排除，用户不会看到未审计内容 |
+| 10 | **未评分不曝光** | 字段未完备（`is_complete` 为 false，如 `risk_score` 或 `category` 缺失）或已下架（`is_soft_deleted` 为 true）的技能在搜索/列表查询中全局排除，用户不会看到未审计内容 |
 
 ---
 

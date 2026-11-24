@@ -1,10 +1,10 @@
-"""Add skill visibility flags: is_complete (completeness) + is_removed (soft-delete).
+"""Add skill visibility flags: is_complete (completeness) + is_soft_deleted (soft-delete).
 
 design
 ------
 * ``skills.is_complete`` 默认 false，当必填字段（risk_score + category，见
   ``src/skills/skill_readiness.py``）齐全后置 true
-* ``is_removed``（skills 与 skill_repos）默认 false，catalog 下架时置 true（软删除）。
+* ``is_soft_deleted``（skills 与 skill_repos）默认 false，catalog 下架时置 true（软删除）。
 """
 
 from collections.abc import Sequence
@@ -25,11 +25,11 @@ def upgrade() -> None:
     )
     op.add_column(
         "skills",
-        sa.Column("is_removed", sa.Boolean(), nullable=False, server_default=sa.text("false")),
+        sa.Column("is_soft_deleted", sa.Boolean(), nullable=False, server_default=sa.text("false")),
     )
     op.add_column(
         "skill_repos",
-        sa.Column("is_removed", sa.Boolean(), nullable=False, server_default=sa.text("false")),
+        sa.Column("is_soft_deleted", sa.Boolean(), nullable=False, server_default=sa.text("false")),
     )
     # 存量行回填：字段已完备的 skill 置为 is_complete（risk_score + category 均非空）。
     # 必填字段清单与 src/skills/skill_readiness.COMPLETE_REQUIRED_FIELDS 保持一致。
@@ -40,6 +40,6 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_column("skill_repos", "is_removed")
-    op.drop_column("skills", "is_removed")
+    op.drop_column("skill_repos", "is_soft_deleted")
+    op.drop_column("skills", "is_soft_deleted")
     op.drop_column("skills", "is_complete")

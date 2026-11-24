@@ -117,11 +117,11 @@ async def _fetch_batch(
     """使用 keyset pagination 短会话读取一批待编码行。
 
     only_missing=True 时仅取 embedding IS NULL 且字段完备（is_complete）且未下架
-    （is_removed=false）的行（与 _vector_search 的可见口径一致：字段未完备或已
+    （is_soft_deleted=false）的行（与 _vector_search 的可见口径一致：字段未完备或已
     下架的行对语义搜索不可见，无需消耗 embedding 计算）。
     """
     target_cond = (
-        "embedding IS NULL AND is_complete IS TRUE AND is_removed IS FALSE"
+        "embedding IS NULL AND is_complete IS TRUE AND is_soft_deleted IS FALSE"
         if only_missing
         else "TRUE"
     )
@@ -156,7 +156,7 @@ async def _fetch_batch(
 
 async def _count_targets(only_missing: bool) -> int:
     cond = (
-        "embedding IS NULL AND is_complete IS TRUE AND is_removed IS FALSE"
+        "embedding IS NULL AND is_complete IS TRUE AND is_soft_deleted IS FALSE"
         if only_missing
         else "TRUE"
     )

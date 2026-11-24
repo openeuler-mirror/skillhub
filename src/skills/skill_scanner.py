@@ -579,7 +579,7 @@ class SkillScanner:
             common['is_complete'] = is_skill_complete(
                 {'risk_score': security.risk_score, 'category': category}
             )
-            common['is_removed'] = False
+            common['is_soft_deleted'] = False
         model_class = Skill if return_skill_model else SkillVersion
         record = model_class(**common)
         setattr(record, '_security_audit_triggered', security.audit_triggered)

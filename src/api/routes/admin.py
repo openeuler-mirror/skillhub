@@ -13,7 +13,7 @@ router = APIRouter()
     dependencies=[Depends(require_admin_token)],
 )
 async def purge_soft_deleted(db: AsyncSession = Depends(get_db)) -> dict:
-    """物理删除已软删除（is_removed=true）的仓库与 skill 及其级联/软关联数据。
+    """物理删除已软删除（is_soft_deleted=true）的仓库与 skill 及其级联/软关联数据。
 
     软删除仅做隐藏标记、保留行与关联以便审计/恢复；此接口做真正的物理清理。
     """

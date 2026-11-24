@@ -198,7 +198,7 @@ async def collect_skill_stats(session: Any) -> dict[str, Any]:
     ]
 
     # 3. 索引创建（embedding）：indexed / missing / not_required 为互斥三分法，
-    #    各项之和恒等于 total。只有字段完备（is_complete）且未下架（is_removed=false）
+    #    各项之和恒等于 total。只有字段完备（is_complete）且未下架（is_soft_deleted=false）
     #    的行才会建索引；字段未完备或已下架且未建索引的 embedding 为空是预期
     #    状态，单列出来避免误判为失败。
     index_rows = await session.execute(
@@ -208,11 +208,11 @@ async def collect_skill_stats(session: Any) -> dict[str, Any]:
             func.count().filter(
                 Skill.embedding.is_(None),
                 Skill.is_complete.is_(True),
-                Skill.is_removed.is_(False),
+                Skill.is_soft_deleted.is_(False),
             ),
             func.count().filter(
                 Skill.embedding.is_(None),
-                or_(Skill.is_complete.is_(False), Skill.is_removed.is_(True)),
+                or_(Skill.is_complete.is_(False), Skill.is_soft_deleted.is_(True)),
             ),
         )
     )

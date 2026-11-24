@@ -1148,7 +1148,7 @@ Batch delete skill repos done: skill_repos_deleted=N,               # 执行后
 重算两处统计值，`WHERE 旧值 <> 新值`，天然幂等（每个仓库扫描完成后、
 以及 CLI `delete` 删除仓库后各执行一次）：
 
-- `contributors.skill_count`：字段完备（is_complete）且未下架（is_removed=false）的可见 skill 计数（与查询口径一致）；
+- `contributors.skill_count`：字段完备（is_complete）且未下架（is_soft_deleted=false）的可见 skill 计数（与查询口径一致）；
 - `skill_repos.skill_num`：仓库下的 skill 行数。
 
 修正完成后输出日志 `Discover: statistics reconciled after scan: contributors=N, skill_repos=N`

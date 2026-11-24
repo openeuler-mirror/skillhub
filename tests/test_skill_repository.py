@@ -192,7 +192,7 @@ class TestSkillRepositoryUnit:
             commit_id="old-commit",
             tree_hash="same-tree",
             download_count=12,
-            is_removed=False,
+            is_soft_deleted=False,
         )
         scanned = SimpleNamespace(
             skill_repo_id=repo_id,
@@ -1753,7 +1753,7 @@ repositories:
             source="github",
             platform="enterprise",
             is_complete=True,
-            is_removed=False,
+            is_soft_deleted=False,
         )
 
         with (

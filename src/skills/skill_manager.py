@@ -393,7 +393,7 @@ class SkillManager:
         修正三类漂移：skill 被删除后 contributors.skill_count /
         skill_repos.skill_num 的残留、多作者仓库只刷新单一 author 的
         contributors 行、以及手工直改 skills 表造成的偏差。统计口径
-        与扫描写入一致（contributors 走字段完备 is_complete 且未下架 is_removed=false
+        与扫描写入一致（contributors 走字段完备 is_complete 且未下架 is_soft_deleted=false
         的可见口径，skill_repos 走仓库下 skill 行数），因此不会与扫描互相翻转。
         失败仅告警，不影响已提交的扫描结果。
         """
@@ -423,7 +423,7 @@ class SkillManager:
         外的组合即已下架。author 口径与扫描写入 skill_repos.author 一致。
 
         软隐藏下 skill / skill_versions 行全部保留，仅把名下 skills 与
-        skill_repos 的 ``is_removed`` 置 true（由 ``soft_delete_skill_repositories``
+        skill_repos 的 ``is_soft_deleted`` 置 true（由 ``soft_delete_skill_repositories``
         实现）；隐藏后自愈统计值（contributors.skill_count / skill_repos.skill_num），
         孤儿作者不在此步物理清理。
         """
@@ -514,7 +514,7 @@ class SkillManager:
 
         对每条「部分扫描」请求（``skill_paths`` 非空：``skills[].skill_url``
         单 Skill 与 ``local_skills`` 原文件方式），按同一口径推导该仓库期望
-        存在的 skill_id 集合，隐藏仓库下不属于集合的 skill（仅把 ``is_removed``
+        存在的 skill_id 集合，隐藏仓库下不属于集合的 skill（仅把 ``is_soft_deleted``
         置 true，行与 version / security_audits / download_history 软关联均保留）。
         整仓移除由 ``hide_removed_catalog_repos`` 负责；整仓请求（skill_paths=None）
         在这里跳过——它是全量扫描，store 的 diff 已覆盖。
@@ -831,7 +831,7 @@ class SkillManager:
 
     @staticmethod
     def _count_unique_skills(skills: list[Skill]) -> int:
-        """统计可见（is_complete 且未下架 is_removed=false）的 unique skill 数。
+        """统计可见（is_complete 且未下架 is_soft_deleted=false）的 unique skill 数。
 
         与 ``SkillRepository.reconcile_skill_nums`` 的可见口径一致，避免扫描
         写入值与自愈统计互相翻转。
@@ -842,7 +842,7 @@ class SkillManager:
                 for skill in skills
                 if getattr(skill, 'skill_id', None)
                 and getattr(skill, 'is_complete', False)
-                and not getattr(skill, 'is_removed', False)
+                and not getattr(skill, 'is_soft_deleted', False)
             }
         )
 
