@@ -224,6 +224,87 @@ class AuditLLMReviewConfig(BaseSettings):
     result_max_files: int = 200
 
 
+class LicenseGateConfig(BaseModel):
+    """license 判定参数与准入清单。
+
+    判定引擎与 openeuler-jenkins 门禁同源，但本平台只做三态标记、不删除。
+    准入清单由 compliance SIG 维护，列出每个 license 的 oeApproved /
+    lowRisk / black 属性；清单未收录的 license 默认判为 unknown（写 0）。
+    """
+
+    # 清单远端地址（AtomGit raw，无需鉴权）；本地缓存过期时回源拉取
+    access_list_url: str = (
+        "https://api.atomgit.com/api/v5/repos/openeuler/compliance/raw/"
+        "doc/rule/Licenses_Access_List.yaml?ref=master"
+    )
+    # 清单本地缓存路径；空则使用 <storage.local_path>/license/Licenses_Access_List.yaml
+    access_list_cache: str = ""
+    # 缓存有效期（小时）；过期后优先回源，失败时降级使用过期缓存
+    access_list_ttl_hours: int = 24
+    # 远端拉取超时（秒）
+    access_list_timeout: float = 30.0
+    # 准入清单未收录、但允许分发的许可（不覆盖 black 判定）
+    extra_allow: list[str] = Field(
+        default_factory=lambda: [
+            "CANN-2.0",
+            "SUL-1.0",
+            "FSL-1.1-Apache-2.0",
+            "Convex-CPL",
+            "CC-BY-3.0-US",
+        ]
+    )
+    # 仅当 SKILL.md 声明无法解析（描述性占位）时是否回退到 LICENSE 文件；
+    # 可解析的声明始终优先（声明优先原则，见 gate_engine.scan）。
+    prefer_file: bool = True
+
+
+class LicenseRepoConfig(BaseModel):
+    """仓库文件树来源与远端拉取参数。
+
+    优先级：``skill_repos.local_path`` 的本地 clone -> 远程缓存目录 ->
+    按需浅克隆。discover 会为配置的仓库维护本地 clone，正常情况下从本地
+    git 对象库物化 license 文件，不会触发完整远端 clone；本地文件树不可用
+    时才使用这里的缓存/拉取配置。
+    """
+
+    # 远程缓存根目录；空则使用 <storage.local_path>/license-repos
+    remote_cache_root: str = ""
+    # 远程缓存有效期（天）；过期后重新拉取
+    remote_cache_ttl_days: int = 7
+    # 缓存保留期（天）：删除本轮未使用且超过该天数的远程/_local 缓存；0 表示禁用
+    remote_cache_keep_days: int = 7
+    # 本地 clone 缺失时是否允许远端浅克隆（关闭后只使用本地/已有缓存）
+    remote_fetch: bool = True
+    # 同时判定多少个仓库（每个仓库内部串行；discover 的仓库扫描另有限制）
+    remote_concurrency: int = 4
+    # 单次 git 命令超时（秒）；超时按仓库不可用处理（该行保持原值）
+    git_timeout: float = 60.0
+
+
+class LicenseCheckConfig(BaseModel):
+    """license 三态标记任务配置。
+
+    任务每天 ``start_time``（按 ``timezone`` 解释）触发一轮**全量**复核：
+    判定 skills / skill_versions 的 license 合规性，写回 ``license_compliant``
+    （1/0；失败保持原值）。判定与写值全部由该任务负责，discover 不参与。
+
+    调度器启动后（worker 已完成 discover 首轮）会先立即执行一轮，之后按
+    ``start_time`` 每日触发；同一时刻通过 PostgreSQL advisory lock 保证
+    多副本下只有一个实例执行。
+    """
+
+    # 是否启用定时任务；关闭后 license_compliant 不再更新（已有值保留）
+    enabled: bool = True
+    # 每日触发时刻（HH:MM），按 timezone 解释
+    start_time: str = "02:00"
+    # 触发时刻时区；与容器 TZ 解耦，默认北京时间
+    timezone: str = "Asia/Shanghai"
+    # 每批提交多少行；控制单次事务大小与锁持有时间
+    batch_size: int = 200
+    gate: LicenseGateConfig = Field(default_factory=LicenseGateConfig)
+    repo: LicenseRepoConfig = Field(default_factory=LicenseRepoConfig)
+
+
 class LoggingConfig(BaseSettings):
     level: str = "INFO"
     format: str = "json"
@@ -250,6 +331,7 @@ class Settings(BaseSettings):
     app: AppConfig = Field(default_factory=AppConfig)
     discover_scheduler: DiscoverSchedulerConfig = Field(default_factory=DiscoverSchedulerConfig)
     audit_llm_review: AuditLLMReviewConfig = Field(default_factory=AuditLLMReviewConfig)
+    license_check: LicenseCheckConfig = Field(default_factory=LicenseCheckConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     ai: AIConfig = Field(default_factory=AIConfig)
     openeuler_repos: list[SkillRepoEntry] = Field(default_factory=list)
@@ -274,6 +356,7 @@ class Settings(BaseSettings):
             app=AppConfig(**data.get("app", {})),
             discover_scheduler=DiscoverSchedulerConfig(**data.get("discover_scheduler", {})),
             audit_llm_review=AuditLLMReviewConfig(**data.get("audit_llm_review", {})),
+            license_check=LicenseCheckConfig(**data.get("license_check", {})),
             logging=LoggingConfig(**data.get("logging", {})),
             ai=AIConfig(**data.get("ai", {})),
             openeuler_repos=data.get("openeuler_repos", []) or [],
