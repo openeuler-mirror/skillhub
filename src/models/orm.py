@@ -9,6 +9,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    SmallInteger,
     String,
     Text,
     UniqueConstraint,
@@ -91,6 +92,11 @@ class Skill(Base):
     extra_metadata: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
     content: Mapped[str | None] = mapped_column(Text, nullable=True)
     risk_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # license 合规三态（由 license 定时任务维护，discover 不写）：
+    #   1    = 已检查且满足 license 要求
+    #   0    = 已检查但不满足（默认从列表/搜索/下载中过滤）
+    #   NULL = 尚未检查或检查失败（仍对外可见，等待下一轮回填）
+    license_compliant: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
     download_count: Mapped[int] = mapped_column(Integer, default=0)
     rating: Mapped[str | None] = mapped_column(String(10), nullable=True)
     is_complete: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=false())
@@ -141,6 +147,11 @@ class SkillVersion(Base):
     extra_metadata: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
     content: Mapped[str | None] = mapped_column(Text, nullable=True)
     risk_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # license 合规三态（由 license 定时任务维护，discover 不写）：
+    #   1    = 已检查且满足 license 要求
+    #   0    = 已检查但不满足（默认从列表/搜索/下载中过滤）
+    #   NULL = 尚未检查或检查失败（仍对外可见，等待下一轮回填）
+    license_compliant: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
     download_count: Mapped[int] = mapped_column(Integer, default=0)
     rating: Mapped[str | None] = mapped_column(String(10), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

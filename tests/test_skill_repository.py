@@ -137,6 +137,7 @@ class TestSkillRepositoryUnit:
             tree_hash="old-tree",
             download_count=12,
             risk_score=77,
+            license_compliant=1,
         )
         scanned = SimpleNamespace(
             skill_repo_id=repo_id,
@@ -156,6 +157,7 @@ class TestSkillRepositoryUnit:
             extra_metadata={},
             content="# Updated",
             risk_score=10,
+            license_compliant=None,
             rating=None,
         )
         existing_result = MagicMock()
@@ -332,6 +334,7 @@ class TestSkillRepositoryUnit:
             extra_metadata={},
             content=None,
             risk_score=10,
+            license_compliant=1,
             download_count=3,
             _period_downloads=None,
             rating=None,

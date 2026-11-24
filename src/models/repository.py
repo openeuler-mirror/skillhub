@@ -815,6 +815,10 @@ class SkillRepository:
     ) -> dict[str, Any]:
         """内容变化时的整行更新值。
 
+        仅在 ``_is_content_unchanged`` 判定内容已变化后调用（新行直接 add，
+        不会走到这里），因此这里列出的字段应覆盖扫描解析出的可变列；
+        由其他任务维护的列例外（见下）。
+
         ``download_count`` 保留已有值：由 popularity 任务维护，不是本次扫描的
         产物，用新解析对象的默认值覆盖会丢失已统计的下载计数。
 
@@ -822,6 +826,14 @@ class SkillRepository:
         扫描已重新触发审计，异步模式下该值暂时为 ``None``（由 Jenkins 收集器
         稍后回填），同步或缓存命中则为新分。不复用旧内容的评分，避免旧分与
         新内容（新 tree_hash）误绑定。
+
+        ``license_compliant`` 由 license 定时任务独占维护，**刻意不出现在
+        更新字典中**：UPDATE 语句不触碰该列，天然保留数据库当前值。这样
+        即使 discover 读取记录后、提交更新前 license 任务刚好写入了新结论，
+        也不会被 discover 用读取时的旧值覆盖（避免读-改-写竞态）。
+
+        其余字段（名称、描述、版本、tree_hash、内容等）都是本次扫描的结果，
+        直接使用 ``representative`` 上的新值。
         """
         values = {
             "skill_repo_id": representative.skill_repo_id,
@@ -857,6 +869,14 @@ class SkillRepository:
     async def get_versions_by_base_skill(self, source_url: str | None, skill_id: str) -> list[SkillVersion]:
         query = select(SkillVersion)
         query = query.where(SkillVersion.skill_id == skill_id)
+        # 版本列表与 latest 使用同一可见口径：只排除 license 判定为 0 的版本，
+        # NULL（未检查）仍返回，避免迁移后历史版本整体消失。
+        query = query.where(
+            or_(
+                SkillVersion.license_compliant.is_(None),
+                SkillVersion.license_compliant == 1,
+            )
+        )
         if source_url:
             query = query.where(SkillVersion.source_url == source_url)
         query = query.order_by(desc(SkillVersion.updated_at), desc(SkillVersion.created_at))
@@ -1598,6 +1618,7 @@ class ContributorRepository:
                 platform_counts[p] = int(c)
 
         # Correlated subquery: total downloads across the contributor's skills
+        # 口径与 contributor 可见性一致（risk_score 非空且 license 不为 0）
         downloads_sq = (
             select(func.coalesce(func.sum(Skill.download_count), 0))
             .where(

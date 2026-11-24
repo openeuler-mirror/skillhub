@@ -556,6 +556,7 @@ class SearchService:
             Skill.tags,
             Skill.platform,
             Skill.risk_score,
+            Skill.license_compliant,
             Skill.download_count,
             Skill.rating,
             Skill.created_at,
@@ -613,6 +614,7 @@ class SearchService:
                 "tags": row["tags"] or [],
                 "platform": row["platform"],
                 "risk_score": row["risk_score"],
+                "license_compliant": row["license_compliant"],
                 "download_count": row["download_count"],
                 "rating": row["rating"],
                 "created_at": row["created_at"].isoformat() if row["created_at"] else None,
@@ -685,7 +687,7 @@ class SearchService:
         sql = text(f"""
             SELECT id, skill_id, name, description, version, author, source,
                    source_url, category, tags, platform,
-                   risk_score, download_count, rating, created_at, updated_at,
+                   risk_score, license_compliant, download_count, rating, created_at, updated_at,
                    embedding <-> CAST(:embedding AS vector) AS distance
             FROM skills
             WHERE {where_sql}
@@ -719,6 +721,7 @@ class SearchService:
                 "tags": row.tags or [],
                 "platform": row.platform,
                 "risk_score": row.risk_score,
+                "license_compliant": row.license_compliant,
                 "download_count": row.download_count,
                 "rating": row.rating,
                 "created_at": row.created_at.isoformat() if row.created_at else None,
