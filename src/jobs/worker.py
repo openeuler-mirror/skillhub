@@ -31,6 +31,7 @@ from src.core.config import get_settings
 from src.core.logging import log_localtime
 from src.jobs.audit_llm_review import start_audit_llm_review_scheduler
 from src.jobs.discover_scheduler import start_discover_scheduler
+from src.jobs.license_check import start_license_check_scheduler
 from src.jobs.migration import run_migration
 from src.security.detector import start_skillspector_collector
 
@@ -90,8 +91,8 @@ def configure_worker_logging() -> None:
 async def _run_background_tasks():
     """按原 lifespan 的顺序与启用开关启动全部后台任务。
 
-    返回 (collector, discover_scheduler, audit_scheduler) 引用，供 shutdown 阶段
-    按逆序停止；未启动的返回 None。
+    返回 (collector, discover_scheduler, license_scheduler, audit_scheduler)
+    引用，供 shutdown 阶段按逆序停止；未启动的返回 None。
     """
     collector = None
     if settings.security.enable_audit:
@@ -108,6 +109,7 @@ async def _run_background_tasks():
 
     discover_scheduler = None
     audit_scheduler = None
+    license_scheduler = None
 
     # 一次性幂等迁移先于 discover 扫描执行；失败仅记录，不阻断后续步骤。
     logger.info("running startup migration")
@@ -131,6 +133,22 @@ async def _run_background_tasks():
     else:
         logger.info("discover_scheduler disabled, skipping discover")
 
+    # license 复核：依赖 discover 首轮完成（本地仓库已同步），启动后先全量复核
+    # 一轮，之后每天定时复核；不删除任何 skill。
+    if settings.license_check.enabled:
+        logger.info("starting license check scheduler (waiting for discover first round)")
+        try:
+            if discover_scheduler is not None:
+                await discover_scheduler.first_round_done.wait()
+            license_scheduler = await start_license_check_scheduler()
+            logger.info("license check scheduler started")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("license check scheduler start failed")
+    else:
+        logger.info("license_check disabled, skipping license check scheduler")
+
     # LLM 审核调度器：依赖 migration 与 discover 首轮扫描完成后启动，
     # 避免审核与首轮扫描并发争抢资源。
     if settings.audit_llm_review.enabled:
@@ -147,7 +165,7 @@ async def _run_background_tasks():
     else:
         logger.info("audit_llm_review disabled, skipping audit llm review scheduler")
 
-    return collector, discover_scheduler, audit_scheduler
+    return collector, discover_scheduler, license_scheduler, audit_scheduler
 
 
 async def _worker_main() -> None:
@@ -161,15 +179,17 @@ async def _worker_main() -> None:
             pass
 
     logger.info("skillhub worker starting up")
-    collector, discover_scheduler, audit_scheduler = await _run_background_tasks()
+    collector, discover_scheduler, license_scheduler, audit_scheduler = await _run_background_tasks()
     logger.info("skillhub worker background tasks started")
 
     try:
         await stop_event.wait()
     finally:
-        # 逆序停止：audit → discover → collector → 关闭进程级 httpx 客户端。
+        # 逆序停止：audit → license → discover → collector → 关闭进程级 httpx 客户端。
         if audit_scheduler is not None:
             await audit_scheduler.stop()
+        if license_scheduler is not None:
+            await license_scheduler.stop()
         if discover_scheduler is not None:
             await discover_scheduler.stop()
         if collector is not None:

@@ -302,8 +302,19 @@ class SkillRepository:
         skill_id_prefix: str | None = None,
         security_level: list[str] | None = None,
     ):
-        # 全局规则：排除未检测（risk_score 为空）的 Skill，不进入列表
+        # license 可见性规则（与详情/搜索/下载/统计保持一致）：
+        #   1    -> 对外可见
+        #   0    -> 不合规，默认从列表过滤
+        #   NULL -> 未检查，仍对外可见（未检查不等于不合规）
+        # 注意不能直接写 license_compliant != 0：SQL 三值逻辑会把 NULL
+        # 一并排除，必须显式 OR NULL 分支。
         query = query.where(skill_model.risk_score.is_not(None))
+        query = query.where(
+            or_(
+                skill_model.license_compliant.is_(None),
+                skill_model.license_compliant == 1,
+            )
+        )
         if category:
             conditions = []
             normal_cats = []
@@ -351,8 +362,15 @@ class SkillRepository:
     def _latest_unique_skills_subquery(self):
         return (
             select(Skill)
-            # 全局规则：统计排除未检测（risk_score 为空）的 Skill，与列表保持一致
+            # 统计口径与列表保持一致：排除未检测（risk_score 为空）和
+            # license 判定不合规（0）的 Skill；NULL 未检查仍计入。
             .where(Skill.risk_score.is_not(None))
+            .where(
+                or_(
+                    Skill.license_compliant.is_(None),
+                    Skill.license_compliant == 1,
+                )
+            )
             .order_by(desc(Skill.updated_at), desc(Skill.created_at))
             .subquery()
         )
@@ -708,6 +726,10 @@ class SkillRepository:
     ) -> dict[str, Any]:
         """内容变化时的整行更新值。
 
+        仅在 ``_is_content_unchanged`` 判定内容已变化后调用（新行直接 add，
+        不会走到这里），因此这里列出的字段应覆盖扫描解析出的可变列；
+        由其他任务维护的列例外（见下）。
+
         ``download_count`` 保留已有值：由 popularity 任务维护，不是本次扫描的
         产物，用新解析对象的默认值覆盖会丢失已统计的下载计数。
 
@@ -715,6 +737,14 @@ class SkillRepository:
         扫描已重新触发审计，异步模式下该值暂时为 ``None``（由 Jenkins 收集器
         稍后回填），同步或缓存命中则为新分。不复用旧内容的评分，避免旧分与
         新内容（新 tree_hash）误绑定。
+
+        ``license_compliant`` 由 license 定时任务独占维护，**刻意不出现在
+        更新字典中**：UPDATE 语句不触碰该列，天然保留数据库当前值。这样
+        即使 discover 读取记录后、提交更新前 license 任务刚好写入了新结论，
+        也不会被 discover 用读取时的旧值覆盖（避免读-改-写竞态）。
+
+        其余字段（名称、描述、版本、tree_hash、内容等）都是本次扫描的结果，
+        直接使用 ``representative`` 上的新值。
         """
         return {
             "skill_repo_id": representative.skill_repo_id,
@@ -744,6 +774,14 @@ class SkillRepository:
     async def get_versions_by_base_skill(self, source_url: str | None, skill_id: str) -> list[SkillVersion]:
         query = select(SkillVersion)
         query = query.where(SkillVersion.skill_id == skill_id)
+        # 版本列表与 latest 使用同一可见口径：只排除 license 判定为 0 的版本，
+        # NULL（未检查）仍返回，避免迁移后历史版本整体消失。
+        query = query.where(
+            or_(
+                SkillVersion.license_compliant.is_(None),
+                SkillVersion.license_compliant == 1,
+            )
+        )
         if source_url:
             query = query.where(SkillVersion.source_url == source_url)
         query = query.order_by(desc(SkillVersion.updated_at), desc(SkillVersion.created_at))
@@ -876,6 +914,12 @@ class SkillRepository:
             Skill.source == source,
             Skill.author == author,
             Skill.risk_score.is_not(None),
+            # contributor 列表可见口径与 Skill 列表一致：过滤 license=0，
+            # 未检查（NULL）仍计入
+            or_(
+                Skill.license_compliant.is_(None),
+                Skill.license_compliant == 1,
+            ),
         )
 
         stats_result = await self.session.execute(
@@ -1279,8 +1323,9 @@ class ContributorRepository:
     async def count_skills(self, source: str, author: str) -> int:
         """统计贡献者名下可见 skill 数（含同 author 的其他仓库）。
 
-        可见性规则与 ``SkillRepository.get_contributor_skills`` 一致
-        （risk_score 已审计非空）。同一事务内可看到本次扫描未 commit 的写入，
+        可见性规则与 ``SkillRepository.get_contributor_skills`` 一致：
+        ``risk_score`` 已审计非空，且 ``license_compliant`` 不为 0
+        （NULL 未检查仍计入）。同一事务内可看到本次扫描未 commit 的写入，
         因此扫描流程 store_skills_and_versions 之后调用即可拿到最新值。
         """
         result = await self.session.execute(
@@ -1288,6 +1333,10 @@ class ContributorRepository:
                 Skill.source == source,
                 Skill.author == author,
                 Skill.risk_score.is_not(None),
+                or_(
+                    Skill.license_compliant.is_(None),
+                    Skill.license_compliant == 1,
+                ),
             )
         )
         return int(result.scalar() or 0)
@@ -1296,9 +1345,11 @@ class ContributorRepository:
         """按 skills 表可见口径重算全部 contributors.skill_count，返回修正行数。
 
         可见性规则与 ``count_skills`` / ``get_contributor_skills`` 一致
-        （risk_score 非空），与扫描 upsert 时的聚合口径相同，不会在
-        扫描与自愈之间来回翻转。仅更新当前值不等于聚合值的行，
-        天然幂等；用于扫描落库后的统计自愈（手工删数据、历史漂移等）。
+        （risk_score 非空、license_compliant 不为 0），与扫描 upsert 时的
+        聚合口径相同，不会在扫描与自愈之间来回翻转。license 定时任务改写
+        0/1 后也会调用本方法，避免 contributor 计数滞后于可见性变化。
+        仅更新当前值不等于聚合值的行，天然幂等；用于扫描落库后的统计自愈
+        （手工删数据、历史漂移等）。
         """
         visible_count = (
             select(func.count(Skill.id))
@@ -1306,6 +1357,10 @@ class ContributorRepository:
                 Skill.source == Contributor.source,
                 Skill.author == Contributor.author,
                 Skill.risk_score.is_not(None),
+                or_(
+                    Skill.license_compliant.is_(None),
+                    Skill.license_compliant == 1,
+                ),
             )
             .scalar_subquery()
         )
@@ -1414,12 +1469,17 @@ class ContributorRepository:
                 platform_counts[p] = int(c)
 
         # Correlated subquery: total downloads across the contributor's skills
+        # 口径与 contributor 可见性一致（risk_score 非空且 license 不为 0）
         downloads_sq = (
             select(func.coalesce(func.sum(Skill.download_count), 0))
             .where(
                 Skill.source == Contributor.source,
                 Skill.author == Contributor.author,
                 Skill.risk_score.is_not(None),
+                or_(
+                    Skill.license_compliant.is_(None),
+                    Skill.license_compliant == 1,
+                ),
             )
             .correlate(Contributor)
             .scalar_subquery()
