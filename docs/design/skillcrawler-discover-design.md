@@ -96,8 +96,7 @@ flowchart TD
 | `src/ai/category_classifier.py` | Category 规则和模型调用 |
 | `src/models/repository.py` | Skills、SkillVersions、SecurityAudit 持久化 |
 | `src/security/detector.py` | Jenkins 客户端和后台报告 collector |
-| `src/jobs/license_check.py` | license 全量复核任务（跟随 discover 轮次触发） |
-| `src/jobs/worker.py` | 独立 worker 进程中启动/停止 discover、license、LLM 审核与 collector |
+| `src/jobs/worker.py` | 独立 worker 进程中启动/停止 discover、LLM 审核与 collector |
 
 ## 1.2 SkillManager 调用链
 
@@ -147,7 +146,7 @@ start_scan(..., skill_paths, skill_path_filter)          # skill_paths 已在上
 
 license 预检使用本轮 discover 复用的 `LicenseChecker`，结果只写入
 `license` / `license_compliant` 两个字段；**不满足 license 要求不会跳过或删除
-skill**，筛选发生在 API 可见性层。详见 §6.4。
+skill**，两个字段当前仅作元数据记录，不参与可见性过滤。详见 §6.4。
 
 # 2. openEuler-skills仓库
 ## 2.1 触发入口
@@ -194,8 +193,8 @@ owner 的三种贡献。配置格式以 openEuler-skills 仓库的真实 `skill.
 ### 2.1.3 discover扫描结束
 discover扫描结束后，补跑衍生字段缺口（`_run_remediations_safe()`），并写入`discover-<时间戳>.json` 结果文件。
 
-后台 `discover_scheduler` 还会在每轮结束后推进轮次序号，唤醒 license 全量复核
-任务（见 §6.4）；CLI 模式不走调度器，但扫描阶段同样执行 license 预检。
+后台 `discover_scheduler` 按配置时刻触发下一轮扫描；CLI 模式不走调度器，
+但扫描阶段同样执行 license 预检。
 
 ## 2.2 贡献方式一：`skill_repos` 整仓贡献
 
@@ -590,8 +589,8 @@ flowchart TD
 ```
 
 license 不再是 discover 的跳过条件：构建 latest / 声明版本 / Tag 版本时都会做一次
-license 预检，结果写入 record 的 `license` 与 `license_compliant`，不合规的
-skill 仍照常入库，由 API 可见性层过滤。判定细节见 §6.4。
+license 预检，结果写入 record 的 `license` 与 `license_compliant`。两字段当前仅作
+元数据记录，不参与可见性过滤。判定细节见 §6.4。
 
 ## 6.1 latest Skill
 
@@ -782,8 +781,8 @@ source_author`）的兜底；②③ 是仓库层 `author` 的两级兜底，由
 ## 6.4 license 预检与字段写入
 
 discover 在构建每个 record 时同步完成一次 license 预检，使新入库/内容变化的
-skill 立即拥有 `license` 与 `license_compliant`，不必等 license 全量复核任务。
-预检**只标记，不删除、不跳过**任何 skill。
+skill 立即拥有 `license` 与 `license_compliant`。预检**只标记，不删除、不跳过**
+任何 skill；两个字段目前仅作元数据记录，不参与可见性过滤。
 
 ### 6.4.1 字段语义
 
@@ -811,7 +810,7 @@ skill 立即拥有 `license` 与 `license_compliant`，不必等 license 全量�
 - `SkillScanner` 内按 `(skill_dir, 归一化声明)` 缓存判定结论，同一 skill 的
   latest 行、声明版本行与多个 tag 版本只判定一次；
 - `license_check.enabled=false` 或清单不可用时跳过预检：新增行两个字段为
-  `NULL`，已有行保留数据库原值，由后续 license 全量复核任务补齐。
+  `NULL`，已有行保留数据库原值，等待下一轮扫描回填。
 
 ### 6.4.4 落库规则
 
@@ -821,22 +820,13 @@ skill 立即拥有 `license` 与 `license_compliant`，不必等 license 全量�
 - 两个字段必须成对写入，避免出现“新类型 + 旧结论”的错配；
 - 仓库不可读、git 物化失败等基础设施问题不写 `0`，留待下一轮重试。
 
-### 6.4.5 与 license 全量复核任务的关系
+### 6.4.5 与全量复核、可见性限制的关系
 
-```mermaid
-flowchart LR
-    D["discover 一轮<br/>扫描 + license 预检 + remediation + 结果文件"] --> N["推进轮次序号<br/>notify_all"]
-    N --> L["license 全量复核<br/>补齐 NULL / 跟随准入清单更新 / 回收缓存"]
-    N --> A["LLM 审核（按自身时间窗口）"]
-```
-
-- worker 等 discover 首轮完成后**并行启动** license 与 LLM 审核；
-- 之后 license 跟随每一轮 discover 触发，不再固定 02:00 与扫描并发；
-- `discover_scheduler.enabled=false` 时，license 退化为按
-  `license_check.start_time` 每日触发；
-- 全量复核不删除任何 skill，只更新两个 license 字段并重算 contributor 统计；
-- API 可见性：`license_compliant=0` 从列表/搜索/下载/详情中过滤，`NULL`
-  （未检查）仍可见。
+- license 定时/全量复核任务已移除，discover 扫描内的预检是当前唯一的
+  字段写入路径；
+- 字段当前仅作元数据记录，**不参与列表/搜索/下载/详情等可见性过滤**；
+- 存量数据补齐、跟随准入清单更新结论、缓存回收与可见性限制策略，后续由
+  其他开发者统一规划实现。
 
 # 7. Category 分类
 

@@ -7,41 +7,30 @@
 2. **判定优先级**：SKILL.md 声明优先于 LICENSE 文件；声明缺失才回退文件；
    声明 restricted + 文件 permissive 仍是 0（冲突只写进 reasons）。
 3. **目录级 LICENSE 缓存**：同一仓库多个 skill 只 listing 一次父目录。
-4. **定时任务判定**：``_check_rows`` 按仓库分组、(skill_dir, declared) 复用
-   结论、列表声明可哈希、单条异常降级为 None。
-5. **可见性**：详情/审计接口/下载对 ``license_compliant == 0`` 返回 404；
-   NULL 仍可见。
-6. **路径边界**：skill 目录越出仓库根（``..`` / 绝对路径）按 error 处理，
+4. **路径边界**：skill 目录越出仓库根（``..`` / 绝对路径）按 error 处理，
    不读取仓库外的 LICENSE。
-7. **无工作树 clone**：discover 的 ``--no-checkout`` clone 从 git 对象库
+5. **无工作树 clone**：discover 的 ``--no-checkout`` clone 从 git 对象库
    物化 license 文件（``local_tree``），避免误判为 missing。
-8. **缓存回收**：远程与 ``_local`` 缓存按保留期删除，active 目录、无 marker
+6. **缓存回收**：远程与 ``_local`` 缓存按保留期删除，active 目录、无 marker
    目录、非本模块目录保留；无 marker 的半成品远程缓存不被视为新鲜。
+7. **discover 预检**：返回 license 类型/三态并按目录与声明复用结论；
+   预检异常不写值、不缓存失败结果。
 
-这些用例不依赖真实数据库与网络：判定用本地临时目录，任务与路由用
-``SimpleNamespace`` 桩对象 + monkeypatch。
+license 定时任务已移除，相关调度/落库/可见性用例不再保留。
+
+这些用例不依赖真实数据库与网络：判定用本地临时目录，预检用
+``SimpleNamespace`` 桩对象。
 """
 
-import asyncio
 import os
 import subprocess
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
-from fastapi import HTTPException
-from sqlalchemy.dialects import postgresql
 
-from src.api.routes.skills import (
-    audit_skill,
-    download_skill,
-    get_skill,
-    get_skill_audit_report,
-)
-from src.jobs.discover_scheduler import DiscoverScheduler
-from src.jobs.license_check import LicenseCheckScheduler, LicenseRowResult
 from src.skills.license.gate_engine import (
     STATUS_ALLOWED,
     STATUS_ERROR,
@@ -365,120 +354,6 @@ def test_remote_cache_without_marker_is_not_fresh(tmp_path):
     assert checker._cache_fresh(partial) is True
 
 
-@pytest.mark.asyncio
-async def test_job_prune_caches_passes_active_repo_keys():
-    """任务清理时把本轮仓库 key 传给远程缓存清理，避免误删活跃缓存。"""
-
-    class FakeChecker:
-        def __init__(self):
-            self.remote_args = None
-            self.local_days = None
-
-        def prune_remote_cache(self, keep_days, active_keys):
-            self.remote_args = (keep_days, active_keys)
-            return 1
-
-        def prune_local_cache(self, keep_days):
-            self.local_days = keep_days
-            return 2
-
-    checker = FakeChecker()
-    scheduler = LicenseCheckScheduler(
-        SimpleNamespace(
-            timezone="Asia/Shanghai",
-            start_time="02:00",
-            batch_size=200,
-            repo=SimpleNamespace(
-                remote_concurrency=4,
-                remote_cache_keep_days=7,
-            ),
-        )
-    )
-    rows = [
-        {"url": "https://github.com/acme/demo", "local_path": "/data/demo"},
-        {"url": "https://github.com/acme/demo", "local_path": "/data/demo"},
-        {"url": "", "local_path": "/data/local-only"},
-    ]
-
-    await scheduler._prune_caches(checker, rows)
-
-    assert checker.remote_args == (7, {"github.com_acme_demo"})
-    assert checker.local_days == 7
-
-
-@pytest.mark.asyncio
-async def test_job_check_rows_groups_repo_and_reuses_verdicts(tmp_path):
-    class FakeChecker:
-        def __init__(self):
-            self.calls = []
-
-        def check(self, repo_url, local_path, skill_dir, declared):
-            self.calls.append((repo_url, local_path, skill_dir, declared))
-            if repo_url == "https://example.com/boom":
-                raise RuntimeError("boom")
-            return LicenseCheckResult(
-                LicenseVerdict(STATUS_ALLOWED, expression="MIT"), "local"
-            )
-
-    checker = FakeChecker()
-    scheduler = LicenseCheckScheduler(
-        SimpleNamespace(
-            timezone="Asia/Shanghai",
-            start_time="02:00",
-            batch_size=200,
-            repo=SimpleNamespace(remote_concurrency=4),
-        )
-    )
-    rows = [
-        {
-            "id": "1",
-            "table": "skills",
-            "skill_id": "a",
-            "source_url": "https://example.com/a/SKILL.md",
-            "extra_metadata": {"license": "MIT"},
-            "url": "https://example.com/a",
-            "local_path": None,
-        },
-        {
-            "id": "2",
-            "table": "skill_versions",
-            "skill_id": "a",
-            "source_url": "https://example.com/a/SKILL.md",
-            "extra_metadata": {"license": "MIT"},
-            "url": "https://example.com/a",
-            "local_path": None,
-        },
-        {
-            "id": "3",
-            "table": "skills",
-            "skill_id": "b",
-            "source_url": "https://example.com/b/SKILL.md",
-            "extra_metadata": {"license": "MIT"},
-            "url": "https://example.com/b",
-            "local_path": None,
-        },
-        {
-            "id": "4",
-            "table": "skills",
-            "skill_id": "c",
-            "source_url": "https://example.com/boom/SKILL.md",
-            "extra_metadata": {},
-            "url": "https://example.com/boom",
-            "local_path": None,
-        },
-    ]
-
-    results = await scheduler._check_rows(checker, rows)
-
-    flags = {item.row["id"]: item.flag for item in results}
-    assert flags == {"1": 1, "2": 1, "3": 1, "4": None}
-    # license 类型与三态同一次判定产出；异常行不携带类型
-    assert {item.row["id"]: item.license for item in results}["1"] == "MIT"
-    assert results[-1].license is None
-    # 同一 repo + skill_dir + 声明只判定一次（rows 1/2 复用）
-    assert len([call for call in checker.calls if call[0] == "https://example.com/a"]) == 1
-
-
 @pytest.mark.parametrize("bad_dir", ["../outside", "__ABS__"])
 def test_check_local_rejects_skill_dir_outside_repo(tmp_path, bad_dir):
     """skill_dir 越界（.. 或绝对路径）时按 error 处理，不读取仓库外 LICENSE。"""
@@ -496,209 +371,6 @@ def test_check_local_rejects_skill_dir_outside_repo(tmp_path, bad_dir):
     assert result.verdict.status == STATUS_ERROR
     assert result.repo_source == "error"
     assert verdict_to_flag(result.verdict.status) is None
-
-
-@pytest.mark.asyncio
-async def test_job_check_rows_accepts_list_license_declaration():
-    """frontmatter 允许 license 列表；缓存 key 不能因不可哈希而崩溃。"""
-
-    class FakeChecker:
-        def __init__(self):
-            self.calls = 0
-
-        def check(self, repo_url, local_path, skill_dir, declared):
-            self.calls += 1
-            return LicenseCheckResult(LicenseVerdict(STATUS_ALLOWED), "local")
-
-    checker = FakeChecker()
-    scheduler = LicenseCheckScheduler(
-        SimpleNamespace(
-            timezone="Asia/Shanghai",
-            start_time="02:00",
-            batch_size=200,
-            repo=SimpleNamespace(remote_concurrency=4),
-        )
-    )
-    rows = [
-        {
-            "id": "1",
-            "table": "skills",
-            "skill_id": "a",
-            "source_url": "https://example.com/a/SKILL.md",
-            "extra_metadata": {"license": ["MIT", "Apache-2.0"]},
-            "url": "https://example.com/a",
-            "local_path": None,
-        },
-        {
-            "id": "2",
-            "table": "skill_versions",
-            "skill_id": "a",
-            "source_url": "https://example.com/a/SKILL.md",
-            "extra_metadata": {"license": ["MIT", "Apache-2.0"]},
-            "url": "https://example.com/a",
-            "local_path": None,
-        },
-    ]
-
-    results = await scheduler._check_rows(checker, rows)
-
-    assert {item.row["id"]: item.flag for item in results} == {"1": 1, "2": 1}
-    # 列表声明归一化后可哈希，同一目录/声明只判定一次
-    assert checker.calls == 1
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("handler", [audit_skill, get_skill_audit_report])
-async def test_audit_endpoints_hidden_when_non_compliant(handler):
-    """审计接口与详情同口径：license=0 时不暴露安全信息。"""
-    repo = MagicMock()
-    repo.get_by_skill_id = AsyncMock(
-        return_value=SimpleNamespace(license_compliant=0)
-    )
-    with patch("src.api.routes.skills.SkillRepository", return_value=repo):
-        with pytest.raises(HTTPException) as exc_info:
-            await handler(skill_id="github:acme/demo", db=AsyncMock())
-
-    assert exc_info.value.status_code == 404
-
-
-@pytest.mark.asyncio
-async def test_skill_detail_hidden_when_non_compliant():
-    repo = MagicMock()
-    repo.get_by_skill_id = AsyncMock(
-        return_value=SimpleNamespace(license_compliant=0)
-    )
-    with patch("src.api.routes.skills.SkillRepository", return_value=repo):
-        with pytest.raises(HTTPException) as exc_info:
-            await get_skill(skill_id="github:acme/demo", db=AsyncMock())
-
-    assert exc_info.value.status_code == 404
-
-
-@pytest.mark.asyncio
-async def test_skill_detail_visible_when_unchecked():
-    repo = MagicMock()
-    repo.get_by_skill_id = AsyncMock(
-        return_value=SimpleNamespace(license_compliant=None)
-    )
-    with patch("src.api.routes.skills.SkillRepository", return_value=repo), patch(
-        "src.api.routes.skills.skill_to_response", return_value=MagicMock()
-    ) as mapper:
-        response = await get_skill(skill_id="github:acme/demo", db=AsyncMock())
-
-    assert response is mapper.return_value
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("version", [None, "1.0.0"])
-async def test_skill_download_hidden_when_non_compliant(version):
-    repo = MagicMock()
-    hidden = SimpleNamespace(license_compliant=0, skill_repo=MagicMock())
-    repo.get_with_repository_by_skill_id = AsyncMock(return_value=hidden)
-    repo.get_version_with_repository = AsyncMock(return_value=hidden)
-    with patch("src.api.routes.skills.SkillRepository", return_value=repo):
-        with pytest.raises(HTTPException) as exc_info:
-            await download_skill(
-                skill_id="github:acme/demo",
-                request=MagicMock(),
-                version=version,
-                db=AsyncMock(),
-            )
-
-    assert exc_info.value.status_code == 404
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("version", [None, "1.0.0"])
-async def test_skill_download_allows_unchecked(version):
-    repo = MagicMock()
-    unchecked = SimpleNamespace(license_compliant=None, skill_repo=None)
-    repo.get_with_repository_by_skill_id = AsyncMock(return_value=unchecked)
-    repo.get_version_with_repository = AsyncMock(return_value=unchecked)
-    with patch("src.api.routes.skills.SkillRepository", return_value=repo):
-        with pytest.raises(HTTPException) as exc_info:
-            await download_skill(
-                skill_id="github:acme/demo",
-                request=MagicMock(),
-                version=version,
-                db=AsyncMock(),
-            )
-
-    # 通过了 license 拦截，停在仓库元数据校验
-    assert exc_info.value.status_code == 409
-
-
-@pytest.mark.asyncio
-async def test_job_persist_writes_license_type_with_flag():
-    """落库时 license 与 license_compliant 成对写入，未检查行不覆盖原值。"""
-    scheduler = LicenseCheckScheduler(
-        SimpleNamespace(
-            timezone="Asia/Shanghai",
-            start_time="02:00",
-            batch_size=200,
-            repo=SimpleNamespace(remote_concurrency=4, remote_cache_keep_days=7),
-        )
-    )
-    session = AsyncMock()
-    session_ctx = MagicMock()
-    session_ctx.__aenter__ = AsyncMock(return_value=session)
-    session_ctx.__aexit__ = AsyncMock(return_value=False)
-    contributor_repo = SimpleNamespace(
-        reconcile_skill_counts=AsyncMock(return_value=0)
-    )
-    results = [
-        # 首次得到结论：写入 flag + license
-        LicenseRowResult(
-            {"id": "1", "table": "skills", "license": None, "license_compliant": None},
-            1,
-            "MIT",
-        ),
-        # 仅 license 类型变化也要更新
-        LicenseRowResult(
-            {"id": "2", "table": "skills", "license": "MIT", "license_compliant": 1},
-            1,
-            "Apache-2.0",
-        ),
-        # 两列都未变化：跳过写入
-        LicenseRowResult(
-            {
-                "id": "3",
-                "table": "skill_versions",
-                "license": "MIT",
-                "license_compliant": 1,
-            },
-            1,
-            "MIT",
-        ),
-        # 未完成检查：保持原值，不写库
-        LicenseRowResult(
-            {
-                "id": "4",
-                "table": "skill_versions",
-                "license": "GPL-3.0-only",
-                "license_compliant": 0,
-            },
-            None,
-            None,
-        ),
-    ]
-
-    with (
-        patch("src.jobs.license_check.AsyncSessionLocal", return_value=session_ctx),
-        patch(
-            "src.jobs.license_check.ContributorRepository",
-            return_value=contributor_repo,
-        ),
-    ):
-        counters = await scheduler._persist(results)
-
-    assert counters == {"compliant": 3, "non_compliant": 0, "errors": 1}
-    assert session.execute.await_count == 2
-    written = []
-    for call in session.execute.await_args_list:
-        compiled = call.args[0].compile(dialect=postgresql.dialect())
-        written.append((compiled.params["license_compliant"], compiled.params["license"]))
-    assert sorted(written) == [(1, "Apache-2.0"), (1, "MIT")]
 
 
 @pytest.mark.asyncio
@@ -743,7 +415,7 @@ async def test_discover_precheck_returns_license_and_reuses_cache(tmp_path):
 
 @pytest.mark.asyncio
 async def test_discover_precheck_failure_keeps_fields_null(tmp_path):
-    """预检异常不写入结论（交给定时任务重试），不缓存失败结果。"""
+    """预检异常不写入结论（等待下一轮重试），不缓存失败结果。"""
 
     class BoomChecker:
         def __init__(self):
@@ -773,49 +445,3 @@ async def test_discover_precheck_failure_keeps_fields_null(tmp_path):
     # 失败不缓存：两次调用都会重试
     assert checker.calls == 2
 
-
-@pytest.mark.asyncio
-async def test_license_scheduler_runs_after_each_discover_round():
-    """license 调度器跟随 discover 轮次：每轮结束后执行一次，不并发重入。"""
-    discover = DiscoverScheduler(
-        SimpleNamespace(
-            enabled=True,
-            start_time="00:00",
-            timezone="Asia/Shanghai",
-            result_dir="",
-        )
-    )
-    scheduler = LicenseCheckScheduler(
-        SimpleNamespace(
-            timezone="Asia/Shanghai",
-            start_time="02:00",
-            batch_size=200,
-            repo=SimpleNamespace(remote_concurrency=4, remote_cache_keep_days=7),
-        ),
-        discover_scheduler=discover,
-    )
-    ran = asyncio.Event()
-    calls: list[int] = []
-
-    async def fake_run_once():
-        calls.append(1)
-        ran.set()
-
-    scheduler.run_once = fake_run_once  # type: ignore[method-assign]
-    await scheduler.start()
-    try:
-        # 还没有 discover 轮次结束：不应提前执行
-        await asyncio.sleep(0.01)
-        assert calls == []
-
-        await discover._notify_round_finished()
-        await asyncio.wait_for(ran.wait(), timeout=1)
-        assert len(calls) == 1
-
-        # 每一轮 discover 结束都会再触发一次，直到 stop 取消
-        ran.clear()
-        await discover._notify_round_finished()
-        await asyncio.wait_for(ran.wait(), timeout=1)
-        assert len(calls) == 2
-    finally:
-        await scheduler.stop()

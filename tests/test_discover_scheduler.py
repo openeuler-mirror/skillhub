@@ -1,6 +1,5 @@
 """DiscoverScheduler 单元测试：时间计算、配置接入与调度循环。"""
 
-import asyncio
 import logging
 from datetime import datetime, timedelta
 from types import SimpleNamespace
@@ -372,27 +371,8 @@ class TestSchedulerLoop:
         # 启动先跑一轮；1:00 -> 3:00 间隔 2 小时；到点再跑第二轮
         assert calls == ["run", timedelta(hours=2).total_seconds(), "run"]
 
-    async def test_wait_for_new_round_blocks_until_round_finishes(self):
-        """下游等待方在轮次结束前阻塞，每轮结束后按序号依次唤醒。"""
-        scheduler = DiscoverScheduler(DiscoverSchedulerConfig(enabled=False))
-
-        first = asyncio.create_task(scheduler.wait_for_new_round(-1))
-        await asyncio.sleep(0.01)
-        assert first.done() is False
-
-        await scheduler._notify_round_finished()
-        assert await asyncio.wait_for(first, timeout=1) == 1
-
-        # 已消费第 1 轮后，必须等到第 2 轮结束才能返回
-        second = asyncio.create_task(scheduler.wait_for_new_round(1))
-        await asyncio.sleep(0.01)
-        assert second.done() is False
-
-        await scheduler._notify_round_finished()
-        assert await asyncio.wait_for(second, timeout=1) == 2
-
-    async def test_loop_notifies_round_when_scan_fails(self, caplog):
-        """单轮扫描异常也必须推进轮次并释放等待方。"""
+    async def test_loop_notifies_first_round_when_scan_fails(self, caplog):
+        """单轮扫描异常也必须置位首轮完成信号并记录错误。"""
         caplog.set_level(logging.ERROR, logger="src.jobs.discover_scheduler")
         scheduler = DiscoverScheduler(
             DiscoverSchedulerConfig(enabled=True, start_time="03:00")
@@ -406,7 +386,6 @@ class TestSchedulerLoop:
             scheduler._running = True
             await scheduler._loop()
 
-        assert scheduler.round_seq == 1
         assert scheduler.first_round_done.is_set()
         assert "round failed" in caplog.text
 

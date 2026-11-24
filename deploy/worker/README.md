@@ -15,19 +15,17 @@ worker:
 `api` 是无状态 Web 服务，不启动任何后台任务。本服务（单副本、`replicas: 1`）承载全部后台任务，按顺序执行：
 
 1. 一次性迁移 `run_migration`
-2. discover 定时调度器（含首轮扫描）
-3. 下游任务：license 复核调度器与 LLM 审核调度器
+2. discover 定时调度器（含首轮扫描与扫描内的 license 预检）
+3. LLM 审核调度器（等待 discover 首轮扫描完成后启动）
 4. SkillSpector 安全采集 collector（`security.enable_audit` 开启时）
 
 时序约束：
 
-- license 复核与 LLM 审核都等待 discover 首轮扫描完成（`first_round_done`
-  事件）后再启动，两者互不依赖、并行运行；
-- license 复核此后跟随每一轮 discover：扫描结束后触发一轮全量复核，
-  避免与 discover 并发读取正在更新的本地 clone；discover 未启用时退化为
-  `license_check.start_time` 每日触发；
+- LLM 审核调度器必须等 discover 首轮扫描完成（`first_round_done` 事件）后再启动；
 - discover 扫描新入库/内容变化的 skill 时会同步完成一次 license 预检，
-  新数据的 `license` / `license_compliant` 立即可用。
+  新数据的 `license` / `license_compliant` 立即可用；两个字段目前仅作
+  元数据记录，不参与可见性过滤。
+- license 全量复核与可见性限制后续由其他开发者统一规划实现。
 
 ## 运行
 
