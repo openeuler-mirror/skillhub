@@ -39,7 +39,7 @@ import time
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import select, text, update
+from sqlalchemy import and_, select, text, update
 
 from src.core.config import LicenseCheckConfig, get_settings
 from src.core.database import AsyncSessionLocal
@@ -401,10 +401,26 @@ class LicenseCheckScheduler:
                 model = Skill if table == "skills" else SkillVersion
                 for start in range(0, len(ids), batch_size):
                     chunk = ids[start:start + batch_size]
+                    values: dict[str, Any] = {"license_compliant": flag}
+                    # license 结论纳入 is_complete 口径（见
+                    # skill_readiness.is_skill_complete）：写结论时联动维护
+                    # skills.is_complete，让 license==0 的行从列表/搜索/统计
+                    # 口径消失。skill_versions 无 is_complete 列，跳过。
+                    if table == "skills":
+                        if flag == 0:
+                            values["is_complete"] = False
+                        else:
+                            # flag == 1：恢复由 risk_score + category 决定的
+                            # 常规完备判定（license 不再拦截）
+                            values["is_complete"] = and_(
+                                Skill.risk_score.is_not(None),
+                                Skill.category.is_not(None),
+                                Skill.category != "",
+                            )
                     await session.execute(
                         update(model)
                         .where(model.id.in_(chunk))
-                        .values(license_compliant=flag)
+                        .values(**values)
                     )
                     # 每批提交：某批失败会中断后续批次，但前面已提交的保留
                     await session.commit()

@@ -574,7 +574,9 @@ class SkillScanner:
             'updated_at': datetime.now(timezone.utc),
         }
         if return_skill_model:
-            # 字段完备（risk_score + category 均非空）才对外可见；扫描中即在
+            # 字段完备才对外可见（见 skill_readiness.is_skill_complete）：新扫描
+            # 对象 license 尚未检查（None 不拦截），此处按 risk_score + category
+            # 判定；license_compliant 由 license 任务独立维护。扫描中即在
             # catalog，故同时复位下架标志（恢复可见）。
             common['is_complete'] = is_skill_complete(
                 {'risk_score': security.risk_score, 'category': category}

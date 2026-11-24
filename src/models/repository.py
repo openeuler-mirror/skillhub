@@ -741,6 +741,7 @@ class SkillRepository:
                     **self._build_summary_update_values(
                         skill,
                         download_count=existing_skill.download_count,
+                        license_compliant=existing_skill.license_compliant,
                     )
                 )
             )
@@ -812,6 +813,7 @@ class SkillRepository:
         representative: Skill | SkillVersion,
         *,
         download_count: int,
+        license_compliant: int | None = None,
     ) -> dict[str, Any]:
         """内容变化时的整行更新值。
 
@@ -862,6 +864,12 @@ class SkillRepository:
         # 仅 Skill 具备可见性标志；SkillVersion 无此二列。内容变化时按本次
         # 扫描结果重算完备性、并复位下架标志（在 catalog 中即恢复可见）。
         if isinstance(representative, Skill):
+            # 重算 is_complete 时 license 部分必须用 DB 现值：representative
+            # 是扫描新建对象，license_compliant 恒为 None（license 由 license
+            # 任务独占维护、discover 不写），直接判会把 license==0 的行误判为
+            # 完备并重新暴露到列表/搜索。license_compliant 不进 values（见
+            # docstring），仅用于本次完备性判定。
+            representative.license_compliant = license_compliant
             values["is_complete"] = is_skill_complete(representative)
             values["is_soft_deleted"] = False
         return values
