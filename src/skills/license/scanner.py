@@ -43,10 +43,6 @@ _LICENSE_NAME_RE = re.compile(
     r"^(?:licen[cs]e|licence|copying|unlicense)(?:[-._].*)?$", re.IGNORECASE
 )
 _MARKER = ".license_fetched_at"
-# ``_local`` 缓存目录名是本地仓库路径 sha1 的前 16 位十六进制。
-# 回收时用该模式限定只处理本模块创建的目录，避免 remote_cache_root 误配
-# 到共享目录时删掉 ``_local`` 下其他程序的旧数据。
-_LOCAL_CACHE_NAME_RE = re.compile(r"^[0-9a-f]{16}$")
 
 
 def _is_license_path(path: str) -> bool:
@@ -124,7 +120,7 @@ class LicenseChecker:
       这样既不用为判定触发完整 checkout，也避免把“工作树为空”误判为
       missing（否则所有无 SKILL.md 声明的 skill 都会被写成 0）。
 
-    线程安全：判定逻辑只读共享的准入清单与缓存字典，定时任务通过
+    线程安全：判定逻辑只读共享的准入清单与缓存字典，discover 通过
     ``asyncio.to_thread`` 并发调用是安全的（缓存命中/写入均为单次 dict
     操作，最坏情况是重复计算一次）。
     """
@@ -410,8 +406,7 @@ class LicenseChecker:
 
         只要有 marker 才算完整缓存：``_fetch_remote`` 成功写完文件后才写
         marker，拉取中断留下的半成品目录没有 marker。若按目录 mtime 判定
-        为新鲜，半成品会被直接扫描并可能把整个仓库误判为 ``missing``；
-        同时这类目录也不符合 ``prune_remote_cache`` 的回收条件，会永久残留。
+        为新鲜，半成品会被直接扫描并可能把整个仓库误判为 ``missing``。
         因此没有 marker 一律视为不新鲜，由调用方重新拉取（拉取前会清空目录）。
         """
         marker = path / _MARKER
@@ -527,101 +522,3 @@ class LicenseChecker:
         except OSError:
             logger.warning("git command failed: %s", " ".join(cmd[:3]), exc_info=True)
             return 1, "" if text else b""
-
-    def prune_remote_cache(
-        self,
-        keep_days: int,
-        active_keys: set[str] | None = None,
-    ) -> int:
-        """清理本轮未使用且超过保留期的远程仓库缓存。
-
-        :param keep_days: 保留天数；``<= 0`` 表示禁用清理
-        :param active_keys: 本轮仍在扫描的 ``normalize_repo_key`` 集合。
-            命中的目录即使 mtime 很旧也保留，避免删掉仍在使用的缓存。
-        """
-        if self._remote_cache_root is None or keep_days <= 0:
-            return 0
-        removed = 0
-        cutoff = time.time() - keep_days * 86400
-        try:
-            entries = list(self._remote_cache_root.iterdir())
-        except OSError:
-            return 0
-        for entry in entries:
-            # 不跟随/删除软链接，避免 remote_cache_root 中混入链接时误操作
-            if entry.is_symlink() or not entry.is_dir():
-                continue
-            # _local 是本地 clone 的 license 物化缓存，由 prune_local_cache
-            # 按自己的 active 集合单独清理。
-            if entry.name == "_local":
-                continue
-            if active_keys is not None and entry.name in active_keys:
-                continue
-            try:
-                marker = entry / _MARKER
-                # 只回收本模块创建的缓存目录：没有 marker 的目录可能属于
-                # 其他数据（remote_cache_root 误配到共享目录），一律不删。
-                if not marker.is_file():
-                    continue
-                mtime = marker.stat().st_mtime
-            except OSError:
-                continue
-            if mtime < cutoff:
-                shutil.rmtree(entry, ignore_errors=True)
-                removed += 1
-        return removed
-
-    def prune_local_cache(self, keep_days: int) -> int:
-        """清理本轮未使用且超过保留期的 ``_local`` 物化缓存。
-
-        ``_local`` 的目录名是本地仓库路径哈希，无法从远程 URL 反推，因此
-        用本轮实际物化过的目录（``_local_trees``）作为 active 集合：
-        本轮用到的目录无论 mtime 多旧都不删；仓库从配置移除、local_path
-        变化后遗留的旧目录才会在超过保留期后被回收。
-
-        只处理「目录名是 16 位 sha1 前缀 + 含 marker」的本模块目录：
-        - 没有 marker 的目录可能是物化中断的残留或其他程序的数据，
-          ``_materialize_local_license_tree`` 下次会自行重建，无需在此删除；
-        - 名字不符合规则的目录一律跳过，防止 ``remote_cache_root`` 误配到
-          共享目录时误删 ``_local`` 下的无关数据。
-        """
-        if self._remote_cache_root is None or keep_days <= 0:
-            return 0
-        local_root = self._remote_cache_root / "_local"
-        try:
-            entries = list(local_root.iterdir())
-        except OSError:
-            return 0
-
-        active: set[str] = set()
-        with self._local_lock:
-            for path in self._local_trees.values():
-                try:
-                    active.add(str(path.resolve()))
-                except (OSError, RuntimeError):
-                    continue
-
-        removed = 0
-        cutoff = time.time() - keep_days * 86400
-        for entry in entries:
-            # 与远程回收一致：跳过软链接；目录名必须是本模块的 sha1 前缀，
-            # 否则可能是误放在 _local 下的其他数据，不能删。
-            if entry.is_symlink() or not entry.is_dir():
-                continue
-            if not _LOCAL_CACHE_NAME_RE.match(entry.name):
-                continue
-            try:
-                if str(entry.resolve()) in active:
-                    continue
-                marker = entry / _MARKER
-                # 物化成功时一定会写 marker；没有 marker 的目录不是完整缓存，
-                # 不按本模块缓存处理（下次物化时会自行重建）。
-                if not marker.is_file():
-                    continue
-                mtime = marker.stat().st_mtime
-            except (OSError, RuntimeError):
-                continue
-            if mtime < cutoff:
-                shutil.rmtree(entry, ignore_errors=True)
-                removed += 1
-        return removed
