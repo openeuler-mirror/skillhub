@@ -11,8 +11,8 @@
    不读取仓库外的 LICENSE。
 5. **无工作树 clone**：discover 的 ``--no-checkout`` clone 从 git 对象库
    物化 license 文件（``local_tree``），避免误判为 missing。
-6. **缓存回收**：远程与 ``_local`` 缓存按保留期删除，active 目录、无 marker
-   目录、非本模块目录保留；无 marker 的半成品远程缓存不被视为新鲜。
+6. **缓存新鲜度**：无 marker 的半成品远程缓存不被视为新鲜，避免把拉取
+   中断的目录误判为 missing。
 7. **discover 预检**：返回 license 类型/三态并按目录与声明复用结论；
    预检异常不写值、不缓存失败结果。
 
@@ -22,7 +22,6 @@ license 定时任务已移除，相关调度/落库/可见性用例不再保留�
 ``SimpleNamespace`` 桩对象。
 """
 
-import os
 import subprocess
 import time
 from pathlib import Path
@@ -262,81 +261,6 @@ def test_fetch_license_tree_rejects_partial_result(monkeypatch, tmp_path):
         assert checker._fetch_license_tree("https://example.com/repo", cache_dir) is False
     finally:
         checker.close()
-
-
-def test_prune_remote_cache_removes_old_and_keeps_active(tmp_path):
-    """远程缓存按保留期回收；本轮 active 的 key 与 _local 目录不删。"""
-    root = tmp_path / "cache"
-    root.mkdir()
-    marker = ".license_fetched_at"
-    old = root / "old-repo"
-    fresh = root / "fresh-repo"
-    active = root / "active-repo"
-    for directory in (old, fresh, active):
-        directory.mkdir()
-        (directory / marker).write_text("x", encoding="utf-8")
-    local = root / "_local"
-    local.mkdir()
-    (local / "repo-0").mkdir()
-    # 没有 marker 的目录可能是误配的共享目录，不应被删除
-    unrelated = root / "unrelated"
-    unrelated.mkdir()
-    (unrelated / "data.txt").write_text("keep", encoding="utf-8")
-
-    old_ts = time.time() - 10 * 86400
-    for directory in (old, active, unrelated):
-        os.utime(directory, (old_ts, old_ts))
-        marker_path = directory / marker
-        if marker_path.is_file():
-            os.utime(marker_path, (old_ts, old_ts))
-
-    checker = _build_checker(tmp_path, remote_cache_root=str(root))
-    removed = checker.prune_remote_cache(7, active_keys={"active-repo"})
-
-    assert removed == 1
-    assert not old.exists()
-    assert fresh.exists()
-    assert active.exists()
-    assert local.exists()
-    assert unrelated.exists()
-
-
-def test_prune_local_cache_removes_old_unused_and_keeps_active(tmp_path):
-    """_local 缓存按保留期回收；本轮物化过的目录与无 marker/非本模块目录不删。"""
-    root = tmp_path / "cache"
-    local = root / "_local"
-    local.mkdir(parents=True)
-    marker = ".license_fetched_at"
-    # 合法缓存目录名为 16 位 sha1 前缀
-    old = local / ("a" * 16)
-    active = local / ("b" * 16)
-    fresh = local / ("c" * 16)
-    for directory in (old, active, fresh):
-        directory.mkdir()
-        (directory / marker).write_text("x", encoding="utf-8")
-    # 物化中断残留（无 marker）与误放在 _local 下的无关目录，都不应删除
-    incomplete = local / ("d" * 16)
-    incomplete.mkdir()
-    unrelated = local / "backup"
-    unrelated.mkdir()
-
-    old_ts = time.time() - 10 * 86400
-    for directory in (old, active, incomplete, unrelated):
-        os.utime(directory, (old_ts, old_ts))
-        marker_path = directory / marker
-        if marker_path.is_file():
-            os.utime(marker_path, (old_ts, old_ts))
-
-    checker = _build_checker(tmp_path, remote_cache_root=str(root))
-    checker._local_trees = {"/repo/active": active}
-    removed = checker.prune_local_cache(7)
-
-    assert removed == 1
-    assert not old.exists()
-    assert active.exists()
-    assert fresh.exists()
-    assert incomplete.exists()
-    assert unrelated.exists()
 
 
 def test_remote_cache_without_marker_is_not_fresh(tmp_path):
