@@ -12,8 +12,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "015_add_skill_visibility"
-down_revision: str | None = "014_add_skill_embedding_hnsw"
+revision: str = "016_add_skill_visibility"
+down_revision: str | None = "015_add_license_compliant"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
