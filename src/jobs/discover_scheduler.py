@@ -176,14 +176,14 @@ class DiscoverScheduler:
                 contributor_repository=ContributorRepository(session),
                 catalog_path=repository_path,
             )
-            # 先同步删除 catalog 中已消失的仓库，再开始扫描新增/更新。
+            # 先同步隐藏 catalog 中已消失的仓库，再开始扫描新增/更新。
             # 失败仅记录日志，不阻断本轮扫描（清理属于自愈，非主流程）。
             try:
-                removed_repos = await manager.delete_removed_catalog_repos(requests)
-                removed_skills = await manager.delete_removed_catalog_skills(requests)
+                removed_repos = await manager.hide_removed_catalog_repos(requests)
+                removed_skills = await manager.hide_removed_catalog_skills(requests)
                 if removed_repos or removed_skills:
                     logger.info(
-                        "%s synced catalog removals before scan: %d repo(s), %d skill(s) deleted",
+                        "%s synced catalog removals before scan: %d repo(s), %d skill(s) hidden",
                         LOG_PREFIX,
                         removed_repos,
                         removed_skills,

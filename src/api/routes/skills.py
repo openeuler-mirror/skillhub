@@ -602,27 +602,15 @@ async def get_skill_versions(
     db: AsyncSession = Depends(get_db),
 ):
     skill_repo = SkillRepository(db)
-    latest_skill = await skill_repo.get_by_skill_id(skill_id)
+    latest_skill = await skill_repo.get_visible_by_skill_id(skill_id)
+    if not latest_skill:
+        raise HTTPException(status_code=404, detail="Skill not found")
+
     tagged_versions = await skill_repo.get_versions_by_base_skill(None, skill_id)
-
-    if not latest_skill and not tagged_versions:
-        raise HTTPException(status_code=404, detail="Skill not found")
-
-    # license 可见性：版本列表按每个 skill_versions 行自己的结论过滤
-    # （在 get_versions_by_base_skill 内完成）；latest 为 0 不影响历史
-    # 版本列表，避免合规的旧版本被最新版本的问题连带隐藏。
-    # 但若 latest 不合规且没有任何可见版本，与详情保持一致返回 404，
-    # 不向调用方暴露“该 skill 存在但被 license 全部拦截”。
-    if not tagged_versions and latest_skill is not None and latest_skill.license_compliant == 0:
-        raise HTTPException(status_code=404, detail="Skill not found")
 
     # 只返回 skill_versions 表的历史版本（Tag 版本），不包含 skills 表的 latest 行
     versions = list(tagged_versions) if tagged_versions else []
-    source_url = (
-        latest_skill.source_url
-        if latest_skill
-        else (versions[0].source_url if versions else "")
-    )
+    source_url = latest_skill.source_url
 
     return SkillVersionsResponse(
         source_url=source_url,
@@ -652,12 +640,15 @@ async def download_skill(
     repo = SkillRepository(db)
 
     if version:
+        # 版本可见性跟随其 base skill（skills 表同 skill_id 的最新行）
+        if not await repo.get_visible_by_skill_id(skill_id):
+            raise HTTPException(status_code=404, detail="Skill not found")
         skill = await repo.get_version_with_repository(skill_id, version)
         if not skill:
             raise HTTPException(status_code=404, detail="Skill version not found")
         resource_type = "skill_version"
     else:
-        skill = await repo.get_with_repository_by_skill_id(skill_id)
+        skill = await repo.get_visible_with_repository_by_skill_id(skill_id)
         if not skill:
             raise HTTPException(status_code=404, detail="Skill not found")
         resource_type = "skill"
@@ -708,7 +699,7 @@ async def download_skill(
 @router.get("/{skill_id:path}", response_model=SkillResponse | ErrorResponse)
 async def get_skill(skill_id: SkillIdPath, db: AsyncSession = Depends(get_db)):
     repo = SkillRepository(db)
-    skill = await repo.get_by_skill_id(skill_id)
+    skill = await repo.get_visible_by_skill_id(skill_id)
 
     if not skill:
         raise HTTPException(status_code=404, detail="Skill not found")
