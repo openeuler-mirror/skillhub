@@ -436,8 +436,12 @@ class LicenseAccessList:
                 return base_status, base_reasons
             if exception_id is None:
                 return STATUS_UNKNOWN, [error]
-            exception_entry = self._entries[exception_id]
-            if not exception_entry["exception"] or exception_entry["black"]:
+            exception_entry = self._entries.get(exception_id)
+            if (
+                exception_entry is None
+                or not exception_entry["exception"]
+                or exception_entry["black"]
+            ):
                 return STATUS_UNKNOWN, [
                     f"不是有效的 license 例外条款: {exception_token}",
                 ]

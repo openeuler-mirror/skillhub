@@ -25,10 +25,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import text
+from sqlalchemy import and_, or_, text, update
 
 from src.ai.category_classifier import DeepSeekCategoryClassifier
 from src.core.database import AsyncSessionLocal
+from src.models.orm import Skill
 
 logger = logging.getLogger(__name__)
 LOG_PREFIX = "[Remediation][Category]"
@@ -127,7 +128,7 @@ async def _classify_rows(
             stats.failed += 1
             logger.exception("%s classify exception: skill_id=%s", LOG_PREFIX, row.id)
             continue
-        if category is None:
+        if not category:
             stats.unclassified += 1
             logger.info(
                 "%s unclassified: skill_id=%s (no valid frontmatter or LLM result)",
@@ -144,11 +145,21 @@ async def _write_categories(pairs: list[tuple[uuid.UUID, str]]) -> int:
     async with AsyncSessionLocal() as session:
         for row_id, category in sorted(pairs, key=lambda pair: pair[0]):
             result = await session.execute(
-                text(
-                    "UPDATE skills SET category = :category "
-                    "WHERE id = :id AND (category IS NULL OR category = '')"
-                ),
-                {"id": row_id, "category": category},
+                # 回填 category 后，字段完备需 risk_score 非空且 license 未判为
+                # 不合规（license_compliant==0 视为不完备；NULL 未检查不拦截）。
+                # 必填字段清单见 src/skills/skill_readiness.COMPLETE_REQUIRED_FIELDS。
+                update(Skill)
+                .where(
+                    Skill.id == row_id,
+                    or_(Skill.category.is_(None), Skill.category == ""),
+                )
+                .values(
+                    category=category,
+                    is_complete=and_(
+                        Skill.risk_score.is_not(None),
+                        Skill.license_compliant.is_distinct_from(0),
+                    ),
+                )
             )
             updated += result.rowcount or 0
         await session.commit()

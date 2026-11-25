@@ -35,7 +35,7 @@ class TestConfigIntegration:
 
         settings = Settings()
         assert settings.discover_scheduler.enabled is False
-        assert settings.discover_scheduler.start_time == "03:00"
+        assert settings.discover_scheduler.start_time == "00:00"
         assert settings.discover_scheduler.timezone == "Asia/Shanghai"
 
     def test_config_yaml_section_parsed(self):
@@ -185,7 +185,7 @@ class TestRunDiscoverOnce:
             ):
                 await scheduler.run_discover_once()
 
-        files = list(tmp_path.glob("discover-*.json"))
+        files = list(tmp_path.rglob("discover-*.json"))
         assert len(files) == 1
         document = json_lib.loads(files[0].read_text(encoding="utf-8"))
 
@@ -266,7 +266,7 @@ class TestRunDiscoverOnce:
                 await scheduler.run_discover_once()
 
         document = json_lib.loads(
-            next(tmp_path.glob("discover-*.json")).read_text(encoding="utf-8")
+            next(tmp_path.rglob("discover-*.json")).read_text(encoding="utf-8")
         )
         failed = next(repo for repo in document["repos"] if repo["outcome"] == "failed")
         assert failed["error"] == "clone timeout"
@@ -476,4 +476,4 @@ class TestSkillStatsWithNotes:
         assert merged["total_skills"] == 9008
         assert merged["security_audit"]["audited"] == 8996
         assert merged["index_creation"]["not_required"] == 8
-        assert merged["index_creation"]["not_required_note"].startswith("未审计且未建索引")
+        assert merged["index_creation"]["not_required_note"].startswith("字段未完备或已下架且未建索引")

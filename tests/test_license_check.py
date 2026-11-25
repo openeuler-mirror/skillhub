@@ -182,6 +182,26 @@ def test_unknown_declared_license_is_non_compliant(tmp_path):
     assert verdict_to_flag(verdict.status) == 0
 
 
+def test_with_extra_allow_exception_returns_unknown_not_keyerror(tmp_path):
+    """WITH 后的例外令牌命中 extra_allow（不在准入清单）时，不应抛 KeyError。
+
+    ``resolve`` 对未收录 token 会返回 ``extra_allow`` 中的值，而该值并不在
+    ``_entries`` 里；WITH 分支若直接 ``self._entries[...]`` 下标会 KeyError。
+    期望返回 unknown（非 allowed），而不是崩溃。
+    """
+    access_file = tmp_path / "access.yaml"
+    access_file.write_text(ACCESS_LIST, encoding="utf-8")
+    access = LicenseAccessList(
+        source=str(access_file), extra_allow=["CANN-2.0"]
+    ).load()
+
+    verdict = access.evaluate("MIT WITH CANN-2.0")
+
+    assert verdict.status == STATUS_UNKNOWN
+    assert verdict_to_flag(verdict.status) == 0
+    assert any("例外" in reason for reason in verdict.reasons)
+
+
 def test_scanner_accepts_list_declaration(tmp_path):
     """frontmatter 的 license 列表（YAML 块列表/行内列表）按 AND 判定。"""
     _write_license(tmp_path, APACHE_TEXT)

@@ -71,17 +71,9 @@ class SearchService:
         tags: list[str] | None = None,
         security_level: list[str] | None = None,
     ):
-        # license 可见性规则与 SkillRepository._apply_skill_filters 保持一致：
-        # 只排除判定为 0 的 Skill；NULL（未检查）仍可见。
-        # SQL 三值逻辑下 `license_compliant != 0` 会把 NULL 一起排除，
-        # 因此必须显式 OR NULL 分支。
-        query = query.where(Skill.risk_score.is_not(None))
-        query = query.where(
-            or_(
-                Skill.license_compliant.is_(None),
-                Skill.license_compliant == 1,
-            )
-        )
+        # 全局规则：仅搜索字段完备（is_complete=True）且未下架（is_soft_deleted=False）的 Skill
+        query = query.where(Skill.is_complete.is_(True))
+        query = query.where(Skill.is_soft_deleted.is_(False))
         if category:
             conditions = []
             normal_cats = []
@@ -649,13 +641,7 @@ class SearchService:
     ) -> dict[str, Any]:
         embedding_str = "[" + ",".join(str(x) for x in embedding) + "]"
 
-        # 语义检索走原生 SQL，条件是 ORM 侧可见性规则的手工镜像：
-        # 新增/调整过滤条件时必须同步修改本列表，否则语义结果会绕过口径。
-        where_clauses = [
-            "embedding IS NOT NULL",
-            "risk_score IS NOT NULL",
-            "(license_compliant IS NULL OR license_compliant = 1)",
-        ]
+        where_clauses = ["embedding IS NOT NULL", "is_complete IS TRUE", "is_soft_deleted IS FALSE"]
         params: dict[str, Any] = {"limit": limit, "offset": offset, "embedding": embedding_str}
 
         if category:

@@ -179,7 +179,7 @@ class TestSkillRepositoryUnit:
         assert "UPDATE skills SET" in str(compiled)
         assert "updated_at=" in str(compiled)
         assert compiled.params["download_count"] == 12
-        # 内容变化时写本次扫描实得分数（旧内容的 77 不能绑定到新 tree_hash）
+        # 内容变化时写扫描实得分：新 tree_hash 对应新内容，不复用旧审计分
         assert compiled.params["risk_score"] == 10
         # 本轮未完成 license 预检（没有 _license_checked 标记）时，UPDATE
         # 不触碰 license 两列，保留数据库已有结论。
@@ -246,6 +246,23 @@ class TestSkillRepositoryUnit:
         assert compiled.params["license"] == "MIT"
         assert compiled.params["license_compliant"] == 1
 
+    def test_is_skill_complete_ignores_license_compliant(self):
+        """license / license_compliant 仅作元数据，不参与完备性（可见性）判定。"""
+        from src.skills.skill_readiness import is_skill_complete
+
+        assert is_skill_complete(
+            {"risk_score": 10, "category": "Development", "license_compliant": 0}
+        ) is True
+        assert is_skill_complete(
+            {"risk_score": 10, "category": "Development", "license_compliant": None}
+        ) is True
+        assert is_skill_complete(
+            {"risk_score": 10, "category": "", "license_compliant": 1}
+        ) is False
+        assert is_skill_complete(
+            {"risk_score": None, "category": "Development", "license": "MIT"}
+        ) is False
+
     @pytest.mark.asyncio
     async def test_store_skills_skips_unchanged_existing_skill(self):
         repo_id = uuid.uuid4()
@@ -257,6 +274,7 @@ class TestSkillRepositoryUnit:
             commit_id="old-commit",
             tree_hash="same-tree",
             download_count=12,
+            is_soft_deleted=False,
         )
         scanned = SimpleNamespace(
             skill_repo_id=repo_id,
@@ -519,8 +537,8 @@ class TestSkillRepositoryUnit:
         assert manager.workspace_base == tmp_path.resolve()
 
     def test_skillcrawler_platform_choices_use_catalog_groups(self):
-        assert PLATFORM_CHOICES == ("community", "enterprise", "personal")
-        with pytest.raises(ValueError, match="expected community"):
+        assert PLATFORM_CHOICES == ("personal", "community", "enterprise")
+        with pytest.raises(ValueError, match="expected personal"):
             _normalize_platform("openeuler")
 
     def test_single_skill_yaml_builds_repo_and_skill_requests(self, tmp_path):
@@ -1533,20 +1551,19 @@ repositories:
         migrated = executed[0].compile(dialect=postgresql.dialect()).params
         assert migrated["platform"] == "community"
 
-    async def test_delete_removed_catalog_repos_deletes_moved_community_author(self):
+    async def test_hide_removed_catalog_repos_hides_moved_community_author(self):
         """community 仓库从旧 SIG 挪到新 SIG：数据库记录的 (platform, author,
-        repo_name) 组合在 catalog 期望集合中已不存在，按交集删除旧归属，
+        repo_name) 组合在 catalog 期望集合中已不存在，按交集隐藏旧归属，
         供后续扫描重建到新归属。"""
 
         session = MagicMock()
         skill_repository = MagicMock()
         skill_repository.session = session
         repo_repository = MagicMock()
-        repo_repository.delete_skill_repositories = AsyncMock()
+        repo_repository.soft_delete_skill_repositories = AsyncMock()
         repo_repository.reconcile_skill_nums = AsyncMock(return_value=0)
         contributor_repository = MagicMock()
         contributor_repository.reconcile_skill_counts = AsyncMock(return_value=0)
-        contributor_repository.delete_contributors_without_skills = AsyncMock(return_value=0)
         manager = SkillManager(skill_repository, repo_repository, contributor_repository)
 
         moved_request = SkillRepositoryRequest(
@@ -1583,28 +1600,27 @@ repositories:
             ]
         )
 
-        deleted = await manager.delete_removed_catalog_repos(
+        hidden = await manager.hide_removed_catalog_repos(
             [moved_request, stayed_request]
         )
 
-        assert deleted == 1
-        repo_repository.delete_skill_repositories.assert_awaited_once()
-        removed_ids = repo_repository.delete_skill_repositories.await_args.args[0]
+        assert hidden == 1
+        repo_repository.soft_delete_skill_repositories.assert_awaited_once()
+        removed_ids = repo_repository.soft_delete_skill_repositories.await_args.args[0]
         assert removed_ids == [1]
 
-    async def test_delete_removed_catalog_repos_uses_url_owner_for_non_community(self):
+    async def test_hide_removed_catalog_repos_uses_url_owner_for_non_community(self):
         """非 community 仓库的 (author, repo_name) 中 author 取 URL owner，
-        URL 未变则归属未变，不会被误删。"""
+        URL 未变则归属未变，不会被误隐藏。"""
 
         session = MagicMock()
         skill_repository = MagicMock()
         skill_repository.session = session
         repo_repository = MagicMock()
-        repo_repository.delete_skill_repositories = AsyncMock()
+        repo_repository.soft_delete_skill_repositories = AsyncMock()
         repo_repository.reconcile_skill_nums = AsyncMock(return_value=0)
         contributor_repository = MagicMock()
         contributor_repository.reconcile_skill_counts = AsyncMock(return_value=0)
-        contributor_repository.delete_contributors_without_skills = AsyncMock(return_value=0)
         manager = SkillManager(skill_repository, repo_repository, contributor_repository)
 
         request = SkillRepositoryRequest(
@@ -1626,10 +1642,10 @@ repositories:
             ]
         )
 
-        deleted = await manager.delete_removed_catalog_repos([request])
+        hidden = await manager.hide_removed_catalog_repos([request])
 
-        assert deleted == 0
-        repo_repository.delete_skill_repositories.assert_not_called()
+        assert hidden == 0
+        repo_repository.soft_delete_skill_repositories.assert_not_called()
 
     async def test_sync_catalog_source_skips_when_platform_unchanged(self):
         """Issue #9: no migration (and no writes) when the catalog view matches."""
@@ -1820,6 +1836,8 @@ repositories:
             author="wordpress",
             source="github",
             platform="enterprise",
+            is_complete=True,
+            is_soft_deleted=False,
         )
 
         with (
