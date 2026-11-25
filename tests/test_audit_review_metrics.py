@@ -114,7 +114,7 @@ def test_save_run_result_writes_json(tmp_path):
     path = save_run_result({"run_id": "run-1"}, config)
 
     assert path is not None
-    assert path.parent == tmp_path
+    assert path.parent.parent == tmp_path
     assert path.name.startswith("audit-review-")
     assert path.name.endswith(".json")
     assert path.read_text(encoding="utf-8").strip().startswith("{")

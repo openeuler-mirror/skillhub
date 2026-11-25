@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import and_, select, update
 
 from src.core.database import AsyncSessionLocal
 from src.models.orm import SecurityAudit, Skill, SkillVersion
@@ -79,7 +79,19 @@ async def persist(
         if application.score is not None:
             resource_id = row.get("resource_id")
             updated = await session.execute(
-                update(Skill).where(Skill.id == resource_id).values(risk_score=application.score)
+                update(Skill)
+                .where(Skill.id == resource_id)
+                .values(
+                    risk_score=application.score,
+                    # 字段完备需 category 非空且 license 未判为不合规
+                    # （license_compliant==0 视为不完备；NULL 未检查不拦截）；
+                    # 必填字段清单见 src/skills/skill_readiness.COMPLETE_REQUIRED_FIELDS
+                    is_complete=and_(
+                        Skill.category.is_not(None),
+                        Skill.category != "",
+                        Skill.license_compliant.is_distinct_from(0),
+                    ),
+                )
             )
             if updated.rowcount == 0:
                 await session.execute(
