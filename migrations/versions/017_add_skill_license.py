@@ -25,7 +25,11 @@
 迁移完成后存量行全部为 NULL。随后：
 
 - discover 在扫描新入库/内容变化的 skill 时做一次 license 预检并写入；
-- license 定时任务在 discover 每轮完成后全量复核并补齐历史数据。
+- 两个字段仅作为元数据记录，不参与可见性过滤。
+
+由于上游 016 的 ``is_complete`` 回填曾把 license 合规纳入可见口径，本迁移
+同时按“仅必填字段”口径重算一次 ``skills.is_complete``，确保 license 不再
+影响展示/搜索。
 
 由 license 判定流程按 ``verdict.expression`` 回填，不需要在本迁移中做
 不可靠的 JSONB 反解析（``extra_metadata.license`` 可能是列表或描述性文本）。
@@ -35,8 +39,8 @@ from collections.abc import Sequence
 
 from alembic import op
 
-revision: str = "016_add_skill_license"
-down_revision: str | None = "015_add_license_compliant"
+revision: str = "017_add_skill_license"
+down_revision: str | None = "016_add_skill_visibility"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
@@ -48,6 +52,12 @@ def upgrade() -> None:
         op.execute(
             f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS license TEXT NULL"
         )
+    # license 不参与可见性：按必填字段口径重算 is_complete。幂等（只写值），
+    # 可与 016 已执行的 license 联动回填结果对齐。
+    op.execute(
+        "UPDATE skills SET is_complete = "
+        "(risk_score IS NOT NULL AND category IS NOT NULL AND category <> '')"
+    )
 
 
 def downgrade() -> None:

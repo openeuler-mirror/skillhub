@@ -33,6 +33,7 @@ from src.skills.skill_parser import (
 )
 from src.models.orm import Skill, SkillVersion
 from src.models.repository import SkillRepository
+from src.skills.skill_readiness import is_skill_complete
 
 from src.skills.skill_id import build_skill_id, extract_owner_repo
 from src.skills.license.gate_engine import normalize_expression
@@ -618,6 +619,15 @@ class SkillScanner:
             'created_at': datetime.now(timezone.utc),
             'updated_at': datetime.now(timezone.utc),
         }
+        if return_skill_model:
+            # 字段完备才对外可见（见 skill_readiness.is_skill_complete）：此处
+            # 按 risk_score + category 判定；license / license_compliant 仅作为
+            # 元数据记录，不参与可见性。扫描中即在 catalog，故同时复位下架
+            # 标志（恢复可见）。
+            common['is_complete'] = is_skill_complete(
+                {'risk_score': security.risk_score, 'category': category}
+            )
+            common['is_soft_deleted'] = False
         model_class = Skill if return_skill_model else SkillVersion
         record = model_class(**common)
         setattr(record, '_security_audit_triggered', security.audit_triggered)

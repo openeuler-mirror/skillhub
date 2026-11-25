@@ -1,13 +1,12 @@
 # worker 服务
 
-后台任务工作进程，与 `api` 共用同一个镜像（[../api/Dockerfile](../api/Dockerfile)），仅在 `compose.yaml` 中通过 `command` 覆盖启动命令：
+后台任务工作进程，使用独立镜像（[./Dockerfile](./Dockerfile)），启动命令在其 `CMD` 中定义，不再依赖 `compose.yaml` 覆盖 `command`：
 
 ```yaml
 worker:
   build:
     context: ..
-    dockerfile: deploy/api/Dockerfile
-  command: ["python", "-m", "src.jobs.worker"]
+    dockerfile: deploy/worker/Dockerfile
 ```
 
 ## 职责
@@ -32,6 +31,10 @@ docker compose up -d worker
 
 日志落在 `<storage.local_path>/logs/worker.log`（默认 `/opt/wittyhub/logs/worker.log`），与 `api.log` 分离。
 
-## 为什么没有独立的 Dockerfile
+## 为什么独立 Dockerfile
 
-worker 与 api 共享全部应用代码、依赖与数据库迁移，仅启动入口不同（`python -m src.jobs.worker` vs `uvicorn src.api.main:app`）。为保持单一镜像、避免重复构建，worker 直接复用 `deploy/api/Dockerfile`，其 `ENTRYPOINT`（等待数据库就绪 + `alembic upgrade head` + `pg_advisory_lock` 串行化迁移）对两个服务均生效。
+worker 与 api 共享全部应用代码、依赖与数据库迁移，仅启动入口不同（`python -m src.jobs.worker` vs `uvicorn src.api.main:app`）。独立 Dockerfile 只在这点差异上分离：
+
+- `CMD` 换成 worker 启动命令（不再由 `compose.yaml` 的 `command` 覆盖）；
+- 去掉 `EXPOSE 8081` 与 `HEALTHCHECK`（worker 不监听 HTTP 端口，崩溃由 `restart: unless-stopped` 兜底）；
+- `ENTRYPOINT` 仍复用 `deploy/api/entrypoint.sh`（等待数据库就绪 + `alembic upgrade head` + `pg_advisory_lock` 串行化迁移），保证 api 与 worker 使用同一份 schema 迁移逻辑。

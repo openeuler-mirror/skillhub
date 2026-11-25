@@ -71,10 +71,10 @@ class SearchService:
         tags: list[str] | None = None,
         security_level: list[str] | None = None,
     ):
-        # 检索可见口径：只排除尚未完成安全审计（risk_score 为空）的 Skill。
-        # license / license_compliant 仅作为字段记录，不参与可见性过滤，
-        # 可见性限制策略后续统一规划。
-        query = query.where(Skill.risk_score.is_not(None))
+        # 全局规则：仅搜索字段完备（is_complete=True）且未下架（is_soft_deleted=False）的 Skill。
+        # is_complete 只由必填字段决定，license / license_compliant 不参与可见性。
+        query = query.where(Skill.is_complete.is_(True))
+        query = query.where(Skill.is_soft_deleted.is_(False))
         if category:
             conditions = []
             normal_cats = []
@@ -645,13 +645,10 @@ class SearchService:
     ) -> dict[str, Any]:
         embedding_str = "[" + ",".join(str(x) for x in embedding) + "]"
 
-        # 语义检索走原生 SQL，条件是 ORM 侧可见性规则的手工镜像：
-        # 新增/调整过滤条件时必须同步修改本列表，否则语义结果会绕过口径。
+        # 语义检索走原生 SQL，可见口径与 ORM 侧保持一致（is_complete + 未下架）；
+        # 调整过滤条件时必须同步修改本列表，否则语义结果会绕过口径。
         # license / license_compliant 不参与可见性过滤。
-        where_clauses = [
-            "embedding IS NOT NULL",
-            "risk_score IS NOT NULL",
-        ]
+        where_clauses = ["embedding IS NOT NULL", "is_complete IS TRUE", "is_soft_deleted IS FALSE"]
         params: dict[str, Any] = {"limit": limit, "offset": offset, "embedding": embedding_str}
 
         if category:

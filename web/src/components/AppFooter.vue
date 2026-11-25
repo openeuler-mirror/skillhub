@@ -14,56 +14,59 @@ const footerCodeList = [
   { code: CodeQrXzs, label: 'openEuler小助手' },
 ]
 
+// 页脚链接应指向 openEuler 官网，而非当前 SkillHub 域名下的相对路径
+const OPEN_EULER_SITE_BASE = 'https://www.openeuler.org'
+
 const quickNav = [
   {
     title: '关于 openEuler',
     list: [
-      { title: '成员单位', link: '/zh/community/member/' },
-      { title: '组织架构', link: '/zh/community/organization/' },
-      { title: '社区章程', link: '/zh/community/charter/' },
-      { title: '贡献看板', link: 'https://datastat.openeuler.openatom.cn/zh/overview' },
-      { title: '社区介绍', link: '/whitepaper/openEuler%20%E5%BC%80%E6%BA%90%E7%A4%BE%E5%8C%BA%E4%BB%8B%E7%BB%8D.pdf' },
+      { title: '成员单位', link: `${OPEN_EULER_SITE_BASE}/zh/community/member/` },
+      { title: '组织架构', link: `${OPEN_EULER_SITE_BASE}/zh/community/organization/` },
+      { title: '社区章程', link: `${OPEN_EULER_SITE_BASE}/zh/community/charter/` },
+      { title: '贡献看板', link: 'https://datastat.openeuler.org/zh/overview' },
+      { title: '社区介绍', link: `${OPEN_EULER_SITE_BASE}/whitepaper/openEuler%20%E5%BC%80%E6%BA%90%E7%A4%BE%E5%8C%BA%E4%BB%8B%E7%BB%8D.pdf` },
     ],
   },
   {
     title: '新闻与资讯',
     list: [
-      { title: '新闻', link: '/zh/interaction/news-list/' },
-      { title: '博客', link: '/zh/interaction/blog-list/' },
-      { title: '白皮书', link: '/zh/showcase/technical-white-paper/' },
+      { title: '新闻', link: `${OPEN_EULER_SITE_BASE}/zh/interaction/news-list/` },
+      { title: '博客', link: `${OPEN_EULER_SITE_BASE}/zh/interaction/blog-list/` },
+      { title: '白皮书', link: `${OPEN_EULER_SITE_BASE}/zh/showcase/technical-white-paper/` },
     ],
   },
   {
     title: '获取与下载',
     list: [
-      { title: '获取 openEuler 操作系统', link: '/zh/download/#get-openeuler' },
-      { title: '最新社区发行版', link: '/zh/download/' },
-      { title: '商业发行版', link: '/zh/download/commercial-release/' },
-      { title: '软件中心', link: 'https://easysoftware.openeuler.openatom.cn/zh' },
+      { title: '获取 openEuler 操作系统', link: `${OPEN_EULER_SITE_BASE}/zh/download/#get-openeuler` },
+      { title: '最新社区发行版', link: `${OPEN_EULER_SITE_BASE}/zh/download/` },
+      { title: '商业发行版', link: `${OPEN_EULER_SITE_BASE}/zh/download/commercial-release/` },
+      { title: '软件中心', link: 'https://easysoftware.openeuler.org/zh' },
     ],
   },
   {
     title: '支持与服务',
     list: [
-      { title: '文档', link: 'https://docs.openeuler.openatom.cn/zh/' },
-      { title: 'FAQ', link: 'https://www.openeuler.openatom.cn/zh/faq/' },
-      { title: '联系我们', link: '/zh/contact-us/' },
+      { title: '文档', link: 'https://docs.openeuler.org/zh/' },
+      { title: 'FAQ', link: `${OPEN_EULER_SITE_BASE}/zh/faq/` },
+      { title: '联系我们', link: `${OPEN_EULER_SITE_BASE}/zh/contact-us/` },
     ],
   },
   {
     title: '互动与交流',
     list: [
-      { title: '邮件列表', link: '/zh/community/mailing-list/' },
-      { title: '活动', link: '/zh/interaction/event-list/' },
+      { title: '邮件列表', link: `${OPEN_EULER_SITE_BASE}/zh/community/mailing-list/` },
+      { title: '活动', link: `${OPEN_EULER_SITE_BASE}/zh/interaction/event-list/` },
       { title: '论坛', link: 'https://forum.openeuler.org/' },
     ],
   },
   {
     title: '贡献与成长',
     list: [
-      { title: 'SIG 中心', link: '/zh/sig/sig-list/' },
-      { title: '贡献攻略', link: '/zh/community/contribution/' },
-      { title: '课程中心', link: '/zh/learn/mooc/' },
+      { title: 'SIG 中心', link: `${OPEN_EULER_SITE_BASE}/zh/sig/sig-list/` },
+      { title: '贡献攻略', link: `${OPEN_EULER_SITE_BASE}/zh/community/contribution/` },
+      { title: '课程中心', link: `${OPEN_EULER_SITE_BASE}/zh/learn/mooc/` },
     ],
   },
 ]
@@ -84,10 +87,10 @@ const friendshipLinks = [
 ]
 
 const legalLinks = [
-  { name: '品牌', url: 'https://www.openeuler.openatom.cn/zh/other/brand/' },
-  { name: '隐私声明', url: 'https://www.openeuler.openatom.cn/zh/other/privacy/' },
-  { name: '法律声明', url: 'https://www.openeuler.openatom.cn/zh/other/legal/' },
-  { name: '关于 cookies', url: 'https://www.openeuler.openatom.cn/zh/other/cookies/' },
+  { name: '品牌', url: `${OPEN_EULER_SITE_BASE}/zh/other/brand/` },
+  { name: '隐私声明', url: `${OPEN_EULER_SITE_BASE}/zh/other/privacy/` },
+  { name: '法律声明', url: `${OPEN_EULER_SITE_BASE}/zh/other/legal/` },
+  { name: '关于 cookies', url: `${OPEN_EULER_SITE_BASE}/zh/other/cookies/` },
 ]
 </script>
 

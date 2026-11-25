@@ -116,12 +116,12 @@ async def _fetch_batch(
 ) -> list[EmbeddingTarget]:
     """使用 keyset pagination 短会话读取一批待编码行。
 
-    only_missing=True 时仅取 embedding IS NULL 且 risk_score IS NOT NULL 的行
-    （与 _vector_search 的可见口径一致：无风险分的行对语义搜索不可见，
-    无需消耗 embedding 计算）。
+    only_missing=True 时仅取 embedding IS NULL 且字段完备（is_complete）且未下架
+    （is_soft_deleted=false）的行（与 _vector_search 的可见口径一致：字段未完备或已
+    下架的行对语义搜索不可见，无需消耗 embedding 计算）。
     """
     target_cond = (
-        "embedding IS NULL AND risk_score IS NOT NULL"
+        "embedding IS NULL AND is_complete IS TRUE AND is_soft_deleted IS FALSE"
         if only_missing
         else "TRUE"
     )
@@ -156,7 +156,9 @@ async def _fetch_batch(
 
 async def _count_targets(only_missing: bool) -> int:
     cond = (
-        "embedding IS NULL AND risk_score IS NOT NULL" if only_missing else "TRUE"
+        "embedding IS NULL AND is_complete IS TRUE AND is_soft_deleted IS FALSE"
+        if only_missing
+        else "TRUE"
     )
     async with AsyncSessionLocal() as session:
         result = await session.execute(text(f"SELECT count(*) FROM skills WHERE {cond}"))
@@ -321,7 +323,7 @@ async def _run_batches(
 
 
 async def embed_missing(batch_size: int = BATCH_SIZE) -> ReindexStats:
-    """增量补嵌入：仅处理 embedding IS NULL 且 risk_score IS NOT NULL 的行。
+    """增量补嵌入：仅处理 embedding IS NULL 且字段完备（is_complete）且未下架的行。
 
     锁被全量任务持有时抛 LockBusyError，由调用方决定跳过。
     """
