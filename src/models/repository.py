@@ -163,11 +163,12 @@ class SkillRepoRepository:
     async def delete_skill_repositories(self, repository_ids: list[str | uuid.UUID]) -> int:
         """批量删除仓库及其级联数据，返回删除的仓库行数。
 
-        skills / skill_versions 通过外键 CASCADE 自动删除，但
-        security_audits 和 download_history 使用 resource_type + resource_id
-        软关联（无外键），需要先按仓库收集 skill 与 skill_versions 的 UUID
-        批量清理（security_audits 对 tag 版本同样按 resource_type='skill'
-        + 版本 UUID 落记录），否则留下孤儿数据。
+        skills / skill_versions 显式删除后再删仓库，不依赖外键 CASCADE
+        （生产库外键未按 ondelete='CASCADE' 生效时，依赖级联会留下孤儿行并
+        触发 skill_id 唯一键冲突）；security_audits 和 download_history 使用
+        resource_type + resource_id 软关联（无外键），需要先按仓库收集 skill
+        与 skill_versions 的 UUID 批量清理（security_audits 对 tag 版本同样按
+        resource_type='skill' + 版本 UUID 落记录），否则留下孤儿数据。
         """
         if not repository_ids:
             return 0
@@ -193,6 +194,16 @@ class SkillRepoRepository:
         if resource_ids:
             related_deleted = await SkillRepository(self.session).delete_skill_related_records(resource_ids)
 
+        # 显式删除子表 rows 再删仓库，避免依赖外键 CASCADE（见方法 docstring）。
+        # skill_versions 可能引用 skills，先删版本再删 skill，最后删仓库。
+        if version_ids:
+            await self.session.execute(
+                delete(SkillVersion).where(SkillVersion.id.in_(version_ids))
+            )
+        if skill_ids:
+            await self.session.execute(
+                delete(Skill).where(Skill.id.in_(skill_ids))
+            )
         result = await self.session.execute(
             delete(SkillRepoModel).where(SkillRepoModel.id.in_(repo_ids))
         )
@@ -998,6 +1009,60 @@ class SkillRepository:
         )
         await self.session.flush()
         return int(audit_result.rowcount or 0) + int(history_result.rowcount or 0)
+
+    async def delete_orphan_skills(self, commit: bool = True) -> int:
+        """删除 skill_repo_id 指向不存在仓库的孤儿 skill / skill_version 及软关联。
+
+        修复历史遗留：仓库删除时若外键 CASCADE 未生效，会留下 skill_repo_id
+        指向已删仓库的孤儿行，导致后续重建同 skill_id 时触发唯一键冲突。幂等，
+        无孤儿时不做任何改动。返回删除的 skill 行数。
+        """
+        repo_exists = (
+            select(SkillRepoModel.id)
+            .where(SkillRepoModel.id == Skill.skill_repo_id)
+            .exists()
+        )
+        orphan_skill_ids_result = await self.session.execute(
+            select(Skill.id).where(~repo_exists)
+        )
+        orphan_skill_ids = [row[0] for row in orphan_skill_ids_result.all()]
+
+        version_repo_exists = (
+            select(SkillRepoModel.id)
+            .where(SkillRepoModel.id == SkillVersion.skill_repo_id)
+            .exists()
+        )
+        orphan_version_ids_result = await self.session.execute(
+            select(SkillVersion.id).where(~version_repo_exists)
+        )
+        orphan_version_ids = [row[0] for row in orphan_version_ids_result.all()]
+
+        resource_ids = [*orphan_skill_ids, *orphan_version_ids]
+        related_deleted = 0
+        if resource_ids:
+            related_deleted = await self.delete_skill_related_records(resource_ids)
+
+        deleted = 0
+        if orphan_version_ids:
+            await self.session.execute(
+                delete(SkillVersion).where(SkillVersion.id.in_(orphan_version_ids))
+            )
+        if orphan_skill_ids:
+            deleted_result = await self.session.execute(
+                delete(Skill).where(Skill.id.in_(orphan_skill_ids))
+            )
+            deleted = int(deleted_result.rowcount or 0)
+        if commit:
+            await self.session.commit()
+        else:
+            await self.session.flush()
+        logger.info(
+            "Deleted orphan skills: skills=%d, versions=%d, related_records=%d",
+            deleted,
+            len(orphan_version_ids),
+            related_deleted,
+        )
+        return deleted
 
     async def delete(self, skill_id: str) -> bool:
         # 先查出 skill 与其 tag 版本的 UUID，用于清理软关联表
