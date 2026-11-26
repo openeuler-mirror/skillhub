@@ -271,36 +271,26 @@ class LicenseRepoConfig(BaseModel):
     remote_cache_root: str = ""
     # 远程缓存有效期（天）；过期后重新拉取
     remote_cache_ttl_days: int = 7
-    # 缓存保留期（天）：删除本轮未使用且超过该天数的远程/_local 缓存；0 表示禁用
-    remote_cache_keep_days: int = 7
     # 本地 clone 缺失时是否允许远端浅克隆（关闭后只使用本地/已有缓存）
     remote_fetch: bool = True
-    # 同时判定多少个仓库（每个仓库内部串行；discover 的仓库扫描另有限制）
-    remote_concurrency: int = 4
     # 单次 git 命令超时（秒）；超时按仓库不可用处理（该行保持原值）
     git_timeout: float = 60.0
 
 
 class LicenseCheckConfig(BaseModel):
-    """license 三态标记任务配置。
+    """discover 扫描内的 license 预检配置。
 
-    任务每天 ``start_time``（按 ``timezone`` 解释）触发一轮**全量**复核：
-    判定 skills / skill_versions 的 license 合规性，写回 ``license_compliant``
-    （1/0；失败保持原值）。判定与写值全部由该任务负责，discover 不参与。
+    预检在扫描新入库/内容变化的 skill 时执行，写回：
+    - ``license``：具体 license 类型（归一化 SPDX 表达式）；
+    - ``license_compliant``：三态 1/0/NULL（失败保持原值）。
 
-    调度器启动后（worker 已完成 discover 首轮）会先立即执行一轮，之后按
-    ``start_time`` 每日触发；同一时刻通过 PostgreSQL advisory lock 保证
-    多副本下只有一个实例执行。
+    两个字段目前仅作为元数据记录，不参与数据可见性过滤；全量复核与
+    可见性限制策略后续由其他开发者统一规划实现。
     """
 
-    # 是否启用定时任务；关闭后 license_compliant 不再更新（已有值保留）
+    # 是否启用 license 预检；关闭后 discover 不写 license / license_compliant，
+    # 两列均保留数据库已有值
     enabled: bool = True
-    # 每日触发时刻（HH:MM），按 timezone 解释
-    start_time: str = "02:00"
-    # 触发时刻时区；与容器 TZ 解耦，默认北京时间
-    timezone: str = "Asia/Shanghai"
-    # 每批提交多少行；控制单次事务大小与锁持有时间
-    batch_size: int = 200
     gate: LicenseGateConfig = Field(default_factory=LicenseGateConfig)
     repo: LicenseRepoConfig = Field(default_factory=LicenseRepoConfig)
 
