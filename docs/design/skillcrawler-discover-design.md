@@ -91,11 +91,12 @@ flowchart TD
 | `src/skills/skill_manager.py` | 仓库同步、状态、扫描与存储编排 |
 | `src/utils/git_operations.py` | clone、fetch、Tag 两阶段拉取、tree hash、blob 物化 |
 | `src/skills/skill_parser.py` | SKILL.md 查找、跳过规则、URL/ID 辅助逻辑 |
-| `src/skills/skill_scanner.py` | latest/Tag 扫描、分类、安全检测触发 |
+| `src/skills/skill_scanner.py` | latest/Tag 扫描、分类、安全检测触发、license 预检 |
+| `src/skills/license/` | 门禁同源 license 判定、仓库文件树准备、准入清单加载 |
 | `src/ai/category_classifier.py` | Category 规则和模型调用 |
 | `src/models/repository.py` | Skills、SkillVersions、SecurityAudit 持久化 |
 | `src/security/detector.py` | Jenkins 客户端和后台报告 collector |
-| `src/jobs/worker.py` | 独立 worker 进程中启动和停止 collector |
+| `src/jobs/worker.py` | 独立 worker 进程中启动/停止 discover、LLM 审核与 collector |
 
 ## 1.2 SkillManager 调用链
 
@@ -112,9 +113,10 @@ discover_configured_skill_repository(request)            # 主入口
 └── 已变 → _discover_and_store_skills(...)                # 扫描并存储（透传 skill_paths / skill_path_filter）
 
 _discover_and_store_skills()
+├── _ensure_license_checker()                               # 本轮首次扫描前构建/复用 checker（失败则跳过预检）
 ├── _discover_skills()                                      # 扫描并返回 Skill/SkillVersion 列表
 ├── _count_unique_skills(latest_skills)                     # 去重计数
-├── skill_repository.store_skills_and_versions(...)         # skills/skill_versions表入库
+├── skill_repository.store_skills_and_versions(...)         # skills/skill_versions表入库（含 license 字段）
 ├── _store_to_security_audits()                             # security_audits表upsert
 └── update_skill_repository(DONE, commit_id, skill_num)     # skill_repos表更新状态、skill_num
 
@@ -134,13 +136,17 @@ start_scan(..., skill_paths, skill_path_filter)          # skill_paths 已在上
 ├── load_scan_records(repo.id)                           # DB：已有 skills + versions
 ├── _scan_latest_skills(skill_paths, ...)                # 只扫上游传入的 skill_paths（部分扫描时已收窄）
 │   ├── get_skill_tree_hashes(..., 'HEAD')               # 1 次批量 rev-parse
-│   └── per skill：git show → build_skill_id → 分类 → 确定安全检测结果（优先复用）
+│   └── per skill：git show → build_skill_id → 分类 → 安全检测 → license 预检
 └── _scan_tagged_skills（per tag）
     ├── list_skill_paths_for_ref(..., ref)               # 1 次 ls-tree -r 独立发现该 Tag 的 SKILL.md
     │   └── skill_path_filter 非空 → 只保留登记的 SKILL.md（部分扫描）
     ├── get_skill_tree_hashes(..., ref)                  # 1 次批量 rev-parse
-    └── per skill：git show → 分类 → 确定安全检测结果（优先复用）
+    └── per skill：git show → 分类 → 安全检测 → license 预检
 ```
+
+license 预检使用本轮 discover 复用的 `LicenseChecker`，结果只写入
+`license` / `license_compliant` 两个字段；**不满足 license 要求不会跳过或删除
+skill**，两个字段当前仅作元数据记录，不参与可见性过滤。详见 §6.4。
 
 # 2. openEuler-skills仓库
 ## 2.1 触发入口
@@ -186,6 +192,9 @@ owner 的三种贡献。配置格式以 openEuler-skills 仓库的真实 `skill.
 
 ### 2.1.3 discover扫描结束
 discover扫描结束后，补跑衍生字段缺口（`_run_remediations_safe()`），并写入`discover-<时间戳>.json` 结果文件。
+
+后台 `discover_scheduler` 按配置时刻触发下一轮扫描；CLI 模式不走调度器，
+但扫描阶段同样执行 license 预检。
 
 ## 2.2 贡献方式一：`skill_repos` 整仓贡献
 
@@ -550,13 +559,11 @@ flowchart TD
         LX -->|否| L2["③ 读取该 SKILL.md 的 frontmatter + 正文<br/>（ git show HEAD:path ）"]
         L2 --> LG{"④ 门禁不过？<br/>读取失败 / 正文<100字 / 缺 name·description"}
         LG -->|是| LSKIP
-        LG -->|否| LL{"⑤ license 允许？"}
-        LL -->|否| LSKIP_L["跳过，并记入 _license_skipped_skill_ids<br/>（ 该 skill 后续 tag 扫描一并跳过 ）"]
-        LL -->|是| L6["⑥ 取 tree_hash / skill_author / skill_platform<br/>（ tree_hash 来自上一步批量计算，缺失为 None ）"]
-        L6 --> L3["⑦ 构建 Skill 操作（ 见 §6.3 ）<br/>version='latest'、version_source='branch_head'<br/>产出 latest Skill record"]
+        LG -->|否| L6["⑤ 取 tree_hash / skill_author / skill_platform<br/>（ tree_hash 来自上一步批量计算，缺失为 None ）"]
+        L6 --> L3["⑥ 构建 Skill 操作（ 见 §6.3 ）<br/>version='latest'、version_source='branch_head'<br/>同步执行 license 预检，产出 latest Skill record"]
         L3 --> L7["▲ append 到 latest 结果列表 discovered"]
-        L7 --> L4{"⑧ frontmatter 声明 version？"}
-        L4 -->|是| LMETA["⑨ 构建 Skill 操作（ 见 §6.3 ）<br/> version=声明值、version_source='metadata'<br/>产出声明版本行 SkillVersion<br/>append 到 metadata_version_rows（ 该 skill 后续 tag 扫描一并跳过 ）"]
+        L7 --> L4{"⑦ frontmatter 声明 version？"}
+        L4 -->|是| LMETA["⑧ 构建 Skill 操作（ 见 §6.3 ）<br/> version=声明值、version_source='metadata'<br/>同样执行 license 预检，产出声明版本行 SkillVersion<br/>append 到 metadata_version_rows（ 该 skill 后续 tag 扫描一并跳过 ）"]
         L4 -->|否| LDONE["该 skill 处理完"]
         LMETA --> LDONE
     end
@@ -568,9 +575,9 @@ flowchart TD
     TAGQ -->|是| T2["列出该 Tag 下所有 SKILL.md 并批量算 tree hash<br/>（不套用 HEAD 清单；只收录 catalog 登记的 skill（部分扫描））"]
     T2 --> TSKILL
     subgraph TSKILL["逐 SKILL.md"]
-        T3{"构建 SkillVersion 前检查是否跳过：<br/>1.门禁不通过（逐 tag 重新校验）<br/>2.HEAD 阶段已记录跳过：声明 version / license拒绝<br/>3.tree_hash 或 commit 已见（去重）"}
+        T3{"构建 SkillVersion 前检查是否跳过：<br/>1.门禁不通过（逐 tag 重新校验）<br/>2.HEAD 阶段已记录跳过：声明 version<br/>3.tree_hash 或 commit 已见（去重）"}
         T3 -->|是| TSKIP["跳过"]
-        T3 -->|否| T4["构建 Skill 操作（ 见 §6.3 ）<br/>version=该 Tag 的 SKILL.md 声明值（无声明则用 tag 名）、version_source='tag'<br/>产出 Tag 版本行 SkillVersion"]
+        T3 -->|否| T4["构建 Skill 操作（ 见 §6.3 ）<br/>version=该 Tag 的 SKILL.md 声明值（无声明则用 tag 名）、version_source='tag'<br/>同样执行 license 预检，产出 Tag 版本行 SkillVersion"]
         T4 --> T5{"version 重复？（构建后）"}
         T5 -->|是| TSKIP
         T5 -->|否| TDONE["Tag 版本行完成"]
@@ -580,6 +587,10 @@ flowchart TD
     classDef build fill:#eef4ff,stroke:#4c8bf5,stroke-width:1.5px
     class L3,LMETA,T4 build
 ```
+
+license 不再是 discover 的跳过条件：构建 latest / 声明版本 / Tag 版本时都会做一次
+license 预检，结果写入 record 的 `license` 与 `license_compliant`。两字段当前仅作
+元数据记录，不参与可见性过滤。判定细节见 §6.4。
 
 ## 6.1 latest Skill
 
@@ -709,23 +720,26 @@ flowchart TD
     D --> E{"⑤ 安全结果复用？<br/>（ tree_hash + commit_id ）"}
     E -->|命中| F["复用 risk_score + audit_details<br/>（ DB 记录 / 扫描缓存 ）"]
     E -->|未命中| G["新提交 Jenkins<br/>写 build_number → audit_details"]
-    F --> H["⑥ 组装对象<br/>汇总 name/version/category/source/author/<br/>tree_hash/risk_score/content → Skill / SkillVersion"]
-    G --> H
+    F --> L["⑥ license 预检<br/>声明优先 → LICENSE 文件回退 → missing/unknown<br/>产出 license + license_compliant（失败留空）"]
+    G --> L
+    L --> H["⑦ 组装对象<br/>汇总 name/version/category/source/author/<br/>tree_hash/risk_score/license/content → Skill / SkillVersion"]
 ```
 
 各步骤做什么、它的输入从哪来、产出流向哪：
 
 | 步骤 | 输入 | 做什么 | 产出 → 去处 |
 |---|---|---|---|
-| ① 解包组装 | `metadata_content`（方法入参） | 拆成 metadata 字典 + content 正文，补 `version_source` | `merged_metadata` → ④、⑥ |
-| ② source_url | `repo` + `relative_path` + `ref` | 拼出该 SKILL.md 的远程 URL | `source_url` → ④、⑥ |
-| ③ 来源/作者 | `repo.url` + 入参 `author`/`skill_author` | 提取 `host`，按 `skill_author → author → source_author` 兜底 | `source`、`author` → ⑥ |
-| ④ 分类 | `merged_metadata` + `content` + `source_url` + `skill_id` | 判定 `category`，`category_cache` 命中即复用 | `category` → ⑥ |
-| ⑤ 安全 | `tree_hash` + `commit_id` + `version` + 已有记录 | 三层复用：DB 记录 → 扫描缓存 → 新提交 Jenkins | `risk_score`、`audit_details` → ⑥ |
-| ⑥ 组装 | ①~⑤ 的全部产物 | 汇总字段构造 `Skill` / `SkillVersion` 对象 | record → 返回调用方 `append` |
+| ① 解包组装 | `metadata_content`（方法入参） | 拆成 metadata 字典 + content 正文，补 `version_source` | `merged_metadata` → ④、⑥、⑦ |
+| ② source_url | `repo` + `relative_path` + `ref` | 拼出该 SKILL.md 的远程 URL | `source_url` → ④、⑥、⑦ |
+| ③ 来源/作者 | `repo.url` + 入参 `author`/`skill_author` | 提取 `host`，按 `skill_author → author → source_author` 兜底 | `source`、`author` → ⑥、⑦ |
+| ④ 分类 | `merged_metadata` + `content` + `source_url` + `skill_id` | 判定 `category`，`category_cache` 命中即复用 | `category` → ⑦ |
+| ⑤ 安全 | `tree_hash` + `commit_id` + `version` + 已有记录 | 三层复用：DB 记录 → 扫描缓存 → 新提交 Jenkins | `risk_score`、`audit_details` → ⑦ |
+| ⑥ license | `repo.url` + `repo_root` + `skill_dir` + frontmatter `license` | 用本轮复用的 `LicenseChecker` 判定；按 `(skill_dir, 归一化声明)` 缓存 | `license`、`license_compliant`、`_license_checked` → ⑦ |
+| ⑦ 组装 | ①~⑥ 的全部产物 | 汇总字段构造 `Skill` / `SkillVersion` 对象 | record → 返回调用方 `append` |
 
-④ 分类与 ⑤ 安全是两个相对独立的字段计算：彼此之间没有数据依赖（⑤ 不消费 ④ 的
-`category`），只是代码里顺序调用，最终都汇入 ⑥。
+④ 分类、⑤ 安全与 ⑥ license 是三个相对独立的字段计算：彼此之间没有数据依赖，
+只是代码里顺序调用，最终都汇入 ⑦。license 预检失败不影响对象构建，也不会让
+skill 跳过入库。
 
 安全结果复用实为三层（DB 记录 → 扫描级缓存 → 新提交 Jenkins），图中第 ⑤ 步的
 「命中 / 未命中」两条分支是其简化视图，完整判定与缓存规则见
@@ -763,6 +777,56 @@ source_author`）的兜底；②③ 是仓库层 `author` 的两级兜底，由
   - 扫描 `sig/*/sig-info.yaml` 的 `repositories[].repo`，只读取 `openeuler/<repo>`，
     不读取 `src-openeuler/<repo>`
   - 映射示例：`openeuler/PilotGo-plugin-llmops` → `atomgit.com_openeuler_PilotGo-plugin-llmops` → `sig_name`
+
+## 6.4 license 预检与字段写入
+
+discover 在构建每个 record 时同步完成一次 license 预检，使新入库/内容变化的
+skill 立即拥有 `license` 与 `license_compliant`。预检**只标记，不删除、不跳过**
+任何 skill；两个字段目前仅作元数据记录，不参与可见性过滤。
+
+### 6.4.1 字段语义
+
+| 字段 | 取值 | 说明 |
+|---|---|---|
+| `license` | SPDX 表达式 / `NULL` | 声明可解析时为声明本身（如 `MIT`、`MIT AND Apache-2.0`）；无声明时写 LICENSE 文件识别结果；missing 时为 `NULL` |
+| `license_compliant` | `1` / `0` / `NULL` | `1`：allowed；`0`：black / restricted / missing / unknown；`NULL`：本轮未完成检查（清单不可用、仓库不可读等） |
+
+### 6.4.2 判定来源与优先级
+
+1. SKILL.md frontmatter 的 `license` 声明可解析 → **以声明为准**，LICENSE 文件
+   识别结果只用于生成冲突原因；
+2. 声明缺失，或声明是无法解析的描述性占位、且仓库中检测到 license 文件并开启
+   `prefer_file=true` → 从 `LICENSE` / `COPYING` / `LICENSES/` 等文件识别；
+   多个文件按 AND 保守处理；
+3. 无声明且无文件 → `missing`（`license=NULL`、`license_compliant=0`）；
+4. 有文件但识别不出 → `unknown`（`license_compliant=0`）。
+
+### 6.4.3 checker 生命周期与缓存
+
+- `SkillManager` 在每轮 discover 第一次扫描仓库前惰性构建 `LicenseChecker`
+  （准入清单不可用时返回 `None`，不影响扫描），本轮结束调用 `close()` 释放；
+- checker 内部按目录缓存 LICENSE 文件列表，消除同一仓库多 skill 反复 listing
+  父目录的开销；
+- `SkillScanner` 内按 `(skill_dir, 归一化声明)` 缓存判定结论，同一 skill 的
+  latest 行、声明版本行与多个 tag 版本只判定一次；
+- `license_check.enabled=false` 或清单不可用时跳过预检：新增行两个字段为
+  `NULL`，已有行保留数据库原值，等待下一轮扫描回填。
+
+### 6.4.4 落库规则
+
+- **新增记录**：直接带上 `license` / `license_compliant` 插入；
+- **内容变化更新**：只有本轮确实完成检查（record 带 `_license_checked=True`）才
+  覆盖这两列；未完成检查时保留数据库原值；
+- 两个字段必须成对写入，避免出现“新类型 + 旧结论”的错配；
+- 仓库不可读、git 物化失败等基础设施问题不写 `0`，留待下一轮重试。
+
+### 6.4.5 与全量复核、可见性限制的关系
+
+- license 定时/全量复核任务已移除，discover 扫描内的预检是当前唯一的
+  字段写入路径；
+- 字段当前仅作元数据记录，**不参与列表/搜索/下载/详情等可见性过滤**；
+- 存量数据补齐、跟随准入清单更新结论、缓存回收与可见性限制策略，后续由
+  其他开发者统一规划实现。
 
 # 7. Category 分类
 
@@ -941,6 +1005,8 @@ discover 写入路径涉及三张关键表，字段约定如下，供 §10 仓�
 | `commit_id` | 仓库 HEAD commit（= `skill_repos.repository_commit_id`），不是 skill 文件夹独立 commit |
 | `platform` | 三级链：per-skill `skill_platform` → `skill_repos.platform` → frontmatter `platform` |
 | `author` | SIG 名或仓库 owner，四级解析链见 §6.3.1 |
+| `license` | 具体 license 类型（归一化 SPDX 表达式），`NULL` 表示未检查或无法识别 |
+| `license_compliant` | license 三态：`1` 合规、`0` 不合规、`NULL` 未完成检查 |
 
 > 注意：repo HEAD commit 存在 `skill_repos.repository_commit_id`，不要写入
 > `skills.extra_metadata.repository_commit_id`。
@@ -948,7 +1014,8 @@ discover 写入路径涉及三张关键表，字段约定如下，供 §10 仓�
 ### `skill_versions`
 
 `skill_versions` 保存 tag 扫描得到的版本快照。每次扫描会重建当前 repo 的版本快照
-（见 §9.2）。
+（见 §9.2）。`license` / `license_compliant` 与 `skills` 表字段平行维护，版本列表
+可直接展示每个版本实际使用的 license 与合规结论。
 
 ## 9.2 增量同步规则（latest Skill 与 Tag 版本通用）
 `skills`（latest Skill，按 `skill_id` 定位）与 `skill_versions`（Tag 版本，按
@@ -968,6 +1035,8 @@ discover 写入路径涉及三张关键表，字段约定如下，供 §10 仓�
    - 清空旧的 embedding 与 `last_indexed_at`
    - 保留 `download_count`
    - `risk_score` 写扫描实得值（内容变化重新触发审计，异步未回时为空，由收集器稍后回填，不复用旧分）。
+   - `license` / `license_compliant` 仅在本次预检得到确定结论时成对写入；未完成
+     检查时保留数据库原值（见 §6.4.4）。
 
 **安全结果复用**（latest 与 tag 通用）发生在持久化之前：扫描器读取已有版本记录，
 当 `tree_hash` 相同且已有评分时，复用原 `risk_score` 和 audit metadata，避免重复触发

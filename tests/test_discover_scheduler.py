@@ -112,7 +112,8 @@ class TestRunDiscoverOnce:
             session_ctx = AsyncMock()
             session_factory.return_value = session_ctx
             manager = SimpleNamespace(
-                discover_configured_skill_repository=AsyncMock(side_effect=results)
+                discover_configured_skill_repository=AsyncMock(side_effect=results),
+                close=AsyncMock(),
             )
             with patch(
                 "src.jobs.discover_scheduler.SkillManager", return_value=manager
@@ -176,7 +177,8 @@ class TestRunDiscoverOnce:
         ):
             session_factory.return_value = AsyncMock()
             manager = SimpleNamespace(
-                discover_configured_skill_repository=AsyncMock(side_effect=results)
+                discover_configured_skill_repository=AsyncMock(side_effect=results),
+                close=AsyncMock(),
             )
             with patch(
                 "src.jobs.discover_scheduler.SkillManager", return_value=manager
@@ -255,7 +257,8 @@ class TestRunDiscoverOnce:
             manager = SimpleNamespace(
                 discover_configured_skill_repository=AsyncMock(
                     side_effect=[RuntimeError("clone timeout"), None, None]
-                )
+                ),
+                close=AsyncMock(),
             )
             with patch(
                 "src.jobs.discover_scheduler.SkillManager", return_value=manager
@@ -292,7 +295,8 @@ class TestRunDiscoverOnce:
                         _fake_result(_unchanged=True),
                         _fake_result(_removed_existing=True),
                     ]
-                )
+                ),
+                close=AsyncMock(),
             )
             with patch(
                 "src.jobs.discover_scheduler.SkillManager", return_value=manager
@@ -321,7 +325,8 @@ class TestRunDiscoverOnce:
             manager = SimpleNamespace(
                 discover_configured_skill_repository=AsyncMock(
                     side_effect=[_fake_result(_created_new=True), RuntimeError("boom"), None]
-                )
+                ),
+                close=AsyncMock(),
             )
             with patch(
                 "src.jobs.discover_scheduler.SkillManager", return_value=manager
@@ -365,6 +370,24 @@ class TestSchedulerLoop:
 
         # 启动先跑一轮；1:00 -> 3:00 间隔 2 小时；到点再跑第二轮
         assert calls == ["run", timedelta(hours=2).total_seconds(), "run"]
+
+    async def test_loop_notifies_first_round_when_scan_fails(self, caplog):
+        """单轮扫描异常也必须置位首轮完成信号并记录错误。"""
+        caplog.set_level(logging.ERROR, logger="src.jobs.discover_scheduler")
+        scheduler = DiscoverScheduler(
+            DiscoverSchedulerConfig(enabled=True, start_time="03:00")
+        )
+
+        async def fake_run(sched):
+            sched._running = False
+            raise RuntimeError("scan failed")
+
+        with patch.object(DiscoverScheduler, "run_discover_once", fake_run):
+            scheduler._running = True
+            await scheduler._loop()
+
+        assert scheduler.first_round_done.is_set()
+        assert "round failed" in caplog.text
 
     async def test_start_stop_lifecycle(self):
         config = DiscoverSchedulerConfig(enabled=True)
