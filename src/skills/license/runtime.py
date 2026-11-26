@@ -4,7 +4,7 @@
 
 1. ``build_checker`` 读取 ``Settings.license_check``，加载准入清单并创建
    ``LicenseChecker``。清单不可用时按 ``required`` 决定抛错还是返回 None；
-   定时任务使用 ``required=False``，此时本轮跳过、不写 0。
+   discover 扫描内的预检使用 ``required=False``，此时本轮跳过、不写 0。
 2. ``verdict_to_flag`` 把引擎状态映射为 ``license_compliant`` 三态：
 
    ============================  ==============
@@ -18,6 +18,9 @@
 
    conflict 不会作为终态出现：``gate_engine.scan`` 在声明与 LICENSE 文件
    不一致时按 SKILL.md 声明返回，冲突原因只记在 verdict.reasons 中。
+3. ``verdict_to_license`` 从同一次判定中提取「具体 license 类型」
+   （``verdict.expression``），供 ``skills.license`` / ``skill_versions.license``
+   字段落库。它与 ``license_compliant`` 共用一次判定结果，不再额外扫描仓库。
 """
 
 from __future__ import annotations
@@ -33,6 +36,7 @@ from src.skills.license.gate_engine import (
     STATUS_MISSING,
     STATUS_RESTRICTED,
     STATUS_UNKNOWN,
+    LicenseVerdict,
 )
 from src.skills.license.scanner import LicenseChecker
 
@@ -51,14 +55,14 @@ def _default_cache_path(settings: Settings) -> str:
 def build_checker(settings: Settings | None = None, *, required: bool = True) -> LicenseChecker | None:
     """按当前配置构建 checker。
 
-    :param settings: 显式传入配置（测试/任务），默认使用进程级 ``get_settings()``
+    :param settings: 显式传入配置（测试等），默认使用进程级 ``get_settings()``
     :param required:
         - ``True``：清单不可用时抛 ``LicenseListUnavailableError``；
         - ``False``：清单不可用时返回 ``None``，由调用方跳过本轮。
-          定时任务必须用 ``False``，否则网络波动会导致整轮任务失败。
+          discover 预检必须用 ``False``，否则网络波动会导致整轮扫描失败。
     :return: 可复用的 ``LicenseChecker`` 或 ``None``
 
-    注意：checker 内部持有目录级 license 文件缓存，应在**一轮任务**内复用，
+    注意：checker 内部持有目录级 license 文件缓存，应在**一轮扫描**内复用，
     不要跨轮长期持有（否则仓库更新后可能读到过期缓存）。
     """
     settings = settings or get_settings()
@@ -102,3 +106,22 @@ def verdict_to_flag(status: str) -> int | None:
     if status in (STATUS_BLACK, STATUS_RESTRICTED, STATUS_MISSING, STATUS_UNKNOWN):
         return FLAG_NON_COMPLIANT
     return None
+
+
+def verdict_to_license(verdict: LicenseVerdict) -> str | None:
+    """判定结论 -> 具体 license 类型（归一化后的 SPDX 表达式）。
+
+    取值口径（与 ``verdict.expression`` 一致）：
+
+    - 声明可解析：声明本身，如 ``MIT``、``MIT AND Apache-2.0``；
+    - 声明缺失、由 LICENSE 文件识别：识别结果，如 ``Apache-2.0``；
+    - missing（无声明且无 license 文件）：空字符串 -> ``None``；
+    - unknown 但声明非空：保留原始声明，便于回溯「为什么判成不合规」；
+    - error（仓库不可读等）：判定层不产生 expression -> ``None``。
+
+    调用方约定：``verdict_to_flag`` 返回 ``None``（本轮未完成检查）时，
+    **不要**写 ``license`` 字段，应与 ``license_compliant`` 一起保持原值，
+    避免把基础设施故障误写成“没有 license”。
+    """
+    expression = (verdict.expression or "").strip()
+    return expression or None

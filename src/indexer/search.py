@@ -71,7 +71,8 @@ class SearchService:
         tags: list[str] | None = None,
         security_level: list[str] | None = None,
     ):
-        # 全局规则：仅搜索字段完备（is_complete=True）且未下架（is_soft_deleted=False）的 Skill
+        # 全局规则：仅搜索字段完备（is_complete=True）且未下架（is_soft_deleted=False）的 Skill。
+        # is_complete 只由必填字段决定，license / license_compliant 不参与可见性。
         query = query.where(Skill.is_complete.is_(True))
         query = query.where(Skill.is_soft_deleted.is_(False))
         if category:
@@ -556,6 +557,8 @@ class SearchService:
             Skill.tags,
             Skill.platform,
             Skill.risk_score,
+            # license / license_compliant 仅用于响应展示，不参与可见性过滤。
+            Skill.license,
             Skill.license_compliant,
             Skill.download_count,
             Skill.rating,
@@ -614,6 +617,7 @@ class SearchService:
                 "tags": row["tags"] or [],
                 "platform": row["platform"],
                 "risk_score": row["risk_score"],
+                "license": row["license"],
                 "license_compliant": row["license_compliant"],
                 "download_count": row["download_count"],
                 "rating": row["rating"],
@@ -641,6 +645,9 @@ class SearchService:
     ) -> dict[str, Any]:
         embedding_str = "[" + ",".join(str(x) for x in embedding) + "]"
 
+        # 语义检索走原生 SQL，可见口径与 ORM 侧保持一致（is_complete + 未下架）；
+        # 调整过滤条件时必须同步修改本列表，否则语义结果会绕过口径。
+        # license / license_compliant 不参与可见性过滤。
         where_clauses = ["embedding IS NOT NULL", "is_complete IS TRUE", "is_soft_deleted IS FALSE"]
         params: dict[str, Any] = {"limit": limit, "offset": offset, "embedding": embedding_str}
 
@@ -684,10 +691,13 @@ class SearchService:
 
         where_sql = " AND ".join(where_clauses)
 
+        # 原生 SQL 分支自行列出返回列：新增字段必须与上面的 ORM 分支保持
+        # 一致，否则混合检索在不同分支返回的 SkillResponse 字段会不同。
         sql = text(f"""
             SELECT id, skill_id, name, description, version, author, source,
                    source_url, category, tags, platform,
-                   risk_score, license_compliant, download_count, rating, created_at, updated_at,
+                   risk_score, license, license_compliant, download_count, rating,
+                   created_at, updated_at,
                    embedding <-> CAST(:embedding AS vector) AS distance
             FROM skills
             WHERE {where_sql}
@@ -721,6 +731,7 @@ class SearchService:
                 "tags": row.tags or [],
                 "platform": row.platform,
                 "risk_score": row.risk_score,
+                "license": row.license,
                 "license_compliant": row.license_compliant,
                 "download_count": row.download_count,
                 "rating": row.rating,

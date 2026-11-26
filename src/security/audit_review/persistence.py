@@ -83,13 +83,11 @@ async def persist(
                 .where(Skill.id == resource_id)
                 .values(
                     risk_score=application.score,
-                    # 字段完备需 category 非空且 license 未判为不合规
-                    # （license_compliant==0 视为不完备；NULL 未检查不拦截）；
+                    # 字段完备只需 category 非空；license 不参与可见性。
                     # 必填字段清单见 src/skills/skill_readiness.COMPLETE_REQUIRED_FIELDS
                     is_complete=and_(
                         Skill.category.is_not(None),
                         Skill.category != "",
-                        Skill.license_compliant.is_distinct_from(0),
                     ),
                 )
             )

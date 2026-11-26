@@ -92,10 +92,15 @@ class Skill(Base):
     extra_metadata: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
     content: Mapped[str | None] = mapped_column(Text, nullable=True)
     risk_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    # license 合规三态（由 license 定时任务维护，discover 不写）：
+    # license 类型：归一化后的 SPDX 表达式（如 ``MIT`` / ``MIT AND Apache-2.0``）。
+    # 由 discover 扫描内的 license 预检维护；
+    # NULL 表示尚未检查，或检查后无法识别出具体 license（如 missing）。
+    license: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # license 合规三态（由 discover 预检维护）：
     #   1    = 已检查且满足 license 要求
-    #   0    = 已检查但不满足（默认从列表/搜索/下载中过滤）
-    #   NULL = 尚未检查或检查失败（仍对外可见，等待下一轮回填）
+    #   0    = 已检查但不满足
+    #   NULL = 尚未检查或检查失败（等待下一轮扫描回填）
+    # 当前仅作为字段记录，不参与列表/搜索/下载等可见性过滤。
     license_compliant: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
     download_count: Mapped[int] = mapped_column(Integer, default=0)
     rating: Mapped[str | None] = mapped_column(String(10), nullable=True)
@@ -147,10 +152,14 @@ class SkillVersion(Base):
     extra_metadata: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
     content: Mapped[str | None] = mapped_column(Text, nullable=True)
     risk_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    # license 合规三态（由 license 定时任务维护，discover 不写）：
+    # license 类型：归一化后的 SPDX 表达式（如 ``MIT`` / ``MIT AND Apache-2.0``）。
+    # 与 skills 表保持一致，便于版本列表直接展示该版本实际使用的 license。
+    license: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # license 合规三态（由 discover 预检维护）：
     #   1    = 已检查且满足 license 要求
-    #   0    = 已检查但不满足（默认从列表/搜索/下载中过滤）
-    #   NULL = 尚未检查或检查失败（仍对外可见，等待下一轮回填）
+    #   0    = 已检查但不满足
+    #   NULL = 尚未检查或检查失败（等待下一轮扫描回填）
+    # 当前仅作为字段记录，不参与版本列表等可见性过滤。
     license_compliant: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
     download_count: Mapped[int] = mapped_column(Integer, default=0)
     rating: Mapped[str | None] = mapped_column(String(10), nullable=True)

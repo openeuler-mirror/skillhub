@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import and_, or_, text, update
+from sqlalchemy import or_, text, update
 
 from src.ai.category_classifier import DeepSeekCategoryClassifier
 from src.core.database import AsyncSessionLocal
@@ -145,9 +145,9 @@ async def _write_categories(pairs: list[tuple[uuid.UUID, str]]) -> int:
     async with AsyncSessionLocal() as session:
         for row_id, category in sorted(pairs, key=lambda pair: pair[0]):
             result = await session.execute(
-                # 回填 category 后，字段完备需 risk_score 非空且 license 未判为
-                # 不合规（license_compliant==0 视为不完备；NULL 未检查不拦截）。
-                # 必填字段清单见 src/skills/skill_readiness.COMPLETE_REQUIRED_FIELDS。
+                # 回填 category 后，字段完备只需 risk_score 非空；
+                # license 不参与可见性。必填字段清单见
+                # src/skills/skill_readiness.COMPLETE_REQUIRED_FIELDS。
                 update(Skill)
                 .where(
                     Skill.id == row_id,
@@ -155,10 +155,7 @@ async def _write_categories(pairs: list[tuple[uuid.UUID, str]]) -> int:
                 )
                 .values(
                     category=category,
-                    is_complete=and_(
-                        Skill.risk_score.is_not(None),
-                        Skill.license_compliant.is_distinct_from(0),
-                    ),
+                    is_complete=Skill.risk_score.is_not(None),
                 )
             )
             updated += result.rowcount or 0

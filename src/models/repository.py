@@ -377,7 +377,8 @@ class SkillRepository:
         skill_id_prefix: str | None = None,
         security_level: list[str] | None = None,
     ):
-        # 全局规则：仅展示字段完备（is_complete=True）且未下架（is_soft_deleted=False）的 Skill
+        # 全局规则：仅展示字段完备（is_complete=True）且未下架（is_soft_deleted=False）的 Skill。
+        # is_complete 只由必填字段决定，license / license_compliant 不参与可见性。
         query = query.where(skill_model.is_complete.is_(True))
         query = query.where(skill_model.is_soft_deleted.is_(False))
         if category:
@@ -752,7 +753,6 @@ class SkillRepository:
                     **self._build_summary_update_values(
                         skill,
                         download_count=existing_skill.download_count,
-                        license_compliant=existing_skill.license_compliant,
                     )
                 )
             )
@@ -824,7 +824,6 @@ class SkillRepository:
         representative: Skill | SkillVersion,
         *,
         download_count: int,
-        license_compliant: int | None = None,
     ) -> dict[str, Any]:
         """内容变化时的整行更新值。
 
@@ -840,10 +839,11 @@ class SkillRepository:
         稍后回填），同步或缓存命中则为新分。不复用旧内容的评分，避免旧分与
         新内容（新 tree_hash）误绑定。
 
-        ``license_compliant`` 由 license 定时任务独占维护，**刻意不出现在
-        更新字典中**：UPDATE 语句不触碰该列，天然保留数据库当前值。这样
-        即使 discover 读取记录后、提交更新前 license 任务刚好写入了新结论，
-        也不会被 discover 用读取时的旧值覆盖（避免读-改-写竞态）。
+        ``license`` / ``license_compliant`` 由 discover 扫描时的 license 预检
+        维护，但 **只有本轮确实完成了检查时才写入**：``SkillScanner``
+        会在记录上标记 ``_license_checked``，未完成检查（准入清单不可用、
+        仓库不可读等）时保留数据库原值，避免把基础设施问题写成“无 license /
+        不合规”。
 
         其余字段（名称、描述、版本、tree_hash、内容等）都是本次扫描的结果，
         直接使用 ``representative`` 上的新值。
@@ -872,30 +872,23 @@ class SkillRepository:
             "last_indexed_at": None,
             "embedding": None,
         }
+        # 只有拿到确定结论才覆盖 license 两列；两个字段必须成对写入，
+        # 避免出现“新类型 + 旧结论”的错配。
+        if getattr(representative, "_license_checked", False):
+            values["license"] = representative.license
+            values["license_compliant"] = representative.license_compliant
         # 仅 Skill 具备可见性标志；SkillVersion 无此二列。内容变化时按本次
         # 扫描结果重算完备性、并复位下架标志（在 catalog 中即恢复可见）。
+        # is_complete 只由必填字段决定，license 不参与可见性。
         if isinstance(representative, Skill):
-            # 重算 is_complete 时 license 部分必须用 DB 现值：representative
-            # 是扫描新建对象，license_compliant 恒为 None（license 由 license
-            # 任务独占维护、discover 不写），直接判会把 license==0 的行误判为
-            # 完备并重新暴露到列表/搜索。license_compliant 不进 values（见
-            # docstring），仅用于本次完备性判定。
-            representative.license_compliant = license_compliant
             values["is_complete"] = is_skill_complete(representative)
             values["is_soft_deleted"] = False
         return values
 
     async def get_versions_by_base_skill(self, source_url: str | None, skill_id: str) -> list[SkillVersion]:
+        # 版本列表不做 license 可见性过滤：license / license_compliant 仅记录。
         query = select(SkillVersion)
         query = query.where(SkillVersion.skill_id == skill_id)
-        # 版本列表与 latest 使用同一可见口径：只排除 license 判定为 0 的版本，
-        # NULL（未检查）仍返回，避免迁移后历史版本整体消失。
-        query = query.where(
-            or_(
-                SkillVersion.license_compliant.is_(None),
-                SkillVersion.license_compliant == 1,
-            )
-        )
         if source_url:
             query = query.where(SkillVersion.source_url == source_url)
         query = query.order_by(desc(SkillVersion.updated_at), desc(SkillVersion.created_at))
@@ -1554,9 +1547,10 @@ class ContributorRepository:
         """统计贡献者名下可见 skill 数（含同 author 的其他仓库）。
 
         可见性规则与 ``SkillRepository.get_contributor_skills`` 一致
-        （字段完备 is_complete 且未下架 is_soft_deleted=false）。同一事务内可看到
-        本次扫描未 commit 的写入，因此扫描流程 store_skills_and_versions
-        之后调用即可拿到最新值。
+        （字段完备 is_complete 且未下架 is_soft_deleted=false）。license /
+        license_compliant 仅记录，不参与可见性。同一事务内可看到本次扫描
+        未 commit 的写入，因此扫描流程 store_skills_and_versions 之后调用
+        即可拿到最新值。
         """
         result = await self.session.execute(
             select(func.count(Skill.id)).where(
@@ -1691,7 +1685,7 @@ class ContributorRepository:
                 platform_counts[p] = int(c)
 
         # Correlated subquery: total downloads across the contributor's skills
-        # 口径与 contributor 可见性一致（risk_score 非空且 license 不为 0）
+        # 口径与 contributor 可见性一致（字段完备且未下架）
         downloads_sq = (
             select(func.coalesce(func.sum(Skill.download_count), 0))
             .where(
