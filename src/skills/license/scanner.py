@@ -39,8 +39,12 @@ from src.skills.license.gate_engine import (
 
 logger = logging.getLogger(__name__)
 
+# 与 gate_engine._LICENSE_FILE_RE 保持一致：除 LICENSE/COPYING 外，
+# 也接受 “Project License” 这类以 license 结尾的命名。
 _LICENSE_NAME_RE = re.compile(
-    r"^(?:licen[cs]e|licence|copying|unlicense)(?:[-._].*)?$", re.IGNORECASE
+    r"^(?:licen[cs]e|licence|copying|unlicense)(?:[-._].*)?$"
+    r"|^(?:.*[-._ ])?(?:licen[cs]e|licence)$",
+    re.IGNORECASE,
 )
 _MARKER = ".license_fetched_at"
 
@@ -49,14 +53,15 @@ def _is_license_path(path: str) -> bool:
     """判断 git 树中的路径是否属于 license 文件。
 
     与 ``LicenseScanner._license_files_in`` 的规则保持一致：
-    文件名匹配 LICENSE/COPYING 等，或位于 ``LICENSES/`` 目录（REUSE 布局）。
+    文件名匹配 LICENSE/COPYING/“xxx License”等，或在 REUSE 约定的全大写
+    ``LICENSES/`` 目录下。``License/``、``licenses/`` 等变体目录不整体收录，
+    其中只有文件名像 license 的才会被物化，避免把 NOTICE/第三方声明当成
+    项目许可。
     """
     name = os.path.basename(path)
-    return bool(
-        _LICENSE_NAME_RE.match(name)
-        or "/LICENSES/" in path
-        or path.startswith("LICENSES/")
-    )
+    if _LICENSE_NAME_RE.match(name):
+        return True
+    return any(part == "LICENSES" for part in path.split("/")[:-1])
 
 
 def normalize_repo_key(repo_url: str) -> str:
@@ -200,6 +205,10 @@ class LicenseChecker:
         直接按 ``error`` 处理，避免把仓库外的 LICENSE 当成该 skill 的许可
         （调用方对 error 保持原值，不会误写 0）。
 
+        仓库根不存在（例如本轮复用了已被删除的物化缓存目录）同样按
+        ``error`` 处理：此时扫描不到任何 license 文件，不能据此判成
+        ``missing`` 并把数据库里的正确结论覆盖成 0。
+
         这样单条 skill 的判定异常不会中断整轮任务，也不会把该行写成 0。
         """
         try:
@@ -220,6 +229,17 @@ class LicenseChecker:
                 ),
                 "error",
                 str(repo_root),
+            )
+
+        if not root.is_dir():
+            logger.warning("license scan rejected: repo root unavailable: %s", repo_root)
+            return LicenseCheckResult(
+                LicenseVerdict(
+                    STATUS_ERROR,
+                    reasons=[f"仓库文件树不可用: {repo_root}"],
+                ),
+                "error",
+                str(root),
             )
 
         try:
