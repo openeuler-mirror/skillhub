@@ -22,6 +22,7 @@ license 定时任务已移除，相关调度/落库/可见性用例不再保留�
 ``SimpleNamespace`` 桩对象。
 """
 
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -41,7 +42,11 @@ from src.skills.license.gate_engine import (
     LicenseVerdict,
 )
 from src.skills.license.runtime import verdict_to_flag, verdict_to_license
-from src.skills.license.scanner import LicenseChecker, LicenseCheckResult
+from src.skills.license.scanner import (
+    LicenseChecker,
+    LicenseCheckResult,
+    _is_license_path,
+)
 from src.skills.skill_scanner import SkillScanner
 
 ACCESS_LIST = """
@@ -171,6 +176,101 @@ def test_missing_license_is_non_compliant(tmp_path):
 
     assert verdict.status == STATUS_MISSING
     assert verdict_to_flag(verdict.status) == 0
+
+
+def test_license_dir_singular_variants_are_detected(tmp_path):
+    """许可归档在 License/ 目录时（如 License/LICENSE）应被识别。"""
+    repo = tmp_path / "repo"
+    skill = repo / "skills" / "demo"
+    skill.mkdir(parents=True)
+    (repo / "License").mkdir()
+    (repo / "License" / "LICENSE").write_text(MIT_TEXT, encoding="utf-8")
+    scanner = _build_scanner(tmp_path)
+
+    verdict = scanner.scan(repo, skill, None)
+
+    assert verdict.status == STATUS_ALLOWED
+    assert verdict.expression == "MIT"
+
+
+def test_project_license_filename_is_detected(tmp_path):
+    """License/Project License 这类文件名也应作为许可来源。"""
+    repo = tmp_path / "repo"
+    skill = repo / "skills" / "demo"
+    skill.mkdir(parents=True)
+    (repo / "License").mkdir()
+    (repo / "License" / "Project License").write_text(APACHE_TEXT, encoding="utf-8")
+    scanner = _build_scanner(tmp_path)
+
+    verdict = scanner.scan(repo, skill, None)
+
+    assert verdict.status == STATUS_ALLOWED
+    assert verdict.expression == "Apache-2.0"
+    # 物化阶段也必须收录该文件，否则 --no-checkout clone 仍会漏判
+    assert _is_license_path("License/Project License")
+    # 只有全大写 LICENSES/（REUSE）整体收录；其他大小写变体按文件名判断
+    assert _is_license_path("LICENSES/MIT.txt")
+    assert not _is_license_path("Licenses/MIT.txt")
+    assert not _is_license_path("License/Third_Party_Notice.md")
+
+
+def test_license_dir_ignores_non_license_notice(tmp_path):
+    """License/ 下的说明/声明文档不应被当成项目许可。"""
+    repo = tmp_path / "repo"
+    skill = repo / "skills" / "demo"
+    skill.mkdir(parents=True)
+    (repo / "License").mkdir()
+    (repo / "License" / "Third_Party_Open_Source_Software_Notice.md").write_text(
+        APACHE_TEXT, encoding="utf-8"
+    )
+    scanner = _build_scanner(tmp_path)
+
+    verdict = scanner.scan(repo, skill, None)
+
+    assert verdict.status == STATUS_MISSING
+
+
+def test_lowercase_licenses_dir_does_not_pull_third_party_files(tmp_path):
+    """非 REUSE 约定的 LICENSES/ 不整体收录，避免第三方许可影响判定。"""
+    repo = tmp_path / "repo"
+    skill = repo / "skills" / "demo"
+    skill.mkdir(parents=True)
+    (repo / "LICENSE").write_text(MIT_TEXT, encoding="utf-8")
+    third_party = repo / "licenses"
+    third_party.mkdir()
+    (third_party / "GPL-2.0.txt").write_text(GPL_TEXT, encoding="utf-8")
+    scanner = _build_scanner(tmp_path)
+
+    verdict = scanner.scan(repo, skill, None)
+
+    assert verdict.status == STATUS_ALLOWED
+    assert verdict.expression == "MIT"
+
+
+def test_license_dir_symlink_outside_repo_is_ignored(tmp_path):
+    """License/ 是指向仓库外的符号链接时，不得读取外部许可。"""
+    repo = tmp_path / "repo"
+    skill = repo / "skills" / "demo"
+    skill.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "LICENSE").write_text(MIT_TEXT, encoding="utf-8")
+    os.symlink(outside, repo / "License")
+    scanner = _build_scanner(tmp_path)
+
+    verdict = scanner.scan(repo, skill, None)
+
+    assert verdict.status == STATUS_MISSING
+
+
+def test_check_local_missing_repo_root_is_error(tmp_path):
+    """仓库文件树不存在（如缓存被清理）时按 error 处理，不能写成 missing。"""
+    checker = _build_checker(tmp_path)
+
+    result = checker.check_local(tmp_path / "not-exists", "", None)
+
+    assert result.verdict.status == STATUS_ERROR
+    assert verdict_to_flag(result.verdict.status) is None
 
 
 def test_unknown_declared_license_is_non_compliant(tmp_path):

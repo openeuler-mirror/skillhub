@@ -94,9 +94,15 @@ _GENERIC_ALIASES = frozenset(
     }
 )
 
+# license 文件名：LICENSE / LICENSE.md / COPYING，以及 “Project License”
+# 这类以 license 结尾的命名（仓库常把它放在 License/ 目录下归档）。
 _LICENSE_FILE_RE = re.compile(
-    r"^(?:licen[cs]e|licence|copying|unlicense)(?:[-._].*)?$", re.IGNORECASE
+    r"^(?:licen[cs]e|licence|copying|unlicense)(?:[-._].*)?$"
+    r"|^(?:.*[-._ ])?(?:licen[cs]e|licence)$",
+    re.IGNORECASE,
 )
+# license 归档目录名（小写比较）：REUSE 用 LICENSES/，也有仓库用 License/。
+_LICENSE_DIR_NAMES = frozenset({"license", "licenses"})
 _SPDX_HEADER_RE = re.compile(r"SPDX-License-Identifier\s*:\s*([^\r\n]+)", re.IGNORECASE)
 _TOKEN_RE = re.compile(r"\(|\)|\bAND\b|\bOR\b|\bWITH\b|[^\s()]+", re.IGNORECASE)
 
@@ -705,8 +711,11 @@ class LicenseScanner:
         """列出单个目录下可作为 license 来源的文件（带目录级缓存）。
 
         识别规则：
-        - 文件名匹配 LICENSE / LICENCE / COPYING / UNLICENSE 及其变体；
-        - 子目录 ``LICENSES/`` 下的所有文件（REUSE 规范布局）。
+        - 文件名匹配 LICENSE / LICENCE / COPYING / UNLICENSE 及其变体，
+          以及 “Project License” 这类以 license 结尾的命名；
+        - 子目录 ``LICENSES/``（REUSE 规范，全大写）下的所有文件；
+        - 子目录 ``License/``、``licenses/`` 等变体下的 license 文件名
+          （有些仓库把项目许可归档在 ``License/Project License``）。
 
         缓存 key 为 ``(repo_root, directory)``，负结果（空元组）也缓存，
         避免同一仓库多个 skill 向上查找时反复 iterdir 大父目录。
@@ -721,13 +730,30 @@ class LicenseScanner:
             return []
         candidates = []
         for path in sorted(directory.iterdir()):
-            if path.is_file() and _LICENSE_FILE_RE.match(path.name):
-                candidates.append(path)
-        licenses_dir = directory / "LICENSES"
-        if licenses_dir.is_dir():
-            for path in sorted(licenses_dir.iterdir()):
-                if path.is_file():
+            if path.is_file():
+                if _LICENSE_FILE_RE.match(path.name):
                     candidates.append(path)
+            elif path.is_dir() and path.name.lower() in _LICENSE_DIR_NAMES:
+                # 不跟随指向仓库外的符号链接目录：与文件级检查保持一致，
+                # 避免把仓库外的 license 当成该仓库/ skill 的许可。
+                if path.is_symlink():
+                    continue
+                try:
+                    entries = sorted(path.iterdir())
+                except OSError:
+                    continue
+                for entry in entries:
+                    if not entry.is_file():
+                        continue
+                    # 只有 REUSE 约定的全大写 LICENSES/ 才把任意文件名当作
+                    # SPDX id（如 LICENSES/MIT.txt）；License/、licenses/ 等
+                    # 变体目录常混放 NOTICE/第三方声明，只收文件名像 license
+                    # 的，避免把第三方声明当成项目许可。
+                    if (
+                        path.name == "LICENSES"
+                        or _LICENSE_FILE_RE.match(entry.name)
+                    ):
+                        candidates.append(entry)
         result = []
         for path in candidates:
             if path.is_symlink():
@@ -763,8 +789,9 @@ class LicenseScanner:
     def _detect(self, path, text):
         identifiers = []
 
-        # REUSE：LICENSES/<SPDX>.txt 文件名即 license identifier
-        if path.parent.name.lower() == "licenses":
+        # REUSE：LICENSES/<SPDX>.txt 文件名即 license identifier；
+        # License/ 等变体目录同理（具体收哪些文件由 _license_files_in 把关）。
+        if path.parent.name.lower() in _LICENSE_DIR_NAMES:
             identifier, _error = self._access.resolve(path.stem)
             if identifier and not self._access.is_nonstandard(identifier):
                 identifiers.append(identifier)
@@ -796,7 +823,9 @@ class LicenseScanner:
     @staticmethod
     def _filename_token(path):
         name = path.stem
-        if path.parent.name.lower() == "licenses":
+        # 位于许可归档目录时优先按文件名解析（REUSE 约定：文件名即 SPDX id）；
+        # 解析不出来再走下面的前缀/后缀剥离与正文识别。
+        if path.parent.name.lower() in _LICENSE_DIR_NAMES:
             return name
         lowered = name.lower()
         for prefix in ("license", "licence", "copying", "unlicense"):

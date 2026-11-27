@@ -74,7 +74,7 @@ flowchart LR
 ### 3.1 字段定义
 
 `skills` 与 `skill_versions` 各新增两个字段，分别由
-`015_add_license_compliant.py` 与 `016_add_skill_license.py` 引入：
+`015_add_license_compliant.py` 与 `017_add_skill_license.py` 引入：
 
 ```sql
 -- 015：三态合规结论
@@ -148,7 +148,9 @@ SQL 的 CHECK 约束对 NULL 求值为 UNKNOWN，视为通过。因此该约束�
 ### 3.5 迁移与回滚
 
 - 015：`015_add_license_compliant`，`down_revision = 014_add_skill_embedding_hnsw`；
-- 016：`016_add_skill_license`，`down_revision = 015_add_license_compliant`；
+- 016：`016_add_skill_visibility`，`down_revision = 015_add_license_compliant`
+  （is_complete / is_soft_deleted 可见性字段，本方案不展开）；
+- 017：`017_add_skill_license`，`down_revision = 016_add_skill_visibility`；
 - 两个迁移都使用 `IF NOT EXISTS` / `IF EXISTS`，重复执行安全；
 - downgrade 先删约束/列，016 只删 `license` 列；
 - 迁移**不回填**：存量数据保持 NULL，由后续 discover 扫描写入。迁移本身不依赖
@@ -192,6 +194,22 @@ flowchart TD
   黑名单许可被 LICENSE 文件静默放行；
 - 声明为 `restricted` 但文件为 `permissive` 时，结论仍是 `0`——不再有
   「文件 rescue」分支。
+
+**LICENSE 文件的识别范围**（`LicenseScanner._license_files_in`，与
+`scanner._is_license_path` 的物化规则保持一致）：
+
+| 位置 | 收录范围 |
+|------|----------|
+| 当前目录 | 文件名匹配 `LICENSE` / `LICENCE` / `COPYING` / `UNLICENSE` 及其变体（如 `LICENSE.md`），以及以 `license` / `licence` 结尾的命名（如 `Project License`） |
+| `LICENSES/` 子目录（REUSE 布局） | 目录下所有文件（文件名即 SPDX identifier） |
+| `License/`、`licenses/` 等单数/大小写变体目录 | 只收文件名符合上述规则的，避免把 `Third_Party_Open_Source_Software_Notice.md` 等声明文档当成项目许可 |
+
+补充规则：
+
+- 目录名大小写不敏感；
+- 不跟随指向仓库外的符号链接目录；
+- 从 skill 目录向上逐级查找，命中第一层即停止；同层多个文件按 AND 保守合并；
+- 仓库根不存在（如物化缓存被清理）按 `error` 处理，不写 0。
 
 ### 4.2 状态到字段的映射
 
@@ -262,7 +280,9 @@ flowchart TD
   `missing`；
 - `skill_dir` 必须落在仓库根内：`resolve()` 后做 `relative_to` 校验，
   `..`、绝对路径或指向仓库外的符号链接一律按 `error` 处理，不读取仓库外
-  的 LICENSE。
+  的 LICENSE；仓库根本身不存在（如缓存目录被删除）同样按 `error` 处理；
+- 物化范围与 4.1 的文件识别规则一致：匹配 LICENSE 类文件名（含
+  `Project License` 这类后缀写法），或位于全大写 `LICENSES/`（REUSE）目录下。
 
 所有 git 命令带 `GIT_TERMINAL_PROMPT=0` 与 `git_timeout`，避免任务被
 交互式认证或网络挂起。临时目录由 `LicenseChecker.close()` 在本轮结束时
@@ -270,6 +290,11 @@ flowchart TD
 
 远程缓存只有在存在 `.license_fetched_at` marker 时才视为新鲜：拉取中断
 留下的无 marker 半成品目录不会被复用，下次拉取会先清空重建。
+
+> **缓存与规则升级**：`_local` 物化缓存只按 HEAD 判断是否可复用，不感知
+> license 识别规则是否变化。升级判定规则（如新增 `License/` 目录识别）后，
+> 同 HEAD 的旧缓存不会自动重建，需要清理 `<remote_cache_root>/_local`
+> 后再扫描，否则会继续沿用旧的、不完整的文件树。
 
 ### 4.5 目录级 LICENSE 缓存
 
@@ -322,8 +347,15 @@ flowchart TD
 - **新增记录**：直接带上本次预检的 `license` / `license_compliant` 插入；
 - **内容变化更新**：只有本轮确实完成检查（record 带 `_license_checked=True`）
   才覆盖这两列；未完成检查时保留数据库原值；
+- **内容未变的存量行**：整行字段不更新，`license` / `license_compliant`
+  也保持不变；
+- **范围边界**：本方案只覆盖 discover 增量（新入库、内容变化）；存量记录的
+  全量复核与回填由独立的定时任务负责（另行实现）；
+- **仓库级前置判断**：仓库 HEAD 与 `skill_repos.repository_commit_id` 相同
+  时整仓跳过，不会触发预检（既有扫描行为）；
 - 两个字段必须成对写入，避免出现“新类型 + 旧结论”的错配；
-- 仓库不可读、git 物化失败等基础设施问题不写 `0`，等待下一轮扫描重试；
+- 仓库不可读、git 物化失败、物化缓存目录被删等基础设施问题不写 `0`，
+  等待下一轮扫描重试；
 - 不满足 license 要求**不会跳过或删除** skill。
 
 ### 5.4 与扫描的时序关系
@@ -424,13 +456,14 @@ license_check:
 
 ## 九、运维
 
-### 9.1 首次上线
+### 9.1 首次上线与升级
 
-1. 执行迁移（Alembic 自动或手动 `alembic upgrade head`，需包含 015 与 016）；
+1. 执行迁移（Alembic 自动或手动 `alembic upgrade head`）；
 2. 确认 `license_check.enabled=true` 且准入清单地址可访问；
 3. 启动 worker / 触发一轮 discover：新入库与内容变化的 skill 会带上预检结果；
 4. 抽查 `license` / `license_compliant` 两列；
-5. 存量未变动的 skill 保持 `NULL`，需等待后续全量复核能力补齐（见第十一节）。
+5. 存量记录：本方案只处理 discover 增量，仓库 HEAD 未变时整仓跳过；存量
+   `NULL` 回填与全量复核由独立的定时任务负责（另行实现）。
 
 ### 9.2 常用核查 SQL
 
@@ -460,8 +493,9 @@ LIMIT 50;
 
 | 现象 | 可能原因 | 处理 |
 |------|----------|------|
-| 大量 `license_compliant IS NULL` | 存量记录未参与扫描，或预检持续失败 | 等待后续全量复核能力；先检查准入清单与仓库可访问性 |
-| discover 日志出现「仓库文件树不可用」 | 本地 clone 缺失且远端拉取失败 | 检查仓库可访问性、token、`git_timeout` |
+| 大量 `license_compliant IS NULL` | 存量记录未参与扫描；本方案只处理 discover 增量 | 先检查准入清单与仓库可访问性；存量回填等待独立定时复核任务 |
+| discover 日志出现「仓库文件树不可用」 | 本地 clone 缺失、远端拉取失败，或 `_local` 物化缓存目录已被删除 | 检查仓库可访问性、token、`git_timeout`；清理该仓库 `_local` 缓存后重扫。该分支不会写 0 |
+| 存量 `0` 一直不被修正 | 本方案只处理 discover 增量，仓库 HEAD 未变时整仓跳过 | 由独立定时复核任务处理（另行实现） |
 | 全部新记录为 0 | 声明表达式非法 / 清单格式变化 | 查看 `reasons`，确认清单版本 |
 | 新入库 skill 的 `license` 为空 | 预检时准入清单不可用 / checker 初始化失败 | 查 discover 日志 `license pre-check`；下一轮扫描会重试 |
 | `license` 与 `license_compliant` 不一致 | 两列必须成对写入；出现不一致通常是手工改库或旧数据 | 用 9.2 的异常 SQL 排查 |
@@ -483,6 +517,8 @@ LIMIT 50;
 | 目录缓存 | 同一父目录只 listing 一次 |
 | discover 预检 | 返回 `(license, flag, checked)`；按 `(skill_dir, 声明)` 复用；异常不缓存、返回全 None |
 | 路径边界 | `..` / 绝对路径越出仓库根 → error（不读仓库外 LICENSE） |
+| 目录变体 | `License/LICENSE`、`License/Project License` 可识别；`License/` 下 NOTICE 不识别；非全大写 `LICENSES/` 不整体收录（避免第三方许可影响判定）；指向仓库外的符号链接目录忽略 |
+| 仓库根缺失 | 物化缓存目录被删除 → error（不写 0），不会误判为 missing |
 | 无工作树 clone | `--no-checkout` clone 从 git 对象库物化 license，判为 `local_tree` |
 | 远程轻量拉取不完整 | 只取到部分 license 文件 → 返回 False，回退完整浅克隆 |
 | 缓存标记 | 无 `.license_fetched_at` 的半成品远程缓存不被视为新鲜 |
@@ -512,8 +548,9 @@ cd wittyhub
 
 1. **数据可见性限制**：确定 `license_compliant=0` 在列表、搜索、详情、版本、
    下载等入口的处理策略（过滤 / 404 / 其他），以及对应的索引与统计口径；
-2. **全量复核**：补齐存量 `NULL`、跟随准入清单更新结论、按轮次或按周期
-   触发，并处理多副本并发（如 advisory lock）；
+2. **全量复核**：存量 `NULL` 回填、不依赖仓库变更的定期复检、跟随准入清单
+   更新存量结论，以及多副本并发控制（如 advisory lock），由独立的定时任务
+   实现；
 3. **缓存回收**：恢复远程缓存与 `_local` 物化缓存的自动清理，避免磁盘长期
    增长；
 4. **前端展示**：基于已透出的 `license` / `license_compliant` 增加类型与
@@ -526,13 +563,13 @@ cd wittyhub
 | 文件 | 变更 |
 |------|------|
 | `migrations/versions/015_add_license_compliant.py` | 新增三态字段与 CHECK 约束 |
-| `migrations/versions/016_add_skill_license.py` | 新增 `license TEXT` 字段（两表） |
+| `migrations/versions/017_add_skill_license.py` | 新增 `license TEXT` 字段（两表） |
 | `src/models/orm.py` | `Skill` / `SkillVersion` 新增 `license`、`license_compliant` |
 | `src/models/repository.py` | 预检成功时成对写入两列；不做 license 可见性过滤 |
 | `src/api/schemas/skill.py` | `SkillResponse.license` / `license_compliant` |
 | `src/api/routes/skills.py` | 响应透出两字段；不做 license 拦截 |
 | `src/indexer/search.py` | 检索结果透出两字段；不做 license 过滤 |
-| `src/skills/license/gate_engine.py` | 判定引擎（vendored，声明优先改造） |
+| `src/skills/license/gate_engine.py` | 判定引擎（vendored，声明优先改造）；license 文件/目录识别规则 |
 | `src/skills/license/scanner.py` | 仓库文件树准备、目录级缓存、marker 新鲜度 |
 | `src/skills/license/runtime.py` | checker 构建、`verdict_to_flag`、`verdict_to_license` |
 | `src/skills/license/access_list.py` | 准入清单拉取、缓存与过期降级 |
